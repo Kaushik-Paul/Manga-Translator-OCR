@@ -2,7 +2,7 @@
 CLI entry point for the Manga Translator.
 
 Usage:
-    uv run python main.py --input <image_or_directory> [--output <dir>] [--lang ja|zh] [--model <model>]
+    uv run python main.py --input <image_or_directory> [--output <dir>] [--lang ja] [--model <model>]
 """
 
 from __future__ import annotations
@@ -27,7 +27,6 @@ def setup_logging(verbose: bool = False) -> None:
     # Quiet noisy libraries
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("PIL").setLevel(logging.WARNING)
-    logging.getLogger("easyocr").setLevel(logging.WARNING)
     logging.getLogger("transformers").setLevel(logging.WARNING)
     logging.getLogger("torch").setLevel(logging.WARNING)
 
@@ -36,15 +35,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         prog="manga-translator",
-        description="Translate manga/doujinshi pages from Japanese/Chinese to English",
+        description="Translate manga/doujinshi pages from Japanese to English",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Translate a single page (Japanese)
   uv run python main.py --input page01.jpg
 
-  # Translate a directory of Chinese manga pages
-  uv run python main.py --input ./manga_pages/ --lang zh --output ./translated/
+  # Translate a directory of pages
+  uv run python main.py --input ./manga_pages/ --output ./translated/
 
   # Use a specific model
   uv run python main.py --input page.png --model mistralai/mistral-large-latest
@@ -66,9 +65,9 @@ Examples:
     parser.add_argument(
         "--lang",
         "-l",
-        choices=["ja", "zh"],
+        choices=["ja"],
         default="ja",
-        help="Source language: 'ja' for Japanese (default), 'zh' for Chinese",
+        help="Source language: 'ja' (Japanese only)",
     )
     parser.add_argument(
         "--model",
