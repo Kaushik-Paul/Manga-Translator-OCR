@@ -85,6 +85,9 @@ def translate_page(
     ocr_engine = get_ocr_engine(cfg.source_lang)
     units: list[RenderTextUnit] = []
     inpaint_region_indices: set[int] = set()
+
+    # Pre-split all regions into OCR sub-regions
+    all_ocr_tasks: list[tuple[int, int, TextRegion]] = []
     for region_idx, region in enumerate(regions):
         ocr_regions = _split_region_for_ocr(region)
         if len(ocr_regions) >= 2:
@@ -93,35 +96,53 @@ def translate_page(
                 region_idx + 1,
                 len(ocr_regions),
             )
-
         for sub_idx, ocr_region in enumerate(ocr_regions, 1):
-            text = ocr_engine.extract_text(ocr_region.cropped, ocr_region.mask).strip()
-            if not text:
-                continue
+            all_ocr_tasks.append((region_idx, sub_idx, ocr_region))
 
-            style_hint = _infer_unit_style(text, ocr_region.w, ocr_region.h)
-            max_words = _max_words_for_unit(style_hint, ocr_region.w, ocr_region.h)
-            max_chars = _max_chars_for_unit(style_hint, ocr_region.w, ocr_region.h)
-            units.append(
-                RenderTextUnit(
-                    region=ocr_region,
-                    source_text=text,
-                    style_hint=style_hint,
-                    max_words=max_words,
-                    max_chars=max_chars,
-                    parent_region_index=region_idx,
-                )
+    # Run OCR — parallel (3 workers) for Modal, sequential for local CPU
+    def _ocr_one(task: tuple[int, int, TextRegion]) -> tuple[int, int, TextRegion, str]:
+        region_idx, sub_idx, ocr_region = task
+        text = ocr_engine.extract_text(ocr_region.cropped, ocr_region.mask).strip()
+        return region_idx, sub_idx, ocr_region, text
+
+    if cfg.use_modal and len(all_ocr_tasks) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        max_workers = min(3, len(all_ocr_tasks))
+        logger.info("  Running OCR in parallel (%d workers, %d sub-regions)...",
+                     max_workers, len(all_ocr_tasks))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            ocr_results = list(pool.map(_ocr_one, all_ocr_tasks))
+    else:
+        ocr_results = [_ocr_one(t) for t in all_ocr_tasks]
+
+    for region_idx, sub_idx, ocr_region, text in ocr_results:
+        if not text:
+            continue
+
+        style_hint = _infer_unit_style(text, ocr_region.w, ocr_region.h)
+        max_words = _max_words_for_unit(style_hint, ocr_region.w, ocr_region.h)
+        max_chars = _max_chars_for_unit(style_hint, ocr_region.w, ocr_region.h)
+        units.append(
+            RenderTextUnit(
+                region=ocr_region,
+                source_text=text,
+                style_hint=style_hint,
+                max_words=max_words,
+                max_chars=max_chars,
+                parent_region_index=region_idx,
             )
-            inpaint_region_indices.add(region_idx)
-            logger.info(
-                "  Region %d.%d [%s, max_words=%d, max_chars=%d]: '%s'",
-                region_idx + 1,
-                sub_idx,
-                style_hint,
-                max_words,
-                max_chars,
-                text[:80],
-            )
+        )
+        inpaint_region_indices.add(region_idx)
+        logger.info(
+            "  Region %d.%d [%s, max_words=%d, max_chars=%d]: '%s'",
+            region_idx + 1,
+            sub_idx,
+            style_hint,
+            max_words,
+            max_chars,
+            text[:80],
+        )
 
     if not units:
         logger.warning("No text extracted from any region. Saving original image.")
