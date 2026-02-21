@@ -2,7 +2,8 @@
 CLI entry point for the Manga Translator.
 
 Usage:
-    uv run python main.py --input <image_or_directory> [--output <dir>] [--lang ja] [--model <model>]
+    uv run python main.py --input <image_or_directory> [<image_or_directory> ...]
+    [--output <dir>] [--lang ja] [--model <model>]
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import sys
 from pathlib import Path
 
 from .config import settings
-from .pipeline import translate_directory, translate_page
+from .pipeline import is_image_file, list_image_files, translate_images
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -42,6 +43,9 @@ Examples:
   # Translate a single page (Japanese)
   uv run python main.py --input page01.jpg
 
+  # Translate multiple pages
+  uv run python main.py --input page01.jpg page02.jpg page03.webp
+
   # Translate a directory of pages
   uv run python main.py --input ./manga_pages/ --output ./translated/
 
@@ -54,7 +58,9 @@ Examples:
         "--input",
         "-i",
         required=True,
-        help="Input image file or directory containing manga pages",
+        nargs="+",
+        metavar="PATH",
+        help="One or more image files and/or directories",
     )
     parser.add_argument(
         "--output",
@@ -112,22 +118,59 @@ def run(argv: list[str] | None = None) -> None:
     logger.info("Output directory: %s", settings.output_dir)
     logger.info("─" * 40)
 
-    input_path = Path(args.input)
+    candidate_images: list[Path] = []
+    for raw_path in args.input:
+        input_path = Path(raw_path)
+        if not input_path.exists():
+            logger.error("Input path does not exist: %s", input_path)
+            sys.exit(1)
 
-    if not input_path.exists():
-        logger.error("Input path does not exist: %s", input_path)
-        sys.exit(1)
+        if input_path.is_dir():
+            dir_images = list_image_files(input_path)
+            if not dir_images:
+                logger.warning("No image files found in %s", input_path)
+            candidate_images.extend(dir_images)
+            continue
 
-    if input_path.is_dir():
-        results = translate_directory(input_path, config=settings)
-        logger.info(
-            "\n✅ Completed! Translated %d images to %s",
-            len(results),
-            settings.output_dir,
-        )
-    elif input_path.is_file():
-        result = translate_page(input_path, config=settings)
-        logger.info("\n✅ Completed! Translated image saved to: %s", result)
-    else:
+        if input_path.is_file():
+            if not is_image_file(input_path):
+                logger.error("Unsupported image extension: %s", input_path)
+                sys.exit(1)
+            candidate_images.append(input_path)
+            continue
+
         logger.error("Input is neither a file nor directory: %s", input_path)
         sys.exit(1)
+
+    # Remove duplicate paths while preserving order.
+    unique_images: list[Path] = []
+    seen: set[str] = set()
+    for image_path in candidate_images:
+        key = str(image_path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_images.append(image_path)
+
+    if not unique_images:
+        logger.error("No valid input images were found.")
+        sys.exit(1)
+
+    if settings.use_modal and len(unique_images) > 1:
+        logger.info(
+            "USE_MODAL=true -> processing pages in parallel (up to %d workers).",
+            settings.modal_max_parallel_pages,
+        )
+    elif len(unique_images) > 1:
+        logger.info("USE_MODAL=false -> processing pages sequentially.")
+
+    results = translate_images(unique_images, config=settings)
+    if len(unique_images) == 1 and results:
+        logger.info("\n✅ Completed! Translated image saved to: %s", results[0])
+    else:
+        logger.info(
+            "\n✅ Completed! Translated %d/%d images to %s",
+            len(results),
+            len(unique_images),
+            settings.output_dir,
+        )

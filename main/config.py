@@ -15,6 +15,18 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(_PROJECT_ROOT / ".env")
 
 
+def _int_env(name: str, default: int) -> int:
+    """Read a positive integer from env, falling back to default on invalid values."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 @dataclass
 class Settings:
     """Application settings loaded from environment and CLI overrides."""
@@ -37,6 +49,10 @@ class Settings:
         default_factory=lambda: os.getenv("USE_MODAL", "true").lower()
         in ("true", "1", "yes")
     )
+    # Conservative default for Modal starter/free plan workloads.
+    modal_max_parallel_pages: int = field(
+        default_factory=lambda: _int_env("MODAL_MAX_PARALLEL_PAGES", 2)
+    )
 
     # Output
     output_dir: Path = field(default_factory=lambda: Path("./output"))
@@ -51,6 +67,8 @@ class Settings:
             raise ValueError(
                 f"Unsupported source language '{self.source_lang}'. Use 'ja'."
             )
+        if self.modal_max_parallel_pages < 1:
+            raise ValueError("MODAL_MAX_PARALLEL_PAGES must be >= 1.")
 
 
 # Singleton

@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import re
 from abc import ABC, abstractmethod
+from threading import Lock
 
 import cv2
 import numpy as np
@@ -204,6 +205,7 @@ class ModalOCREngine(MangaOCREngine):
 
     _instance: ModalOCREngine | None = None
     _modal_ocr = None
+    _modal_lock = Lock()
 
     def __new__(cls) -> ModalOCREngine:
         if cls._instance is None:
@@ -211,7 +213,11 @@ class ModalOCREngine(MangaOCREngine):
         return cls._instance
 
     def _ensure_modal(self) -> None:
-        if self._modal_ocr is None:
+        if self._modal_ocr is not None:
+            return
+        with self._modal_lock:
+            if self._modal_ocr is not None:
+                return
             import modal
 
             logger.info("Connecting to Modal manga-ocr-service...")
