@@ -33,8 +33,8 @@ class Settings:
 
     # OCR
     source_lang: str = "ja"  # "ja" for Japanese
-    use_modal_ocr: bool = field(
-        default_factory=lambda: os.getenv("USE_MODAL_OCR", "true").lower()
+    use_modal: bool = field(
+        default_factory=lambda: os.getenv("USE_MODAL", "true").lower()
         in ("true", "1", "yes")
     )
 

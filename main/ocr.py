@@ -222,14 +222,7 @@ class ModalOCREngine(MangaOCREngine):
     def _run_manga_ocr(self, image: NDArray) -> str:
         """Send the image to Modal GPU for manga-ocr inference."""
         self._ensure_modal()
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        pil_image = Image.fromarray(rgb)
-
-        import io
-
-        buf = io.BytesIO()
-        pil_image.save(buf, format="PNG")
-        png_bytes = buf.getvalue()
+        png_bytes = self._encode_png(image)
 
         try:
             text = self._modal_ocr.ocr.remote(png_bytes)
@@ -237,6 +230,55 @@ class ModalOCREngine(MangaOCREngine):
         except Exception as e:
             logger.warning("Modal OCR call failed: %s", e)
             return ""
+
+    @staticmethod
+    def _encode_png(image: NDArray) -> bytes:
+        """Convert a BGR numpy image to PNG bytes."""
+        import io
+
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(rgb)
+        buf = io.BytesIO()
+        pil_image.save(buf, format="PNG")
+        return buf.getvalue()
+
+    def extract_text(self, image: NDArray, region_mask: NDArray | None = None) -> str:
+        """
+        Extract text with parallel multi-pass refinement via Modal .map().
+
+        The base OCR call is made first. If multipass refinement is needed,
+        all 4 image variants are sent to Modal in a single batched .map() call
+        instead of 4 sequential round-trips.
+        """
+        self._ensure_modal()
+        crop = self._crop_with_mask(image, region_mask)
+        base = self._run_manga_ocr(crop)
+        if not base:
+            return ""
+
+        area = crop.shape[0] * crop.shape[1]
+        should_refine = area >= 50000 or self._is_noisy_text(base)
+        if not should_refine:
+            return base.strip()
+
+        # Batch all variants into a single .map() call for parallel GPU inference
+        variants = self._build_preprocess_variants(crop)
+        variant_bytes = [self._encode_png(v) for v in variants]
+
+        try:
+            results = list(self._modal_ocr.ocr.map(variant_bytes))
+        except Exception as e:
+            logger.warning("Modal OCR .map() failed, returning base text: %s", e)
+            return base.strip()
+
+        candidates = [base]
+        for text in results:
+            t = text.strip() if text else ""
+            if t:
+                candidates.append(t)
+
+        best = max(candidates, key=self._score_candidate)
+        return best.strip()
 
     def _ensure_model(self) -> None:
         # No local model needed — inference is remote.
@@ -261,7 +303,7 @@ def get_ocr_engine(lang: str = "ja") -> OCREngine:
 
     from .config import settings
 
-    if settings.use_modal_ocr:
+    if settings.use_modal:
         logger.info("Using Modal GPU OCR engine.")
         return ModalOCREngine()
 
