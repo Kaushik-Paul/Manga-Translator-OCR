@@ -32,7 +32,11 @@ class Settings:
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
 
     # OCR
-    source_lang: str = "ja"  # "ja" for Japanese, "zh" for Chinese
+    source_lang: str = "ja"  # "ja" for Japanese
+    use_modal_ocr: bool = field(
+        default_factory=lambda: os.getenv("USE_MODAL_OCR", "true").lower()
+        in ("true", "1", "yes")
+    )
 
     # Output
     output_dir: Path = field(default_factory=lambda: Path("./output"))
@@ -43,9 +47,9 @@ class Settings:
             raise ValueError(
                 "OPENROUTER_API_KEY is required. Set it in .env or pass via environment."
             )
-        if self.source_lang not in ("ja", "zh"):
+        if self.source_lang != "ja":
             raise ValueError(
-                f"Unsupported source language '{self.source_lang}'. Use 'ja' or 'zh'."
+                f"Unsupported source language '{self.source_lang}'. Use 'ja'."
             )
 
 

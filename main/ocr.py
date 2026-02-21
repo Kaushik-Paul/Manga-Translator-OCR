@@ -1,10 +1,7 @@
 """
 OCR engines for extracting text from manga bubbles.
 
-- MangaOCREngine: Uses `manga-ocr` library, optimized for Japanese manga text.
-- EasyOCREngine: Uses `easyocr`, supports Chinese and Japanese.
-
-Both engines run in CPU-only mode.
+This project currently uses MangaOCREngine only.
 """
 
 from __future__ import annotations
@@ -197,75 +194,79 @@ class MangaOCREngine(OCREngine):
         return best.strip()
 
 
-class EasyOCREngine(OCREngine):
+class ModalOCREngine(MangaOCREngine):
     """
-    Multi-language OCR using EasyOCR.
+    OCR engine that offloads manga-ocr inference to a Modal.com T4 GPU.
 
-    Supports Chinese (Simplified + Traditional) and Japanese.
-    Runs in CPU mode (gpu=False).
+    Inherits all preprocessing, noise detection, and multi-pass refinement
+    from MangaOCREngine — only the raw model call is remote.
     """
 
-    _instances: dict[str, EasyOCREngine] = {}
-    _reader = None
-    _lang: str = "zh"
+    _instance: ModalOCREngine | None = None
+    _modal_ocr = None
 
-    def __new__(cls, lang: str = "zh") -> EasyOCREngine:
-        if lang not in cls._instances:
-            instance = super().__new__(cls)
-            instance._lang = lang
-            cls._instances[lang] = instance
-        return cls._instances[lang]
+    def __new__(cls) -> ModalOCREngine:
+        if cls._instance is None:
+            cls._instance = super(MangaOCREngine, cls).__new__(cls)
+        return cls._instance
 
-    def __init__(self, lang: str = "zh") -> None:
-        self._lang = lang
+    def _ensure_modal(self) -> None:
+        if self._modal_ocr is None:
+            import modal
 
-    def _ensure_reader(self) -> None:
-        if self._reader is None:
-            logger.info(
-                "Loading EasyOCR reader for '%s' (first time may download models)...",
-                self._lang,
-            )
-            import easyocr
+            logger.info("Connecting to Modal manga-ocr-service...")
+            MangaOCRCls = modal.Cls.from_name("manga-ocr-service", "MangaOCR")
+            self._modal_ocr = MangaOCRCls()
+            logger.info("Connected to Modal manga-ocr-service.")
 
-            # Map our language codes to EasyOCR language codes
-            lang_map = {
-                "zh": ["ch_sim", "ch_tra", "en"],
-                "ja": ["ja", "en"],
-            }
-            langs = lang_map.get(self._lang, [self._lang, "en"])
-            self._reader = easyocr.Reader(langs, gpu=False)
-            logger.info("EasyOCR reader loaded.")
+    def _run_manga_ocr(self, image: NDArray) -> str:
+        """Send the image to Modal GPU for manga-ocr inference."""
+        self._ensure_modal()
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(rgb)
 
-    def extract_text(self, image: NDArray, region_mask: NDArray | None = None) -> str:
-        self._ensure_reader()
+        import io
+
+        buf = io.BytesIO()
+        pil_image.save(buf, format="PNG")
+        png_bytes = buf.getvalue()
+
         try:
-            results = self._reader.readtext(image, detail=0)  # type: ignore[union-attr]
-            # Join all detected text fragments
-            text = " ".join(results).strip()
-            return text
+            text = self._modal_ocr.ocr.remote(png_bytes)
+            return text.strip() if text else ""
         except Exception as e:
-            logger.warning("EasyOCR failed on region: %s", e)
+            logger.warning("Modal OCR call failed: %s", e)
             return ""
+
+    def _ensure_model(self) -> None:
+        # No local model needed — inference is remote.
+        pass
 
 
 def get_ocr_engine(lang: str = "ja") -> OCREngine:
     """
-    Factory function to get the appropriate OCR engine.
+    Factory function to get the OCR engine.
 
     Args:
-        lang: Source language - "ja" for Japanese (uses manga-ocr),
-              "zh" for Chinese (uses EasyOCR).
+        lang: Source language. Only "ja" is supported for OCR.
 
     Returns:
-        An OCR engine instance.
+        An OCR engine instance (ModalOCREngine if enabled, else local).
     """
-    if lang == "ja":
-        return MangaOCREngine()
-    elif lang == "zh":
-        return EasyOCREngine(lang="zh")
-    else:
-        logger.warning("Unknown language '%s', falling back to EasyOCR.", lang)
-        return EasyOCREngine(lang=lang)
+    if lang != "ja":
+        logger.warning(
+            "OCR language '%s' is not supported; falling back to manga-ocr (ja).",
+            lang,
+        )
+
+    from .config import settings
+
+    if settings.use_modal_ocr:
+        logger.info("Using Modal GPU OCR engine.")
+        return ModalOCREngine()
+
+    logger.info("Using local CPU OCR engine.")
+    return MangaOCREngine()
 
 
 def _is_kanji(char: str) -> bool:
