@@ -258,6 +258,12 @@ manga_testing/**
 temp_repo/**
 !temp_repo/.gitkeep
 
+main/fonts/**
+!main/fonts/.gitkeep
+
+main/weights/**
+!main/weights/.gitkeep
+
 
 .DS_Store
 
