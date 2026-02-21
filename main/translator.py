@@ -240,6 +240,9 @@ def _call_openrouter(
         ],
         "temperature": 0.3,  # Low temperature for consistent translations
         "max_tokens": 4096,
+        "reasoning": {
+            "effort": "none",
+        }
     }
 
     logger.info("Calling OpenRouter API (model: %s)...", model)
