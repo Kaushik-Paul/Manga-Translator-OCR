@@ -1,0 +1,16 @@
+[project]
+name = "manga-translator-ocr"
+version = "0.1.0"
+description = "Doujinshi/Manga translator - detects text bubbles, extracts text via OCR, translates JP/CN to English, and renders translated text back onto the page"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "manga-ocr>=0.1.12",
+    "easyocr>=1.7",
+    "opencv-python-headless>=4.9",
+    "Pillow>=10.0",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+    "onnxruntime>=1.17",
+    "huggingface-hub>=0.20",
+]
