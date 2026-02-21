@@ -7,7 +7,9 @@ using models that handle NSFW text content without moderation issues.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
+import re
 import time
 
 import httpx
@@ -28,6 +30,7 @@ Rules:
 - If the text is a single sound effect, output a short English SFX only
 - If OCR text is fragmented/noisy, produce one compact readable English line
 - If text looks garbled from OCR, infer the most likely intended meaning and translate that
+- If an input line includes constraints like (style=sfx/dialogue, max_words=N, max_chars=N), obey them strictly
 - Avoid raw romaji transliteration of kana
 - Prefer natural English interjections (e.g., "Ah...", "Gulp...", "Throb...") over transliterated syllables
 - Do not output long gibberish transliterations; summarize noisy moans/interjections briefly
@@ -42,7 +45,18 @@ Rules:
 - Keep it short and bubble-friendly
 - Use natural English SFX/interjections for noisy text
 - Never output romaji or untranslated Japanese/Chinese
+- Never output transliterated Japanese syllables (e.g., "desu", "kun", "chan", "uhyo")
+- If a line includes (style=..., max_words=N, max_chars=N), obey it strictly
 - Output ONLY the translation text"""
+
+
+@dataclass(frozen=True)
+class TranslationConstraint:
+    """Optional per-line translation constraints."""
+
+    style: str | None = None
+    max_words: int | None = None
+    max_chars: int | None = None
 
 
 def translate_texts(
@@ -50,6 +64,7 @@ def translate_texts(
     source_lang: str | None = None,
     model: str | None = None,
     max_retries: int = 3,
+    constraints: list[TranslationConstraint] | None = None,
 ) -> list[str]:
     """
     Translate a batch of texts from Japanese/Chinese to English.
@@ -61,6 +76,7 @@ def translate_texts(
         source_lang: Source language ("ja" or "zh"). Defaults to settings.
         model: OpenRouter model to use. Defaults to settings.
         max_retries: Number of retries on failure.
+        constraints: Optional per-line translation constraints.
 
     Returns:
         List of translated English strings (same length as input).
@@ -79,13 +95,23 @@ def translate_texts(
 
     # Build the user message with numbered lines for batch translation
     numbered_lines = []
-    for idx, (_, text) in enumerate(indexed_texts):
-        numbered_lines.append(f"[{idx + 1}] {text}")
+    for idx, (orig_idx, text) in enumerate(indexed_texts):
+        constraint = (
+            constraints[orig_idx]
+            if constraints is not None and orig_idx < len(constraints)
+            else None
+        )
+        hint = _constraint_tag(constraint)
+        if hint:
+            numbered_lines.append(f"[{idx + 1}] {hint} {text}")
+        else:
+            numbered_lines.append(f"[{idx + 1}] {text}")
 
     user_message = (
         f"Translate the following {lang_name} manga text to English. "
-        f"Each line is numbered. Return ONLY the translations, one per line, "
-        f"with the same numbering format [N].\n\n"
+        f"Each line is numbered and may include optional constraints like "
+        f"(style=sfx/dialogue, max_words=N, max_chars=N). Follow constraints strictly. "
+        f"Return ONLY the translations, one per line, with the same numbering format [N].\n\n"
         + "\n".join(numbered_lines)
     )
 
@@ -108,20 +134,35 @@ def translate_texts(
                 return texts
 
     # Repair pass for missing/unchanged/non-English outputs.
-    repair_candidates: list[tuple[int, str]] = []
-    for mapped_idx, (_, src_text) in enumerate(indexed_texts):
+    repair_candidates: list[tuple[int, int, str]] = []
+    for mapped_idx, (orig_idx, src_text) in enumerate(indexed_texts):
         candidate = translated_map.get(mapped_idx, "")
-        if _needs_repair_translation(src_text, candidate):
-            repair_candidates.append((mapped_idx, src_text))
+        constraint = (
+            constraints[orig_idx]
+            if constraints is not None and orig_idx < len(constraints)
+            else None
+        )
+        if _needs_repair_translation(src_text, candidate, constraint):
+            repair_candidates.append((mapped_idx, orig_idx, src_text))
 
     if repair_candidates:
-        repair_lines = [
-            f"[{i + 1}] {src_text}"
-            for i, (_, src_text) in enumerate(repair_candidates)
-        ]
+        repair_lines = []
+        for i, (_, orig_idx, src_text) in enumerate(repair_candidates):
+            constraint = (
+                constraints[orig_idx]
+                if constraints is not None and orig_idx < len(constraints)
+                else None
+            )
+            hint = _constraint_tag(constraint)
+            if hint:
+                repair_lines.append(f"[{i + 1}] {hint} {src_text}")
+            else:
+                repair_lines.append(f"[{i + 1}] {src_text}")
+
         repair_message = (
             f"Translate the following {lang_name} manga text to concise English. "
-            f"Return ONLY numbered lines in [N] format.\n\n"
+            f"Lines may contain (style=..., max_words=N, max_chars=N) constraints. "
+            f"Follow constraints strictly. Return ONLY numbered lines in [N] format.\n\n"
             + "\n".join(repair_lines)
         )
         try:
@@ -131,9 +172,14 @@ def translate_texts(
                 system_prompt=REPAIR_SYSTEM_PROMPT,
             )
             repaired_map = _parse_numbered_response(repair_response, len(repair_candidates))
-            for repair_idx, (mapped_idx, src_text) in enumerate(repair_candidates):
+            for repair_idx, (mapped_idx, orig_idx, src_text) in enumerate(repair_candidates):
                 fixed = repaired_map.get(repair_idx, "").strip()
-                if fixed and not _needs_repair_translation(src_text, fixed):
+                constraint = (
+                    constraints[orig_idx]
+                    if constraints is not None and orig_idx < len(constraints)
+                    else None
+                )
+                if fixed and not _needs_repair_translation(src_text, fixed, constraint):
                     translated_map[mapped_idx] = fixed
         except Exception as e:
             logger.warning("Repair translation pass failed: %s", e)
@@ -214,7 +260,11 @@ def _contains_cjk(text: str) -> bool:
     return False
 
 
-def _needs_repair_translation(source: str, translated: str) -> bool:
+def _needs_repair_translation(
+    source: str,
+    translated: str,
+    constraint: TranslationConstraint | None = None,
+) -> bool:
     tgt = translated.strip()
     src = source.strip()
     if not tgt:
@@ -224,6 +274,131 @@ def _needs_repair_translation(source: str, translated: str) -> bool:
     if tgt in {"[", "]", "[8", "[9", "...", ".."}:
         return True
     if _contains_cjk(tgt):
+        return True
+    if _looks_like_romaji_noise(tgt) and _contains_cjk(src):
+        return True
+
+    words = re.findall(r"[A-Za-z']+", tgt)
+    if constraint is not None:
+        if constraint.max_words is not None and constraint.max_words > 0:
+            if len(words) > constraint.max_words + 1:
+                return True
+        if constraint.max_chars is not None and constraint.max_chars > 0:
+            if len(tgt) > constraint.max_chars + 6:
+                return True
+        if constraint.style == "sfx" and len(words) >= 4 and _looks_like_romaji_noise(tgt):
+            return True
+
+    return False
+
+
+def _constraint_tag(constraint: TranslationConstraint | None) -> str:
+    """Serialize a constraint to an inline hint consumed by the translator prompt."""
+    if constraint is None:
+        return ""
+
+    parts: list[str] = []
+    if constraint.style in {"sfx", "dialogue"}:
+        parts.append(f"style={constraint.style}")
+    if constraint.max_words is not None and constraint.max_words > 0:
+        parts.append(f"max_words={int(constraint.max_words)}")
+    if constraint.max_chars is not None and constraint.max_chars > 0:
+        parts.append(f"max_chars={int(constraint.max_chars)}")
+    if not parts:
+        return ""
+
+    return "(" + ", ".join(parts) + ")"
+
+
+def _looks_like_romaji_noise(text: str) -> bool:
+    """Heuristic: flag long transliterated-sounding outputs for repair pass."""
+    words = [w.lower() for w in re.findall(r"[A-Za-z']+", text)]
+    if len(words) < 3:
+        return False
+
+    long_words = [w for w in words if len(w) >= 4]
+    if len(long_words) < 2:
+        return False
+
+    common_en = {
+        "this",
+        "that",
+        "what",
+        "when",
+        "where",
+        "then",
+        "well",
+        "okay",
+        "right",
+        "please",
+        "come",
+        "again",
+        "good",
+        "more",
+        "with",
+        "have",
+        "gonna",
+        "suck",
+        "lick",
+        "ouch",
+        "slip",
+        "gulp",
+        "throb",
+        "twitch",
+        "splash",
+        "moan",
+        "heh",
+        "huh",
+        "ah",
+        "oh",
+        "mmm",
+        "yeah",
+        "feel",
+        "hot",
+        "mom",
+        "rough",
+        "coming",
+    }
+
+    def english_like(word: str) -> bool:
+        if word in common_en:
+            return True
+        return word.endswith(
+            (
+                "ing",
+                "ed",
+                "ly",
+                "er",
+                "est",
+                "tion",
+                "ness",
+                "ment",
+                "ful",
+                "able",
+            )
+        )
+
+    english_hits = sum(1 for w in long_words if english_like(w))
+    romaji_markers = {"desu", "kun", "chan", "sama", "senpai", "san"}
+    if any(w in romaji_markers for w in words):
+        return True
+
+    romaji_cluster_hits = sum(
+        1
+        for w in long_words
+        if re.search(r"(sh|ch|ts|ry|ny|ky|gy|ja|ju|jo)", w) is not None
+    )
+    vowel_heavy = 0
+    for w in long_words:
+        vowels = sum(1 for ch in w if ch in "aeiou")
+        if vowels / float(max(1, len(w))) >= 0.45:
+            vowel_heavy += 1
+
+    if romaji_cluster_hits >= 2 and english_hits <= 1:
+        return True
+    if english_hits <= max(1, len(long_words) // 4) and vowel_heavy >= max(
+        2, len(long_words) // 2
+    ):
         return True
     return False
 

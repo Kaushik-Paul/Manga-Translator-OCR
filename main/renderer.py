@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import re
 
 import cv2
 import numpy as np
@@ -144,6 +145,7 @@ def render_text_on_image(
     h: int,
     font_path: str | None = None,
     region_mask: NDArray | None = None,
+    style_hint: str | None = None,
     padding: int = 6,
 ) -> NDArray:
     """
@@ -156,6 +158,7 @@ def render_text_on_image(
         text: Translated text to render.
         x, y, w, h: Bounding box of the target region.
         font_path: Path to a TTF font file.
+        style_hint: Optional style override ("dialogue" or "sfx").
         padding: Internal padding.
 
     Returns:
@@ -165,7 +168,11 @@ def render_text_on_image(
         return image
 
     result = image.copy()
-    text_style = _infer_text_style(text, w, h)
+    pre_render = result.copy()
+    if style_hint in {"dialogue", "sfx"}:
+        text_style = style_hint
+    else:
+        text_style = _infer_text_style(text, w, h)
 
     # Convert BGR to RGB for PIL
     rgb = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
@@ -176,7 +183,7 @@ def render_text_on_image(
 
     # Place text near the original glyph cluster inside the region when possible.
     # For longer dialogue, optionally expand toward the enclosing bubble shape.
-    box_x, box_y, box_w, box_h, bubble_used = _resolve_text_box(
+    box_x, box_y, box_w, box_h, bubble_used, bubble_clip_mask_local = _resolve_text_box(
         x=x,
         y=y,
         w=w,
@@ -188,13 +195,17 @@ def render_text_on_image(
     )
     non_bubble_dialogue = text_style == "dialogue" and not bubble_used
     if non_bubble_dialogue:
-        # Non-bubble regions are often SFX/noise; keep wording compact.
-        max_words = 5 if (box_w * box_h) < 12000 else 7
-        text = _compress_dialogue_for_tiny_box(text, max_words=max_words)
+        # Non-bubble regions are often noisy merged text; force compact phrasing.
+        text = _tighten_non_bubble_dialogue(text=text, box_w=box_w, box_h=box_h)
+        if _is_low_signal_dialogue_fragment(text):
+            return image
+        if _prefer_sfx_for_free_text(text=text, box_w=box_w, box_h=box_h):
+            text_style = "sfx"
+            non_bubble_dialogue = False
     if _is_punctuation_only(text):
         return image
 
-    is_tall_dialogue = text_style == "dialogue" and box_h > box_w * 1.35
+    is_tall_dialogue = text_style == "dialogue" and box_h > box_w * 1.20
     if font_path:
         font_file = font_path
     elif _contains_cjk(text):
@@ -211,6 +222,21 @@ def render_text_on_image(
     text_padding = max(2, padding - 2) if text_style == "dialogue" else padding
     avail_w = box_w - 2 * text_padding
     avail_h = box_h - 2 * text_padding
+    box_clip_mask = _crop_clip_mask_to_box(
+        bubble_clip_mask_local=bubble_clip_mask_local,
+        region_x=x,
+        region_y=y,
+        region_w=w,
+        region_h=h,
+        box_x=box_x,
+        box_y=box_y,
+        box_w=box_w,
+        box_h=box_h,
+    )
+    if box_clip_mask is not None:
+        effective_w = _effective_mask_text_width(box_clip_mask)
+        if effective_w > 14:
+            avail_w = min(avail_w, max(10, effective_w - 2 * text_padding))
     if avail_w <= 10 or avail_h <= 10:
         return image
 
@@ -236,6 +262,26 @@ def render_text_on_image(
         style=text_style,
         max_size_cap=font_cap,
     )
+    if text_style == "sfx" and lines:
+        widest = _max_line_width(draw, lines, font)
+        if widest > int(avail_w * 1.08):
+            compact_text = _compact_sfx_text(text)
+            if compact_text and compact_text != text:
+                font2, lines2, line_spacing2 = _fit_text_to_box(
+                    draw=draw,
+                    text=compact_text,
+                    max_w=avail_w,
+                    max_h=avail_h,
+                    font_path=font_file,
+                    style=text_style,
+                    max_size_cap=font_cap,
+                )
+                if lines2:
+                    font, lines, line_spacing = font2, lines2, line_spacing2
+                    text = compact_text
+                    widest = _max_line_width(draw, lines, font)
+        if (not bubble_used) and widest > int(avail_w * 1.12):
+            return image
 
     # If dialogue still overflows into too many tiny lines, aggressively shorten.
     rendered_area = box_w * box_h
@@ -264,6 +310,8 @@ def render_text_on_image(
 
     if not lines:
         return image
+    if _is_overbroken_sfx(text=text, text_style=text_style, lines=lines, font=font):
+        return image
     if _should_skip_render_text(
         text=text,
         box_w=box_w,
@@ -285,7 +333,7 @@ def render_text_on_image(
 
     # Center vertically
     start_y = box_y + text_padding + max(0, (avail_h - total_text_height) // 2)
-    x_anchor = box_x + text_padding + max(0, (box_w - 2 * text_padding - avail_w) // 2)
+    x_anchor = box_x + text_padding
     stroke_width = 1 if getattr(font, "size", 12) < 18 else 2
 
     # Draw each line centered horizontally
@@ -293,6 +341,18 @@ def render_text_on_image(
     for i, line in enumerate(lines):
         lw, lh = line_metrics[i]
         line_x = x_anchor + max(0, (avail_w - lw) // 2)
+        if box_clip_mask is not None:
+            local_y = current_y - box_y
+            target_rel_x = line_x - box_x
+            masked_rel_x = _fit_line_x_to_mask(
+                mask=box_clip_mask,
+                y=local_y,
+                line_h=lh,
+                line_w=lw,
+                default_x=target_rel_x,
+            )
+            if masked_rel_x is not None:
+                line_x = box_x + masked_rel_x
 
         # Draw outline for readability (stroke)
         draw.text(
@@ -307,8 +367,21 @@ def render_text_on_image(
         current_y += lh + line_spacing
 
     # Convert back to BGR
-    result = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-    return result
+    rendered = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+    if (
+        bubble_clip_mask_local is None
+        or bubble_clip_mask_local.shape[:2] != (h, w)
+        or cv2.countNonZero(bubble_clip_mask_local.astype(np.uint8)) == 0
+    ):
+        return rendered
+
+    # Keep new text only inside the detected bubble mask.
+    clip_mask_full = np.zeros(result.shape[:2], dtype=np.uint8)
+    clip_mask_full[y : y + h, x : x + w] = bubble_clip_mask_local.astype(np.uint8)
+    keep = clip_mask_full > 0
+    clipped = pre_render.copy()
+    clipped[keep] = rendered[keep]
+    return clipped
 
 
 def _infer_text_style(text: str, w: int, h: int) -> str:
@@ -334,7 +407,7 @@ def _resolve_text_box(
     region_image: NDArray,
     translated_text: str,
     text_style: str,
-) -> tuple[int, int, int, int, bool]:
+) -> tuple[int, int, int, int, bool, NDArray | None]:
     """
     Resolve a final text placement box.
 
@@ -352,7 +425,7 @@ def _resolve_text_box(
             translated_text=translated_text,
         )
     sx, sy, sw, sh = _resolve_sfx_box(x=x, y=y, w=w, h=h, region_mask=region_mask)
-    return (sx, sy, sw, sh, False)
+    return (sx, sy, sw, sh, False, None)
 
 
 def _resolve_dialogue_box(
@@ -363,7 +436,7 @@ def _resolve_dialogue_box(
     region_mask: NDArray | None,
     region_image: NDArray,
     translated_text: str,
-) -> tuple[int, int, int, int, bool]:
+) -> tuple[int, int, int, int, bool, NDArray | None]:
     """
     Resolve a box for dialogue text.
 
@@ -387,44 +460,70 @@ def _resolve_dialogue_box(
         translated_text=translated_text,
     )
 
-    anchor = _mask_centroid(region_mask, w, h)
-    if anchor is None:
-        anchor = (w // 2, h // 2)
-    bubble = _estimate_bubble_box(region_image=region_image, anchor=anchor)
-    if bubble is None:
-        return (*fallback_box, False)
+    center_anchor = (w // 2, h // 2)
+    mask_anchor = _mask_centroid(region_mask, w, h)
+    anchors: list[tuple[int, int]] = [center_anchor]
+    if mask_anchor is not None and mask_anchor != center_anchor:
+        anchors.append(mask_anchor)
 
-    bx, by, bw, bh = bubble
+    bubble_mask = None
+    for anchor in anchors:
+        bubble_mask = _extract_bubble_mask(
+            region_image=region_image,
+            anchor=anchor,
+            region_mask=region_mask,
+        )
+        if bubble_mask is not None:
+            break
+    if bubble_mask is None:
+        for anchor in anchors:
+            bubble_box = _estimate_bubble_box(region_image=region_image, anchor=anchor)
+            if bubble_box is None:
+                continue
+            bx, by, bw, bh = bubble_box
+            bubble_mask = np.zeros((h, w), dtype=np.uint8)
+            bubble_mask[by : by + bh, bx : bx + bw] = 255
+            break
+        if bubble_mask is None:
+            return (*fallback_box, False, None)
+
+    bubble_bbox = _mask_bbox(bubble_mask)
+    if bubble_bbox is None:
+        return (*fallback_box, False, None)
+    bx1, by1, bx2, by2 = bubble_bbox
+    bx, by, bw, bh = bx1, by1, (bx2 - bx1), (by2 - by1)
     bubble_area = bw * bh
     region_area = max(1, w * h)
     if bubble_area < int(region_area * 0.16):
-        return (*fallback_box, False)
+        return (*fallback_box, False, None)
     if bubble_area > int(region_area * 0.97):
-        return (*fallback_box, False)
+        return (*fallback_box, False, None)
 
-    # Shrink inside the bubble so text stays off the border.
-    shrink_x = max(4, int(bw * 0.10))
-    shrink_y = max(4, int(bh * 0.12))
-    x1 = min(w - 1, max(0, bx + shrink_x))
-    y1 = min(h - 1, max(0, by + shrink_y))
-    x2 = min(w, max(x1 + 1, bx + bw - shrink_x))
-    y2 = min(h, max(y1 + 1, by + bh - shrink_y))
+    bubble_render_mask = _prepare_bubble_render_mask(bubble_mask)
+    if bubble_render_mask is None:
+        return (*fallback_box, False, None)
 
+    fit_bbox = _mask_bbox(bubble_render_mask)
+    if fit_bbox is None:
+        return (*fallback_box, False, None)
+    x1, y1, x2, y2 = fit_bbox
+    shrink_ratio = 0.10 if (y2 - y1) > (x2 - x1) * 1.20 else 0.06
+    x1, y1, x2, y2 = _shrink_centered_box(x1, y1, x2, y2, shrink_ratio)
     fit_w = x2 - x1
     fit_h = y2 - y1
     min_w = max(28, int(w * 0.30))
     min_h = max(24, int(h * 0.30))
     if fit_w < min_w or fit_h < min_h:
-        return (*fallback_box, False)
+        return (*fallback_box, False, None)
 
     # For longer dialogue, avoid overly tight boxes.
     if len(translated_text.strip()) >= 18:
         min_long_w = max(min_w, int(w * 0.45))
         min_long_h = max(min_h, int(h * 0.42))
         if fit_w < min_long_w or fit_h < min_long_h:
-            return (*fallback_box, False)
+            return (*fallback_box, False, None)
 
-    return (x + x1, y + y1, fit_w, fit_h, True)
+    return (x + x1, y + y1, fit_w, fit_h, True, bubble_render_mask)
 
 
 def _dialogue_fallback_box(
@@ -554,6 +653,244 @@ def _mask_centroid(
     return (int(np.mean(xs)), int(np.mean(ys)))
 
 
+def _extract_bubble_mask(
+    region_image: NDArray,
+    anchor: tuple[int, int],
+    region_mask: NDArray | None = None,
+) -> NDArray | None:
+    """
+    Extract an explicit bubble mask using flood-fill, similar to MIT's approach.
+
+    The seed is chosen near OCR-mask centroid and constrained by Canny edges so
+    fill stays inside enclosed speech bubble boundaries.
+    """
+    if region_image.size == 0:
+        return None
+
+    gray = cv2.cvtColor(region_image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    h, w = gray.shape[:2]
+    if h < 8 or w < 8:
+        return None
+
+    ax = int(np.clip(anchor[0], 0, max(0, w - 1)))
+    ay = int(np.clip(anchor[1], 0, max(0, h - 1)))
+
+    edges = cv2.Canny(blurred, 70, 140, L2gradient=True)
+    edges = cv2.dilate(
+        edges,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+
+    flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    flood_mask[1 : h + 1, 1 : w + 1][edges > 0] = 1
+
+    blocked_seed_mask: NDArray | None = None
+    if region_mask is not None and region_mask.shape[:2] == (h, w):
+        if region_mask.max() > 1:
+            _, seed_block = cv2.threshold(region_mask, 127, 255, cv2.THRESH_BINARY)
+        else:
+            seed_block = (region_mask > 0).astype(np.uint8) * 255
+        blocked_seed_mask = cv2.dilate(
+            seed_block.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            iterations=1,
+        )
+
+    seed = _find_fill_seed(
+        blurred,
+        flood_mask,
+        (ax, ay),
+        blocked_mask=blocked_seed_mask,
+    )
+    if seed is None:
+        return None
+    sx, sy = seed
+
+    fill_src = blurred.copy()
+    diff = int(np.clip(np.std(blurred) * 0.30, 8, 24))
+    flags = 4 | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
+    area, _, _, _ = cv2.floodFill(
+        fill_src,
+        flood_mask,
+        (sx, sy),
+        255,
+        loDiff=diff,
+        upDiff=diff,
+        flags=flags,
+    )
+    min_area = max(220, int(h * w * 0.02))
+    if area < min_area:
+        return None
+
+    filled = (flood_mask[1:-1, 1:-1] == 255).astype(np.uint8) * 255
+    if filled[sy, sx] == 0:
+        return None
+
+    # Keep only the connected component containing the seed.
+    num_labels, labels, _, _ = cv2.connectedComponentsWithStats(filled, connectivity=8)
+    label = int(labels[sy, sx])
+    if label <= 0 or label >= num_labels:
+        return None
+
+    component = (labels == label).astype(np.uint8) * 255
+    comp_area = cv2.countNonZero(component)
+    if comp_area < min_area:
+        return None
+    if comp_area > int(h * w * 0.94):
+        return None
+
+    # Very dark, huge fills are often panel/background leakage.
+    mean_val = float(np.mean(gray[component > 0])) if comp_area > 0 else 0.0
+    if mean_val < 95 and comp_area > int(h * w * 0.55):
+        return None
+    # Reject colorful large fills (skin/clothes/panel background) that are not
+    # speech bubbles. Bubbles are typically low-saturation interiors.
+    hsv = cv2.cvtColor(region_image, cv2.COLOR_BGR2HSV)
+    sat_vals = hsv[:, :, 1][component > 0]
+    if sat_vals.size > 0:
+        mean_sat = float(np.mean(sat_vals))
+        bright_ratio = float(np.mean(gray[component > 0] > 185))
+        if mean_sat > 52 and comp_area > int(h * w * 0.12):
+            return None
+        if mean_sat > 42 and bright_ratio < 0.35 and comp_area > int(h * w * 0.18):
+            return None
+
+    k = _odd(max(3, int(round(np.sqrt(comp_area) / 30))))
+    component = cv2.morphologyEx(
+        component,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)),
+        iterations=1,
+    )
+    component = cv2.morphologyEx(
+        component,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+    return component
+
+
+def _find_fill_seed(
+    gray: NDArray,
+    flood_mask: NDArray,
+    seed: tuple[int, int],
+    blocked_mask: NDArray | None = None,
+) -> tuple[int, int] | None:
+    """Find a nearby unblocked flood-fill seed, preferring brighter pixels."""
+    h, w = gray.shape[:2]
+    sx = int(np.clip(seed[0], 0, max(0, w - 1)))
+    sy = int(np.clip(seed[1], 0, max(0, h - 1)))
+
+    def is_open(x: int, y: int) -> bool:
+        if not (0 <= x < w and 0 <= y < h):
+            return False
+        if flood_mask[y + 1, x + 1] != 0:
+            return False
+        if blocked_mask is not None and blocked_mask.shape[:2] == (h, w):
+            return blocked_mask[y, x] == 0
+        return True
+
+    if is_open(sx, sy):
+        return (sx, sy)
+
+    max_radius = max(6, int(min(h, w) * 0.35))
+    best: tuple[int, int] | None = None
+    best_score = -1e9
+    for r in range(1, max_radius + 1):
+        x0 = max(0, sx - r)
+        x1 = min(w - 1, sx + r)
+        y0 = max(0, sy - r)
+        y1 = min(h - 1, sy + r)
+
+        for x in range(x0, x1 + 1):
+            for y in (y0, y1):
+                if not is_open(x, y):
+                    continue
+                score = float(gray[y, x]) - (abs(x - sx) + abs(y - sy)) * 1.2
+                if score > best_score:
+                    best_score = score
+                    best = (x, y)
+
+        for y in range(y0 + 1, y1):
+            for x in (x0, x1):
+                if not is_open(x, y):
+                    continue
+                score = float(gray[y, x]) - (abs(x - sx) + abs(y - sy)) * 1.2
+                if score > best_score:
+                    best_score = score
+                    best = (x, y)
+
+        if best is not None and r >= 4:
+            break
+
+    return best
+
+
+def _prepare_bubble_render_mask(mask: NDArray) -> NDArray | None:
+    """Slightly shrink the bubble mask to keep text away from the outline."""
+    if mask.size == 0:
+        return None
+    comp_area = cv2.countNonZero(mask.astype(np.uint8))
+    if comp_area < 180:
+        return None
+
+    k = _odd(max(3, int(round(np.sqrt(comp_area) / 36))))
+    eroded = cv2.erode(
+        mask.astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)),
+        iterations=1,
+    )
+    if cv2.countNonZero(eroded) >= max(120, int(comp_area * 0.35)):
+        return eroded
+    return mask.astype(np.uint8)
+
+
+def _mask_bbox(mask: NDArray) -> tuple[int, int, int, int] | None:
+    """Return x1,y1,x2,y2 bounds for non-zero mask pixels."""
+    ys, xs = np.where(mask > 0)
+    if len(xs) < 20:
+        return None
+    x1 = int(xs.min())
+    y1 = int(ys.min())
+    x2 = int(xs.max()) + 1
+    y2 = int(ys.max()) + 1
+    return (x1, y1, x2, y2)
+
+
+def _shrink_centered_box(
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    shrink_percent: float,
+) -> tuple[int, int, int, int]:
+    """Shrink a box uniformly from the center (comic-translate style)."""
+    if shrink_percent <= 0:
+        return (x1, y1, x2, y2)
+    cx = (x1 + x2) * 0.5
+    cy = (y1 + y2) * 0.5
+    w = max(1.0, float(x2 - x1))
+    h = max(1.0, float(y2 - y1))
+    scale = max(0.2, 1.0 - shrink_percent)
+    nw = w * scale
+    nh = h * scale
+    sx1 = int(round(cx - nw * 0.5))
+    sy1 = int(round(cy - nh * 0.5))
+    sx2 = int(round(cx + nw * 0.5))
+    sy2 = int(round(cy + nh * 0.5))
+    if sx2 <= sx1 or sy2 <= sy1:
+        return (x1, y1, x2, y2)
+    return (sx1, sy1, sx2, sy2)
+
+
+def _odd(value: int) -> int:
+    """Round up to odd integer."""
+    return value if value % 2 == 1 else value + 1
+
+
 def _estimate_bubble_box(
     region_image: NDArray,
     anchor: tuple[int, int],
@@ -649,6 +986,7 @@ def _fit_text_to_box(
         max_size = min(max_size, 42)
     else:
         max_size = min(max_size, 54)
+        min_size = min(min_size, 6)
     if max_size_cap is not None:
         max_size = min(max_size, max_size_cap)
 
@@ -670,7 +1008,13 @@ def _fit_text_to_box(
         int,
     ]:
         font = _load_font(size)
-        lines = _wrap_text(draw, text, font, max_w)
+        lines = _wrap_text(
+            draw,
+            text,
+            font,
+            max_w,
+            allow_char_wrap=(style != "sfx"),
+        )
         spacing = _line_spacing_for_size(size, style)
         if not lines:
             return font, [], spacing, 0, 0
@@ -726,11 +1070,44 @@ def _compress_dialogue_for_tiny_box(text: str, max_words: int) -> str:
     return f"{trimmed}..."
 
 
+def _tighten_non_bubble_dialogue(text: str, box_w: int, box_h: int) -> str:
+    """Apply hard budgets for dialogue rendered outside detected bubbles."""
+    clean = " ".join(text.replace("\r", " ").replace("\n", " ").split())
+    if not clean:
+        return clean
+
+    area = max(1, box_w * box_h)
+    aspect = box_h / float(max(1, box_w))
+    if area < 5000:
+        max_words = 3
+        max_chars = 18
+    elif area < 12000:
+        max_words = 4
+        max_chars = 30
+    else:
+        max_words = 4
+        max_chars = 32
+
+    if aspect >= 1.50:
+        max_words = min(max_words, 4)
+        max_chars = min(max_chars, 26)
+
+    clipped = _compress_dialogue_for_tiny_box(clean, max_words=max_words)
+    if len(clipped) > max_chars:
+        clipped = clipped[:max_chars].rstrip(".,;:!?- ")
+        if clipped and not clipped.endswith("..."):
+            clipped += "..."
+    return clipped
+
+
 def _is_punctuation_only(text: str) -> bool:
     """Return True when text has no letters/digits and is only punctuation/symbols."""
     cleaned = text.strip()
     if not cleaned:
         return True
+    # Keep ellipsis-only bubbles instead of blanking them out.
+    if _is_ellipsis_like(cleaned):
+        return False
     return not any(ch.isalnum() for ch in cleaned)
 
 
@@ -747,6 +1124,8 @@ def _should_skip_render_text(
         return True
     if _is_punctuation_only(clean):
         return True
+    if _is_ellipsis_like(clean):
+        return False
 
     area = max(1, box_w * box_h)
     alpha_num = sum(1 for c in clean if c.isalnum())
@@ -763,6 +1142,220 @@ def _should_skip_render_text(
     if (not bubble_used) and area < 3000 and len(words) <= 2 and alpha_num <= 3:
         return True
     return False
+
+
+def _prefer_sfx_for_free_text(text: str, box_w: int, box_h: int) -> bool:
+    """Use SFX style for short non-bubble snippets to avoid heavy dialogue rendering."""
+    clean = " ".join(text.split())
+    words = clean.split(" ") if clean else []
+    alpha = sum(1 for c in clean if c.isalpha())
+    area = max(1, box_w * box_h)
+    if area < 12000 and len(words) <= 4 and alpha <= 24:
+        return True
+    if len(words) <= 2 and alpha <= 18:
+        return True
+    return False
+
+
+def _is_low_signal_dialogue_fragment(text: str) -> bool:
+    """Detect low-information one-word fragments from noisy OCR/translation."""
+    tokens = [w.lower() for w in re.findall(r"[A-Za-z']+", text)]
+    if not tokens:
+        return True
+
+    low_signal = {
+        "that",
+        "that's",
+        "this",
+        "there",
+        "then",
+        "well",
+        "okay",
+        "just",
+        "so",
+        "what",
+        "is",
+        "are",
+        "ah",
+        "oh",
+        "huh",
+    }
+    if len(tokens) == 1:
+        return tokens[0] in low_signal
+    if len(tokens) == 2:
+        return all(t in low_signal for t in tokens)
+    if len(tokens) <= 3 and sum(1 for t in tokens if t in low_signal) >= (len(tokens) - 1):
+        return True
+    if len(tokens) <= 4 and (
+        ("happened" in tokens or "happening" in tokens)
+        and tokens[0] in {"that", "that's", "this", "it"}
+    ):
+        return True
+    return False
+
+
+def _compact_sfx_text(text: str) -> str:
+    """Compress noisy SFX phrases to improve fit in narrow boxes."""
+    tokens = re.findall(r"[A-Za-z']+", text)
+    if not tokens:
+        return text.strip()
+
+    compacted: list[str] = []
+    for token in tokens[:3]:
+        t = token.lower()
+        t = re.sub(r"(.)\1{2,}", r"\1\1", t)
+        compacted.append(t)
+
+    clean = " ".join(compacted)
+    if len(compacted) >= 2:
+        clean = " ".join(compacted[:2])
+    if len(clean) > 14:
+        clean = clean[:14].rstrip()
+    return clean.capitalize()
+
+
+def _max_line_width(
+    draw: ImageDraw.ImageDraw,
+    lines: list[str],
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+) -> int:
+    """Return the widest line in pixels."""
+    if not lines:
+        return 0
+    widths: list[int] = []
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        widths.append(max(0, bbox[2] - bbox[0]))
+    return max(widths) if widths else 0
+
+
+def _is_overbroken_sfx(
+    text: str,
+    text_style: str,
+    lines: list[str],
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+) -> bool:
+    """
+    Suppress tiny SFX renders that break one short word into many fragments.
+    """
+    if text_style != "sfx":
+        return False
+    words = text.split()
+    if len(lines) <= 1:
+        return False
+
+    font_size = getattr(font, "size", 12)
+    if len(words) == 1:
+        token = words[0].strip(".,;:!?-_'\"")
+        if len(token) <= 7 and len(lines) >= 2 and font_size <= 10:
+            return True
+        if len(token) <= 10 and len(lines) >= 3:
+            return True
+
+    if len(words) <= 2 and len(lines) >= 4 and font_size <= 11:
+        return True
+
+    return font_size <= 8
+
+
+def _crop_clip_mask_to_box(
+    bubble_clip_mask_local: NDArray | None,
+    region_x: int,
+    region_y: int,
+    region_w: int,
+    region_h: int,
+    box_x: int,
+    box_y: int,
+    box_w: int,
+    box_h: int,
+) -> NDArray | None:
+    """Crop region-local bubble mask into the chosen render box."""
+    if (
+        bubble_clip_mask_local is None
+        or bubble_clip_mask_local.shape[:2] != (region_h, region_w)
+    ):
+        return None
+
+    lx1 = box_x - region_x
+    ly1 = box_y - region_y
+    lx2 = lx1 + box_w
+    ly2 = ly1 + box_h
+    if lx1 < 0 or ly1 < 0 or lx2 > region_w or ly2 > region_h:
+        return None
+
+    crop = bubble_clip_mask_local[ly1:ly2, lx1:lx2].astype(np.uint8)
+    if crop.shape[:2] != (box_h, box_w):
+        return None
+    if cv2.countNonZero(crop) < 20:
+        return None
+    return crop
+
+
+def _effective_mask_text_width(mask: NDArray) -> int:
+    """Estimate an interior usable line width from a bubble mask."""
+    rows = mask > 0
+    widths = rows.sum(axis=1)
+    widths = widths[widths > 0]
+    if widths.size == 0:
+        return 0
+    return int(np.percentile(widths, 45))
+
+
+def _fit_line_x_to_mask(
+    mask: NDArray,
+    y: int,
+    line_h: int,
+    line_w: int,
+    default_x: int,
+) -> int | None:
+    """Center a line inside the mask span for the corresponding scan rows."""
+    h, w = mask.shape[:2]
+    if h <= 0 or w <= 0:
+        return None
+    y0 = max(0, int(y))
+    y1 = min(h, int(y + max(1, line_h)))
+    if y1 <= y0:
+        return None
+
+    band = mask[y0:y1, :] > 0
+    row_left: list[int] = []
+    row_right: list[int] = []
+    for row in band:
+        xs = np.where(row)[0]
+        if xs.size == 0:
+            continue
+        row_left.append(int(xs.min()))
+        row_right.append(int(xs.max()))
+
+    if not row_left:
+        return None
+
+    left = int(np.percentile(np.array(row_left), 25))
+    right = int(np.percentile(np.array(row_right), 75))
+    avail = right - left + 1
+    if avail < max(8, int(line_w * 0.55)):
+        # Fall back to widest visible span in this band.
+        best_idx = int(np.argmax(np.array(row_right) - np.array(row_left)))
+        left = row_left[best_idx]
+        right = row_right[best_idx]
+        avail = right - left + 1
+
+    if avail <= 6:
+        return None
+
+    x = left + max(0, (avail - line_w) // 2)
+    max_x = max(0, w - line_w)
+    if max_x <= 0:
+        return 0
+    return int(np.clip(x, 0, max_x))
+
+
+def _is_ellipsis_like(text: str) -> bool:
+    """Return True when text is only ellipsis-like punctuation."""
+    compact = text.replace(" ", "").strip()
+    if not compact:
+        return False
+    return all(ch in ".…·･・" for ch in compact)
 
 
 def _contains_cjk(text: str) -> bool:
@@ -784,6 +1377,7 @@ def _wrap_text(
     text: str,
     font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
     max_width: int,
+    allow_char_wrap: bool = True,
 ) -> list[str]:
     """Wrap text to fit within max_width pixels."""
     paragraphs = [p.strip() for p in text.replace("\r", "\n").split("\n") if p.strip()]
@@ -808,10 +1402,13 @@ def _wrap_text(
                 current_line = word
         lines.append(current_line)
 
-        # If a word/line exceeds width, fall back to character-level wrapping.
+        # If a word/line exceeds width, optionally fall back to character wrapping.
         for line in lines:
             bbox = draw.textbbox((0, 0), line, font=font)
             if bbox[2] - bbox[0] <= max_width:
+                wrapped.append(line)
+                continue
+            if not allow_char_wrap:
                 wrapped.append(line)
                 continue
 

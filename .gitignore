@@ -255,6 +255,8 @@ implementation/**
 manga_testing/**
 !manga_testing/.gitkeep
 
+temp_repo/**
+!temp_repo/.gitkeep
 
 
 .DS_Store
