@@ -445,7 +445,7 @@ def _resolve_dialogue_box(
     This follows the same idea as comic-translate's best-render-area flow:
     prioritize bubble interior (when detectable), otherwise keep the full region.
     """
-    inset = max(2, int(min(w, h) * 0.03))
+    inset = max(3, int(min(w, h) * 0.05))
     default_box = (
         x + inset,
         y + inset,
@@ -509,7 +509,7 @@ def _resolve_dialogue_box(
     if fit_bbox is None:
         return (*fallback_box, False, None)
     x1, y1, x2, y2 = fit_bbox
-    shrink_ratio = 0.10 if (y2 - y1) > (x2 - x1) * 1.20 else 0.06
+    shrink_ratio = 0.12 if (y2 - y1) > (x2 - x1) * 1.20 else 0.08
     x1, y1, x2, y2 = _shrink_centered_box(x1, y1, x2, y2, shrink_ratio)
     fit_w = x2 - x1
     fit_h = y2 - y1
@@ -985,7 +985,9 @@ def _fit_text_to_box(
     """Find the largest font size where the wrapped text fits in the box."""
 
     if style == "dialogue":
-        max_size = min(max_size, 42)
+        # Scale max font size based on available box height for better fill
+        dynamic_max = min(48, max(18, max_h // 2))
+        max_size = min(max_size, dynamic_max)
     else:
         max_size = min(max_size, 54)
         min_size = min(min_size, 6)
@@ -1002,6 +1004,7 @@ def _fit_text_to_box(
 
     def _layout_at_size(
         size: int,
+        allow_hyphenation: bool = False,
     ) -> tuple[
         ImageFont.FreeTypeFont | ImageFont.ImageFont,
         list[str],
@@ -1016,6 +1019,7 @@ def _fit_text_to_box(
             font,
             max_w,
             allow_char_wrap=(style != "sfx"),
+            allow_hyphenation=allow_hyphenation,
         )
         spacing = _line_spacing_for_size(size, style)
         if not lines:
@@ -1032,11 +1036,12 @@ def _fit_text_to_box(
         total_h = sum(heights) + (len(lines) - 1) * spacing
         return font, lines, spacing, max_line_w, total_h
 
+    # Binary search WITHOUT hyphenation — prefer smaller font over word breaks.
     lo, hi = min_size, max_size
     best: tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, list[str], int] | None = None
     while lo <= hi:
         mid = (lo + hi) // 2
-        font, lines, spacing, used_w, used_h = _layout_at_size(mid)
+        font, lines, spacing, used_w, used_h = _layout_at_size(mid, allow_hyphenation=False)
         if lines and used_w <= max_w and used_h <= max_h:
             best = (font, lines, spacing)
             lo = mid + 1
@@ -1046,8 +1051,8 @@ def _fit_text_to_box(
     if best is not None:
         return best
 
-    # Fallback to minimum size.
-    font, lines, spacing, _, _ = _layout_at_size(min_size)
+    # Fallback to minimum size WITH hyphenation as last resort.
+    font, lines, spacing, _, _ = _layout_at_size(min_size, allow_hyphenation=True)
     return font, lines, spacing
 
 
@@ -1055,7 +1060,7 @@ def _line_spacing_for_size(size: int, style: str) -> int:
     """Compute line spacing as a function of font size and text style."""
     if style == "sfx":
         return max(1, int(size * 0.10))
-    return max(2, int(size * 0.14))
+    return max(2, int(size * 0.18))
 
 
 def _compress_dialogue_for_tiny_box(text: str, max_words: int) -> str:
@@ -1380,8 +1385,15 @@ def _wrap_text(
     font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
     max_width: int,
     allow_char_wrap: bool = True,
+    allow_hyphenation: bool = True,
 ) -> list[str]:
-    """Wrap text to fit within max_width pixels."""
+    """Wrap text to fit within max_width pixels.
+
+    Uses word-boundary wrapping. When allow_hyphenation is True, words
+    that don't fit are split at natural English syllable boundaries.
+    When False, oversized words are kept whole (the caller should try
+    a smaller font size instead).
+    """
     paragraphs = [p.strip() for p in text.replace("\r", "\n").split("\n") if p.strip()]
     if not paragraphs:
         return []
@@ -1404,7 +1416,8 @@ def _wrap_text(
                 current_line = word
         lines.append(current_line)
 
-        # If a word/line exceeds width, optionally fall back to character wrapping.
+        # Handle lines that exceed max_width — try hyphenation instead of
+        # arbitrary character breaks.
         for line in lines:
             bbox = draw.textbbox((0, 0), line, font=font)
             if bbox[2] - bbox[0] <= max_width:
@@ -1414,17 +1427,105 @@ def _wrap_text(
                 wrapped.append(line)
                 continue
 
-            current = ""
-            for c in line:
-                test = current + c
-                cbbox = draw.textbbox((0, 0), test, font=font)
-                if cbbox[2] - cbbox[0] <= max_width:
-                    current = test
+            # Try to break at word boundaries within this line (it may be a
+            # single long word or a phrase whose first word is too wide).
+            line_words = line.split()
+            sub_lines: list[str] = []
+            for lw in line_words:
+                lw_bbox = draw.textbbox((0, 0), lw, font=font)
+                lw_width = lw_bbox[2] - lw_bbox[0]
+                if lw_width <= max_width:
+                    # Word fits — append or extend current sub-line
+                    if sub_lines:
+                        test = sub_lines[-1] + " " + lw
+                        test_bbox = draw.textbbox((0, 0), test, font=font)
+                        if test_bbox[2] - test_bbox[0] <= max_width:
+                            sub_lines[-1] = test
+                        else:
+                            sub_lines.append(lw)
+                    else:
+                        sub_lines.append(lw)
                 else:
-                    if current:
-                        wrapped.append(current)
-                    current = c
-            if current:
-                wrapped.append(current)
+                    # Single word too wide — try hyphenation if allowed
+                    if not allow_hyphenation:
+                        # Keep word whole; the caller (binary search) will
+                        # detect overflow and try a smaller font size.
+                        sub_lines.append(lw)
+                    else:
+                        parts = _hyphenate_word(lw)
+                        if len(parts) > 1:
+                            for part_idx, part in enumerate(parts):
+                                display = part + "-" if part_idx < len(parts) - 1 else part
+                                p_bbox = draw.textbbox((0, 0), display, font=font)
+                                if p_bbox[2] - p_bbox[0] <= max_width:
+                                    if sub_lines and part_idx > 0:
+                                        test = sub_lines[-1] + display
+                                        t_bbox = draw.textbbox((0, 0), test, font=font)
+                                        if t_bbox[2] - t_bbox[0] <= max_width:
+                                            sub_lines[-1] = test
+                                        else:
+                                            sub_lines.append(display)
+                                    else:
+                                        if sub_lines:
+                                            test = sub_lines[-1] + " " + display
+                                            t_bbox = draw.textbbox((0, 0), test, font=font)
+                                            if t_bbox[2] - t_bbox[0] <= max_width:
+                                                sub_lines[-1] = test
+                                            else:
+                                                sub_lines.append(display)
+                                        else:
+                                            sub_lines.append(display)
+                                else:
+                                    # Even hyphenated part doesn't fit — just add it
+                                    sub_lines.append(display)
+                        else:
+                            # No hyphenation possible — keep word whole
+                            sub_lines.append(lw)
+            wrapped.extend(sub_lines if sub_lines else [line])
 
     return wrapped
+
+
+def _hyphenate_word(word: str) -> list[str]:
+    """Split a word at natural English syllable boundaries.
+
+    Returns a list of parts. If no good split is found, returns [word].
+    Uses common English suffix patterns for break points.
+    """
+    clean = word.rstrip(".,;:!?-_'\"")
+    suffix = word[len(clean):]
+    if len(clean) < 4:
+        return [word]
+
+    # Common English break patterns (ordered by preference — try longest
+    # suffix first so we get the most balanced split).
+    patterns = [
+        "tion", "sion", "ment", "ness", "able", "ible",
+        "ful", "less", "ous", "ive", "ing", "ting",
+        "ally", "ely", "ily", "ly",
+        "er", "ed", "en", "est", "ize", "ise",
+        "ated", "ious", "eous", "tial", "cial",
+    ]
+
+    low = clean.lower()
+    best_split = -1
+    for pat in patterns:
+        idx = low.rfind(pat)
+        if idx > 1 and idx + len(pat) >= len(clean) - 1:
+            if idx > best_split:
+                best_split = idx
+
+    if best_split > 1 and best_split < len(clean) - 1:
+        return [clean[:best_split], clean[best_split:] + suffix]
+
+    # Fallback: split at roughly the middle between consonant/vowel boundary
+    vowels = set("aeiouAEIOU")
+    mid = len(clean) // 2
+    # Search outward from the middle for a consonant→vowel transition
+    for offset in range(0, len(clean) // 2):
+        for pos in (mid + offset, mid - offset):
+            if 2 <= pos < len(clean) - 1:
+                if clean[pos - 1] not in vowels and clean[pos] in vowels:
+                    return [clean[:pos], clean[pos:] + suffix]
+
+    return [word]
