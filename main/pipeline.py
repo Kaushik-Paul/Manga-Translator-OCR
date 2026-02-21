@@ -6,6 +6,7 @@ Flow: Load image → Detect text (ML model) → OCR → Translate → Inpaint + 
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import logging
 from pathlib import Path
@@ -13,7 +14,6 @@ import re
 
 import cv2
 import numpy as np
-from numpy.typing import NDArray
 
 from .config import Settings, settings
 from .detector import TextRegion, detect_text_regions
@@ -22,6 +22,7 @@ from .renderer import inpaint_text_region, render_text_on_image
 from .translator import TranslationConstraint, translate_texts
 
 logger = logging.getLogger(__name__)
+_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
 
 
 @dataclass
@@ -229,34 +230,85 @@ def translate_directory(
     cfg = config or settings
     input_dir = Path(input_dir)
 
-    if not input_dir.is_dir():
-        raise NotADirectoryError(f"Not a directory: {input_dir}")
-
-    # Find image files
-    image_extensions = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
-    image_files = sorted(
-        f
-        for f in input_dir.iterdir()
-        if f.suffix.lower() in image_extensions and f.is_file()
-    )
+    image_files = list_image_files(input_dir)
 
     if not image_files:
         logger.warning("No image files found in %s", input_dir)
         return []
 
     logger.info("Found %d images to translate in %s", len(image_files), input_dir)
+    return translate_images(image_files, config=cfg)
+
+
+def translate_images(
+    image_files: list[str | Path],
+    config: Settings | None = None,
+) -> list[Path]:
+    """
+    Translate a list of image files.
+
+    Processing mode:
+    - Local OCR (`USE_MODAL=false`): sequential
+    - Modal OCR (`USE_MODAL=true`): bounded parallel workers
+    """
+    cfg = config or settings
+    files = [Path(f) for f in image_files]
+    total = len(files)
+
+    if total == 0:
+        logger.warning("No input images provided.")
+        return []
 
     results: list[Path] = []
-    for i, img_path in enumerate(image_files, 1):
-        logger.info("\n[%d/%d] Processing %s...", i, len(image_files), img_path.name)
+    tasks = list(enumerate(files, start=1))
+
+    def _translate_one(task: tuple[int, Path]) -> tuple[Path | None, Exception | None]:
+        i, img_path = task
+        logger.info("\n[%d/%d] Processing %s...", i, total, img_path.name)
         try:
             out = translate_page(img_path, config=cfg)
-            results.append(out)
+            return out, None
         except Exception as e:
-            logger.error("Failed to process %s: %s", img_path.name, e)
+            return None, e
 
-    logger.info("\nDone! Translated %d/%d images.", len(results), len(image_files))
+    if cfg.use_modal and total > 1:
+        max_workers = min(cfg.modal_max_parallel_pages, total)
+        logger.info(
+            "Using parallel page processing with Modal (%d workers).",
+            max_workers,
+        )
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            ordered_results = list(pool.map(_translate_one, tasks))
+        for (_, img_path), (out, error) in zip(tasks, ordered_results):
+            if out is not None:
+                results.append(out)
+            elif error is not None:
+                logger.error("Failed to process %s: %s", img_path.name, error)
+    else:
+        for task in tasks:
+            _, img_path = task
+            out, error = _translate_one(task)
+            if out is not None:
+                results.append(out)
+            elif error is not None:
+                logger.error("Failed to process %s: %s", img_path.name, error)
+
+    logger.info("\nDone! Translated %d/%d images.", len(results), total)
     return results
+
+
+def is_image_file(path: str | Path) -> bool:
+    """Return True if `path` is a supported image file."""
+    p = Path(path)
+    return p.is_file() and p.suffix.lower() in _IMAGE_EXTENSIONS
+
+
+def list_image_files(input_dir: str | Path) -> list[Path]:
+    """List supported image files in a directory."""
+    input_path = Path(input_dir)
+    if not input_path.is_dir():
+        raise NotADirectoryError(f"Not a directory: {input_path}")
+    return sorted(f for f in input_path.iterdir() if is_image_file(f))
 
 
 def _resolve_output_path(

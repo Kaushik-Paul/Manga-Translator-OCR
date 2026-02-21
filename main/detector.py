@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from pathlib import Path
+from threading import Lock
 
 import cv2
 import numpy as np
@@ -114,6 +114,7 @@ class ComicTextDetector:
 
     _instance: ComicTextDetector | None = None
     _session = None
+    _session_lock = Lock()
 
     def __new__(cls) -> ComicTextDetector:
         if cls._instance is None:
@@ -124,27 +125,30 @@ class ComicTextDetector:
         """Download and load the ONNX model if not already loaded."""
         if self._session is not None:
             return
+        with self._session_lock:
+            if self._session is not None:
+                return
 
-        logger.info("Loading comic-text-detector ONNX model...")
+            logger.info("Loading comic-text-detector ONNX model...")
 
-        from huggingface_hub import hf_hub_download
-        import onnxruntime as ort
+            from huggingface_hub import hf_hub_download
+            import onnxruntime as ort
 
-        model_path = hf_hub_download(
-            repo_id=_MODEL_REPO,
-            filename=_MODEL_FILE,
-        )
-        logger.info("Model downloaded to: %s", model_path)
+            model_path = hf_hub_download(
+                repo_id=_MODEL_REPO,
+                filename=_MODEL_FILE,
+            )
+            logger.info("Model downloaded to: %s", model_path)
 
-        # Create ONNX Runtime session (CPU only)
-        sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        self._session = ort.InferenceSession(
-            model_path,
-            sess_options=sess_options,
-            providers=["CPUExecutionProvider"],
-        )
-        logger.info("comic-text-detector model loaded (CPU).")
+            # Create ONNX Runtime session (CPU only)
+            sess_options = ort.SessionOptions()
+            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            self._session = ort.InferenceSession(
+                model_path,
+                sess_options=sess_options,
+                providers=["CPUExecutionProvider"],
+            )
+            logger.info("comic-text-detector model loaded (CPU).")
 
     def detect(
         self,
