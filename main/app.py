@@ -115,6 +115,10 @@ def run(argv: list[str] | None = None) -> None:
 
     logger.info("Source language: %s", settings.source_lang)
     logger.info("Translation model: %s", settings.translation_model)
+    logger.info(
+        "Detection backend: %s",
+        "modal service" if settings.use_detection_model else "local model",
+    )
     logger.info("Output directory: %s", settings.output_dir)
     logger.info("─" * 40)
 

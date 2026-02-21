@@ -27,6 +27,14 @@ def _int_env(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    """Read a boolean from env with a sane fallback."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("true", "1", "yes", "on")
+
+
 @dataclass
 class Settings:
     """Application settings loaded from environment and CLI overrides."""
@@ -48,6 +56,10 @@ class Settings:
     use_modal: bool = field(
         default_factory=lambda: os.getenv("USE_MODAL", "true").lower()
         in ("true", "1", "yes")
+    )
+    # True -> Modal detector service. False -> local ONNX detector.
+    use_detection_model: bool = field(
+        default_factory=lambda: _bool_env("USE_DETECTION_MODEL", True)
     )
     # Conservative default for Modal starter/free plan workloads.
     modal_max_parallel_pages: int = field(

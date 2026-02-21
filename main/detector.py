@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 _MODEL_REPO = "mayocream/comic-text-detector-onnx"
 _MODEL_FILE = "comic-text-detector.onnx"
 _MODEL_INPUT_SIZE = (1024, 1024)  # Model expects 1024x1024 input
+_MODAL_DETECTOR_APP = "manga-detector-service"
+_MODAL_DETECTOR_CLASS = "ComicTextDetectorService"
 
 
 def _odd(value: int) -> int:
@@ -575,6 +577,108 @@ class ComicTextDetector:
         return True
 
 
+class ModalTextDetector(ComicTextDetector):
+    """
+    Detector that offloads ONNX mask inference to a Modal CPU service.
+
+    Region extraction and sorting still run locally so downstream behavior
+    stays aligned with the existing pipeline.
+    """
+
+    _instance: ModalTextDetector | None = None
+    _modal_detector = None
+    _modal_lock = Lock()
+
+    def __new__(cls) -> ModalTextDetector:
+        if cls._instance is None:
+            cls._instance = super(ComicTextDetector, cls).__new__(cls)
+        return cls._instance
+
+    def _ensure_modal(self) -> None:
+        if self._modal_detector is not None:
+            return
+        with self._modal_lock:
+            if self._modal_detector is not None:
+                return
+            import modal
+
+            logger.info("Connecting to Modal comic-text-detector service...")
+            DetectorCls = modal.Cls.from_name(_MODAL_DETECTOR_APP, _MODAL_DETECTOR_CLASS)
+            self._modal_detector = DetectorCls()
+            logger.info("Connected to Modal comic-text-detector service.")
+
+    @staticmethod
+    def _encode_png(image: NDArray) -> bytes:
+        ok, encoded = cv2.imencode(".png", image)
+        if not ok:
+            raise ValueError("Failed to encode image for Modal detector call.")
+        return encoded.tobytes()
+
+    @staticmethod
+    def _decode_mask(mask_bytes: bytes, expected_h: int, expected_w: int) -> NDArray:
+        if not mask_bytes:
+            return np.zeros((expected_h, expected_w), dtype=np.uint8)
+
+        payload = np.frombuffer(mask_bytes, dtype=np.uint8)
+        decoded = cv2.imdecode(payload, cv2.IMREAD_GRAYSCALE)
+        if decoded is None:
+            raise ValueError("Modal detector returned invalid mask bytes.")
+
+        if decoded.shape != (expected_h, expected_w):
+            decoded = cv2.resize(
+                decoded,
+                (expected_w, expected_h),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        return (decoded > 0).astype(np.uint8) * 255
+
+    def detect(
+        self,
+        image: NDArray,
+        text_threshold: float = 0.5,
+        min_area: int = 100,
+        padding: int = 5,
+    ) -> tuple[list[TextRegion], NDArray]:
+        self._ensure_modal()
+
+        h, w = image.shape[:2]
+        image_bytes = self._encode_png(image)
+
+        try:
+            text_mask_bytes = self._modal_detector.detect_mask.remote(
+                image_bytes, text_threshold
+            )
+        except Exception as e:
+            raise RuntimeError(
+                "Modal detection failed. Deploy `modal_detector_service.py` and "
+                "ensure your Modal auth/env vars are configured."
+            ) from e
+
+        text_mask = self._decode_mask(text_mask_bytes, expected_h=h, expected_w=w)
+        regions = self._extract_regions_from_mask(
+            image, text_mask, min_area=min_area, padding=padding
+        )
+        regions = _sort_manga_order(regions, page_width=w)
+        logger.info("Detected %d text regions using Modal comic-text-detector.", len(regions))
+        return regions, text_mask
+
+    def _ensure_model(self) -> None:
+        # No local ONNX session required when using Modal detector service.
+        pass
+
+
+def get_text_detector() -> ComicTextDetector:
+    """Factory for selecting local vs Modal detection backend."""
+    from .config import settings
+
+    if settings.use_detection_model:
+        logger.info("Using Modal comic-text-detector service.")
+        return ModalTextDetector()
+
+    logger.info("Using local comic-text-detector model.")
+    return ComicTextDetector()
+
+
 def detect_text_regions(
     image: NDArray,
     **kwargs,
@@ -588,7 +692,7 @@ def detect_text_regions(
     Returns:
         Tuple of (list of TextRegion, full-page text mask).
     """
-    detector = ComicTextDetector()
+    detector = get_text_detector()
     return detector.detect(image, **kwargs)
 
 
