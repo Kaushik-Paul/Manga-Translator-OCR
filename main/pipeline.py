@@ -70,7 +70,7 @@ def translate_page(
     ocr_engine = get_ocr_engine(cfg.source_lang)
     extracted_texts: list[str] = []
     for i, region in enumerate(regions):
-        text = ocr_engine.extract_text(region.cropped)
+        text = ocr_engine.extract_text(region.cropped, region.mask)
         extracted_texts.append(text)
         if text:
             logger.info("  Region %d: '%s'", i + 1, text[:80])
