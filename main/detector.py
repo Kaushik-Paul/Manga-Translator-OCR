@@ -29,6 +29,62 @@ _MODEL_FILE = "comic-text-detector.onnx"
 _MODEL_INPUT_SIZE = (1024, 1024)  # Model expects 1024x1024 input
 
 
+def _odd(value: int) -> int:
+    """Round up to the nearest odd integer."""
+    return value if value % 2 == 1 else value + 1
+
+
+def _boxes_are_near(
+    a: tuple[int, int, int, int], b: tuple[int, int, int, int], gap: int
+) -> bool:
+    """Return True if two boxes overlap or are within `gap` pixels."""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+
+    x_gap = max(0, max(ax1, bx1) - min(ax2, bx2))
+    y_gap = max(0, max(ay1, by1) - min(ay2, by2))
+    return x_gap <= gap and y_gap <= gap
+
+
+def _merge_nearby_boxes(
+    boxes: list[tuple[int, int, int, int]], gap: int
+) -> list[tuple[int, int, int, int]]:
+    """Merge overlapping/nearby boxes into larger blocks."""
+    if not boxes:
+        return []
+
+    merged = boxes.copy()
+    changed = True
+    while changed:
+        changed = False
+        next_boxes: list[tuple[int, int, int, int]] = []
+        used = [False] * len(merged)
+
+        for i, base in enumerate(merged):
+            if used[i]:
+                continue
+            bx1, by1, bx2, by2 = base
+            used[i] = True
+
+            for j in range(i + 1, len(merged)):
+                if used[j]:
+                    continue
+                if _boxes_are_near((bx1, by1, bx2, by2), merged[j], gap):
+                    ox1, oy1, ox2, oy2 = merged[j]
+                    bx1 = min(bx1, ox1)
+                    by1 = min(by1, oy1)
+                    bx2 = max(bx2, ox2)
+                    by2 = max(by2, oy2)
+                    used[j] = True
+                    changed = True
+
+            next_boxes.append((bx1, by1, bx2, by2))
+
+        merged = next_boxes
+
+    return merged
+
+
 @dataclass
 class TextRegion:
     """A detected text region with its bounding box and cropped image."""
@@ -231,59 +287,288 @@ class ComicTextDetector:
         """Extract text regions from the binary mask, merging nearby text into blocks."""
         h, w = image.shape[:2]
 
-        # Aggressively merge nearby text into speech-bubble-sized blocks
-        # Step 1: Close small gaps between characters
-        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-        cleaned = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=3)
+        # Merge nearby characters into dialogue-sized blocks with dynamic kernels.
+        # Fixed, very-large kernels tend to over-merge across nearby bubbles/panels.
+        short_side = min(h, w)
+        close_size = _odd(max(5, int(round(short_side * 0.006))))
+        dilate_size = _odd(max(11, int(round(short_side * 0.013))))
+        close2_size = _odd(max(9, int(round(short_side * 0.010))))
 
-        # Step 2: Dilate aggressively to merge text within the same bubble
-        # Use a large kernel to connect text lines that belong together
-        kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
-        cleaned = cv2.dilate(cleaned, kernel_dilate, iterations=3)
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (close_size, close_size))
+        cleaned = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
 
-        # Step 3: Close again to fill any remaining gaps
-        kernel_close2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel_close2, iterations=2)
+        kernel_dilate = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (dilate_size, dilate_size)
+        )
+        cleaned = cv2.dilate(cleaned, kernel_dilate, iterations=1)
+
+        kernel_close2 = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (close2_size, close2_size)
+        )
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel_close2, iterations=1)
 
         # Find contours on the merged mask
         contours, _ = cv2.findContours(
             cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
 
-        regions: list[TextRegion] = []
+        candidate_boxes: list[tuple[int, int, int, int]] = []
         for contour in contours:
             area = cv2.contourArea(contour)
             if area < min_area:
                 continue
 
             rx, ry, rw, rh = cv2.boundingRect(contour)
-
-            # Skip very tiny regions (likely noise)
             if rw < 15 or rh < 15:
                 continue
+            candidate_boxes.append((rx, ry, rx + rw, ry + rh))
 
-            # Apply padding
+        merge_gap = max(10, int(short_side * 0.012))
+        merged_boxes = _merge_nearby_boxes(candidate_boxes, gap=merge_gap)
+
+        regions: list[TextRegion] = []
+        page_area = h * w
+        max_region_area = int(page_area * 0.10)
+        max_region_w = int(w * 0.45)
+        max_region_h = int(h * 0.45)
+
+        for x1, y1, x2, y2 in merged_boxes:
+            rx, ry = x1, y1
+            rw = x2 - x1
+            rh = y2 - y1
+
+            if (rw * rh) > 25000:
+                disconnected_boxes = self._split_disconnected_region(
+                    mask=mask,
+                    region_bbox=(rx, ry, rw, rh),
+                    min_area=min_area,
+                    padding=max(2, padding // 2),
+                    page_w=w,
+                    page_h=h,
+                )
+                if len(disconnected_boxes) >= 2:
+                    for sx1, sy1, sx2, sy2 in disconnected_boxes:
+                        region = self._make_region(image, mask, sx1, sy1, sx2, sy2)
+                        if self._is_region_viable(region):
+                            regions.append(region)
+                    continue
+
+            is_overmerged = (
+                (rw * rh) > max_region_area
+                or rw > max_region_w
+                or rh > max_region_h
+            )
+
+            if is_overmerged:
+                split_boxes = self._split_overmerged_region(
+                    mask=mask,
+                    region_bbox=(rx, ry, rw, rh),
+                    min_area=min_area,
+                    padding=max(2, padding // 2),
+                    page_w=w,
+                    page_h=h,
+                )
+                if len(split_boxes) >= 2:
+                    logger.debug(
+                        "Split oversized region (%d,%d,%d,%d) into %d sub-regions.",
+                        rx,
+                        ry,
+                        rw,
+                        rh,
+                        len(split_boxes),
+                    )
+                    for x1, y1, x2, y2 in split_boxes:
+                        region = self._make_region(image, mask, x1, y1, x2, y2)
+                        if self._is_region_viable(region):
+                            regions.append(region)
+                    continue
+
             x1 = max(0, rx - padding)
             y1 = max(0, ry - padding)
             x2 = min(w, rx + rw + padding)
             y2 = min(h, ry + rh + padding)
-
-            # Extract the ORIGINAL mask for this region (for inpainting)
-            region_mask = mask[y1:y2, x1:x2].copy()
-            cropped = image[y1:y2, x1:x2].copy()
-
-            regions.append(
-                TextRegion(
-                    x=x1,
-                    y=y1,
-                    w=x2 - x1,
-                    h=y2 - y1,
-                    cropped=cropped,
-                    mask=region_mask,
-                )
-            )
+            region = self._make_region(image, mask, x1, y1, x2, y2)
+            if self._is_region_viable(region):
+                regions.append(region)
 
         return regions
+
+    def _split_overmerged_region(
+        self,
+        mask: NDArray,
+        region_bbox: tuple[int, int, int, int],
+        min_area: int,
+        padding: int,
+        page_w: int,
+        page_h: int,
+    ) -> list[tuple[int, int, int, int]]:
+        """
+        Split a very large merged region using the original (non-merged) text mask.
+        """
+        rx, ry, rw, rh = region_bbox
+        sub_mask = mask[ry : ry + rh, rx : rx + rw]
+        if cv2.countNonZero(sub_mask) == 0:
+            return []
+
+        short_side = max(1, min(rw, rh))
+        close_size = _odd(max(3, int(round(short_side * 0.02))))
+        dilate_size = _odd(max(5, int(round(short_side * 0.035))))
+
+        refined = cv2.morphologyEx(
+            sub_mask,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (close_size, close_size)),
+            iterations=1,
+        )
+        refined = cv2.dilate(
+            refined,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_size, dilate_size)),
+            iterations=1,
+        )
+
+        contours, _ = cv2.findContours(refined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        min_sub_area = max(80, min_area // 3)
+        boxes: list[tuple[int, int, int, int]] = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < min_sub_area:
+                continue
+
+            sx, sy, sw, sh = cv2.boundingRect(contour)
+            if sw < 12 or sh < 12:
+                continue
+
+            x1 = max(0, rx + sx - padding)
+            y1 = max(0, ry + sy - padding)
+            x2 = min(page_w, rx + sx + sw + padding)
+            y2 = min(page_h, ry + sy + sh + padding)
+            boxes.append((x1, y1, x2, y2))
+
+        if not boxes:
+            return []
+
+        merge_gap = max(8, int(short_side * 0.05))
+        return _merge_nearby_boxes(boxes, gap=merge_gap)
+
+    def _make_region(
+        self,
+        image: NDArray,
+        mask: NDArray,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+    ) -> TextRegion:
+        """Create a TextRegion object from absolute coordinates."""
+        region_mask = mask[y1:y2, x1:x2].copy()
+        cropped = image[y1:y2, x1:x2].copy()
+        return TextRegion(
+            x=x1,
+            y=y1,
+            w=x2 - x1,
+            h=y2 - y1,
+            cropped=cropped,
+            mask=region_mask,
+        )
+
+    def _split_disconnected_region(
+        self,
+        mask: NDArray,
+        region_bbox: tuple[int, int, int, int],
+        min_area: int,
+        padding: int,
+        page_w: int,
+        page_h: int,
+    ) -> list[tuple[int, int, int, int]]:
+        """
+        Split medium/large regions that contain clearly disconnected text clusters.
+        """
+        rx, ry, rw, rh = region_bbox
+        sub_mask = mask[ry : ry + rh, rx : rx + rw]
+        if cv2.countNonZero(sub_mask) == 0:
+            return []
+
+        short_side = max(1, min(rw, rh))
+        close_size = _odd(max(3, int(round(short_side * 0.012))))
+        dilate_size = _odd(max(5, int(round(short_side * 0.03))))
+
+        refined = cv2.morphologyEx(
+            sub_mask,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (close_size, close_size)),
+            iterations=1,
+        )
+        refined = cv2.dilate(
+            refined,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_size, dilate_size)),
+            iterations=1,
+        )
+
+        contours, _ = cv2.findContours(refined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        min_sub_area = max(60, min_area // 3)
+
+        boxes: list[tuple[int, int, int, int]] = []
+        areas: list[float] = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < min_sub_area:
+                continue
+            sx, sy, sw, sh = cv2.boundingRect(contour)
+            if sw < 12 or sh < 12:
+                continue
+
+            x1 = max(0, rx + sx - padding)
+            y1 = max(0, ry + sy - padding)
+            x2 = min(page_w, rx + sx + sw + padding)
+            y2 = min(page_h, ry + sy + sh + padding)
+            boxes.append((x1, y1, x2, y2))
+            areas.append(area)
+
+        if len(boxes) < 2:
+            return []
+
+        merged = _merge_nearby_boxes(boxes, gap=max(10, int(short_side * 0.10)))
+        if len(merged) < 2:
+            return []
+
+        total_area = float(sum(areas)) if areas else 0.0
+        max_area = float(max(areas)) if areas else 0.0
+        if total_area > 0.0 and (max_area / total_area) > 0.82:
+            return []
+
+        separation_threshold = max(20, int(short_side * 0.18))
+        separated = False
+        for i in range(len(merged)):
+            ax1, ay1, ax2, ay2 = merged[i]
+            for j in range(i + 1, len(merged)):
+                bx1, by1, bx2, by2 = merged[j]
+                x_gap = max(0, max(ax1, bx1) - min(ax2, bx2))
+                y_gap = max(0, max(ay1, by1) - min(ay2, by2))
+                if x_gap > separation_threshold or y_gap > separation_threshold:
+                    separated = True
+                    break
+            if separated:
+                break
+
+        return merged if separated else []
+
+    def _is_region_viable(self, region: TextRegion) -> bool:
+        """Filter noisy tiny detections that are unlikely to be useful text regions."""
+        if region.w < 18 or region.h < 18:
+            return False
+        if region.mask is None:
+            return True
+
+        non_zero = cv2.countNonZero(region.mask.astype(np.uint8))
+        if non_zero < 20:
+            return False
+
+        area = max(1, region.w * region.h)
+        density = non_zero / float(area)
+        if area < 1800 and density < 0.028:
+            return False
+        return True
 
 
 def detect_text_regions(

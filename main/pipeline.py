@@ -115,7 +115,13 @@ def translate_page(
     for (region, _), translated in zip(text_regions, translated_texts):
         if translated.strip():
             result = render_text_on_image(
-                result, translated, region.x, region.y, region.w, region.h
+                result,
+                translated,
+                region.x,
+                region.y,
+                region.w,
+                region.h,
+                region_mask=region.mask,
             )
 
     # 6. Save output
