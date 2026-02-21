@@ -14,7 +14,9 @@ The model outputs:
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Lock
 
 import cv2
@@ -26,6 +28,10 @@ logger = logging.getLogger(__name__)
 # Model configuration
 _MODEL_REPO = "mayocream/comic-text-detector-onnx"
 _MODEL_FILE = "comic-text-detector.onnx"
+_MODEL_PATH_ENV = "COMIC_TEXT_DETECTOR_MODEL_PATH"
+_LOCAL_MODEL_PATH = (
+    Path(__file__).resolve().parent / "weights" / "comic-text-detector" / _MODEL_FILE
+)
 _MODEL_INPUT_SIZE = (1024, 1024)  # Model expects 1024x1024 input
 _MODAL_DETECTOR_APP = "manga-detector-service"
 _MODAL_DETECTOR_CLASS = "ComicTextDetectorService"
@@ -124,7 +130,7 @@ class ComicTextDetector:
         return cls._instance
 
     def _ensure_model(self) -> None:
-        """Download and load the ONNX model if not already loaded."""
+        """Load bundled ONNX model (with fallback download) if not already loaded."""
         if self._session is not None:
             return
         with self._session_lock:
@@ -133,14 +139,32 @@ class ComicTextDetector:
 
             logger.info("Loading comic-text-detector ONNX model...")
 
-            from huggingface_hub import hf_hub_download
             import onnxruntime as ort
 
-            model_path = hf_hub_download(
-                repo_id=_MODEL_REPO,
-                filename=_MODEL_FILE,
-            )
-            logger.info("Model downloaded to: %s", model_path)
+            env_model_path = os.getenv(_MODEL_PATH_ENV, "").strip()
+            if env_model_path:
+                env_candidate = Path(env_model_path).expanduser()
+                if not env_candidate.is_file():
+                    raise FileNotFoundError(
+                        f"{_MODEL_PATH_ENV} points to a missing file: {env_candidate}"
+                    )
+                model_path = str(env_candidate)
+                logger.info(
+                    "Using detector model from %s: %s",
+                    _MODEL_PATH_ENV,
+                    model_path,
+                )
+            elif _LOCAL_MODEL_PATH.is_file():
+                model_path = str(_LOCAL_MODEL_PATH)
+                logger.info("Using bundled detector model: %s", model_path)
+            else:
+                from huggingface_hub import hf_hub_download
+
+                model_path = hf_hub_download(
+                    repo_id=_MODEL_REPO,
+                    filename=_MODEL_FILE,
+                )
+                logger.info("Detector model downloaded to: %s", model_path)
 
             # Create ONNX Runtime session (CPU only)
             sess_options = ort.SessionOptions()

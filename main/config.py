@@ -54,12 +54,11 @@ class Settings:
     # OCR
     source_lang: str = "ja"  # "ja" for Japanese
     use_modal: bool = field(
-        default_factory=lambda: os.getenv("USE_MODAL", "true").lower()
-        in ("true", "1", "yes")
+        default_factory=lambda: _bool_env("USE_MODAL", False)
     )
     # True -> Modal detector service. False -> local ONNX detector.
     use_detection_model: bool = field(
-        default_factory=lambda: _bool_env("USE_DETECTION_MODEL", True)
+        default_factory=lambda: _bool_env("USE_DETECTION_MODEL", False)
     )
     # Conservative default for Modal starter/free plan workloads.
     modal_max_parallel_pages: int = field(

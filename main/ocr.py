@@ -7,6 +7,8 @@ This project currently uses MangaOCREngine only.
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 import re
 from abc import ABC, abstractmethod
 from threading import Lock
@@ -17,6 +19,10 @@ from numpy.typing import NDArray
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+_MANGA_OCR_MODEL_ENV = "MANGA_OCR_MODEL_PATH"
+_LOCAL_MANGA_OCR_MODEL_DIR = (
+    Path(__file__).resolve().parent / "weights" / "manga-ocr-base"
+)
 
 
 class OCREngine(ABC):
@@ -42,7 +48,7 @@ class MangaOCREngine(OCREngine):
     Japanese manga OCR using the `manga-ocr` library.
 
     Handles vertical/horizontal text, furigana, varied fonts.
-    Model is lazy-loaded on first use (~400MB download on first run).
+    Model is lazy-loaded on first use (bundled local weights are preferred).
     """
 
     _instance: MangaOCREngine | None = None
@@ -67,10 +73,27 @@ class MangaOCREngine(OCREngine):
 
     def _ensure_model(self) -> None:
         if self._model is None:
-            logger.info("Loading manga-ocr model (first time may download ~400MB)...")
             from manga_ocr import MangaOcr
 
-            self._model = MangaOcr()
+            env_source = os.getenv(_MANGA_OCR_MODEL_ENV, "").strip()
+            if env_source:
+                candidate = Path(env_source).expanduser()
+                model_source = str(candidate) if candidate.exists() else env_source
+                logger.info(
+                    "Loading manga-ocr model from %s: %s",
+                    _MANGA_OCR_MODEL_ENV,
+                    model_source,
+                )
+            elif _LOCAL_MANGA_OCR_MODEL_DIR.is_dir():
+                model_source = str(_LOCAL_MANGA_OCR_MODEL_DIR)
+                logger.info("Loading manga-ocr model from bundled weights: %s", model_source)
+            else:
+                model_source = "kha-white/manga-ocr-base"
+                logger.info(
+                    "Loading manga-ocr model from Hugging Face repo: %s", model_source
+                )
+
+            self._model = MangaOcr(pretrained_model_name_or_path=model_source)
             logger.info("manga-ocr model loaded.")
 
     def _run_manga_ocr(self, image: NDArray) -> str:

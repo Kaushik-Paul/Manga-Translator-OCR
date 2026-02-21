@@ -20,41 +20,43 @@ from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
 
-# Try to find suitable dialogue and SFX fonts.
-_DIALOGUE_FONT_SEARCH_PATHS = [
-    "/usr/share/fonts/opentype/urw-base35/NimbusSans-Bold.otf",
-    "/usr/share/fonts/truetype/liberation/LiberationSansNarrow-Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-    "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
-    "/usr/share/fonts/truetype/ubuntu/Ubuntu-Bold.ttf",
-    "/System/Library/Fonts/Helvetica.ttc",
-    "/Library/Fonts/Arial Bold.ttf",
-]
+_MODULE_DIR = Path(__file__).resolve().parent
+_FONTS_DIR = _MODULE_DIR / "fonts"
 
-_SFX_FONT_SEARCH_PATHS = [
-    "/usr/share/fonts/opentype/urw-base35/NimbusSans-BoldItalic.otf",
-    "/usr/share/fonts/truetype/freefont/FreeSansBoldOblique.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSansNarrow-BoldItalic.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-BoldItalic.ttf",
-    "/usr/share/fonts/truetype/ubuntu/Ubuntu-BoldItalic.ttf",
-    "/usr/share/fonts/truetype/freefont/FreeSansOblique.ttf",
-    "/System/Library/Fonts/Helvetica.ttc",
-]
 
-_NARROW_DIALOGUE_FONT_SEARCH_PATHS = [
-    "/usr/share/fonts/truetype/liberation/LiberationSansNarrow-Bold.ttf",
-    "/usr/share/fonts/opentype/urw-base35/NimbusSansNarrow-Bold.otf",
-    "/usr/share/fonts/truetype/ubuntu/UbuntuSans[wdth,wght].ttf",
-]
+def _font_paths(*font_files: str) -> list[str]:
+    """Build candidate font paths from bundled assets."""
+    return [str(_FONTS_DIR / file_name) for file_name in font_files]
 
-_CJK_DIALOGUE_FONT_SEARCH_PATHS = [
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
-    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-    "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
-]
+
+# Use bundled fonts so deployments (e.g. Spaces) do not depend on host system fonts.
+_DIALOGUE_FONT_SEARCH_PATHS = _font_paths(
+    "NimbusSans-Bold.otf",
+    "LiberationSansNarrow-Bold.ttf",
+    "DejaVuSans-Bold.ttf",
+    "LiberationSans-Bold.ttf",
+    "FreeSansBold.ttf",
+)
+
+_SFX_FONT_SEARCH_PATHS = _font_paths(
+    "NimbusSans-BoldItalic.otf",
+    "FreeSansBoldOblique.ttf",
+    "LiberationSansNarrow-BoldItalic.ttf",
+    "LiberationSans-BoldItalic.ttf",
+    "FreeSansOblique.ttf",
+)
+
+_NARROW_DIALOGUE_FONT_SEARCH_PATHS = _font_paths(
+    "LiberationSansNarrow-Bold.ttf",
+    "NimbusSansNarrow-Bold.otf",
+    "UbuntuSans[wdth,wght].ttf",
+)
+
+_CJK_DIALOGUE_FONT_SEARCH_PATHS = _font_paths(
+    "NotoSansCJK-Bold.ttc",
+    "wqy-zenhei.ttc",
+    "DroidSansFallbackFull.ttf",
+)
 
 
 def _find_font(search_paths: list[str]) -> str | None:
