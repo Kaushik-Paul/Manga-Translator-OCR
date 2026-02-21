@@ -173,24 +173,43 @@ def translate_page(
         _sanitize_translated_text(text=text, unit=unit)
         for text, unit in zip(translated_texts, units)
     ]
+    renderable_unit_mask = [
+        _is_renderable_translation(text) for text in translated_texts
+    ]
+    renderable_region_indices = {
+        unit.parent_region_index
+        for unit, can_render in zip(units, renderable_unit_mask)
+        if can_render
+    }
 
     for i, (src, tgt) in enumerate(zip(source_texts, translated_texts)):
         logger.info("  [%d] %s → %s", i + 1, src[:40], tgt[:60])
+    skipped_units = len(renderable_unit_mask) - sum(renderable_unit_mask)
+    if skipped_units > 0:
+        logger.warning(
+            "Skipping %d unit(s) with empty/non-renderable translated text.",
+            skipped_units,
+        )
+    if inpaint_region_indices and not renderable_region_indices:
+        logger.warning(
+            "No renderable translations for this page; preserving original text regions."
+        )
 
     # 5. Inpaint original text, then render translated text
     logger.info("Step 4/4: Inpainting and rendering translated text...")
     result = image.copy()
 
-    # First pass: inpaint each original region that yielded at least one OCR unit.
-    for region_idx in sorted(inpaint_region_indices):
+    # First pass: inpaint only regions that have at least one renderable translation.
+    # This avoids blank bubbles/pages when translation output is empty or unusable.
+    for region_idx in sorted(renderable_region_indices):
         region = regions[region_idx]
         result = inpaint_text_region(
             result, region.x, region.y, region.w, region.h, region.mask
         )
 
     # Second pass: render translated text onto the cleaned image
-    for unit, translated in zip(units, translated_texts):
-        if translated.strip():
+    for unit, translated, can_render in zip(units, translated_texts, renderable_unit_mask):
+        if can_render:
             region = unit.region
             result = render_text_on_image(
                 result,
@@ -273,17 +292,27 @@ def translate_images(
 
     if cfg.use_modal and total > 1:
         max_workers = min(cfg.modal_max_parallel_pages, total)
+        total_batches = (total + max_workers - 1) // max_workers
         logger.info(
-            "Using parallel page processing with Modal (%d workers).",
+            "Using batched parallel page processing with Modal (%d workers per batch).",
             max_workers,
         )
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            ordered_results = list(pool.map(_translate_one, tasks))
-        for (_, img_path), (out, error) in zip(tasks, ordered_results):
-            if out is not None:
-                results.append(out)
-            elif error is not None:
-                logger.error("Failed to process %s: %s", img_path.name, error)
+        for batch_index, start in enumerate(range(0, total, max_workers), start=1):
+            batch_tasks = tasks[start : start + max_workers]
+            logger.info(
+                "Starting batch %d/%d with %d page(s).",
+                batch_index,
+                total_batches,
+                len(batch_tasks),
+            )
+            with ThreadPoolExecutor(max_workers=len(batch_tasks)) as pool:
+                batch_results = list(pool.map(_translate_one, batch_tasks))
+
+            for (_, img_path), (out, error) in zip(batch_tasks, batch_results):
+                if out is not None:
+                    results.append(out)
+                elif error is not None:
+                    logger.error("Failed to process %s: %s", img_path.name, error)
     else:
         for task in tasks:
             _, img_path = task
@@ -614,6 +643,35 @@ def _sanitize_translated_text(text: str, unit: RenderTextUnit) -> str:
     if unit.style_hint == "dialogue":
         return "..."
     return "Ah..."
+
+
+def _is_renderable_translation(text: str) -> bool:
+    """
+    Return True if translation should be rendered on-page.
+
+    Reject empty strings and punctuation-only placeholders (e.g. "...").
+    """
+    cleaned = " ".join(text.replace("\r", " ").replace("\n", " ").split()).strip()
+    if not cleaned:
+        return False
+    if _looks_like_refusal_text(cleaned):
+        return False
+    return re.search(r"[A-Za-z0-9]", cleaned) is not None
+
+
+def _looks_like_refusal_text(text: str) -> bool:
+    lower = text.lower()
+    markers = (
+        "i can't provide",
+        "i cannot provide",
+        "i can't assist",
+        "i cannot assist",
+        "i'm unable to",
+        "i am unable to",
+        "sorry, i can't",
+        "sorry, i cannot",
+    )
+    return any(marker in lower for marker in markers)
 
 
 def _contains_cjk(text: str) -> bool:

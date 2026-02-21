@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import re
+from threading import Lock
 import time
 
 import httpx
@@ -17,6 +18,7 @@ import httpx
 from .config import settings
 
 logger = logging.getLogger(__name__)
+_OPENROUTER_CALL_LOCK = Lock()
 
 # System prompt designed for manga/doujinshi translation
 SYSTEM_PROMPT = """You are an expert manga/doujinshi translator specializing in Japanese and Chinese to English translation.
@@ -165,24 +167,39 @@ def translate_texts(
             f"Follow constraints strictly. Return ONLY numbered lines in [N] format.\n\n"
             + "\n".join(repair_lines)
         )
-        try:
-            repair_response = _call_openrouter(
-                model_name,
-                repair_message,
-                system_prompt=REPAIR_SYSTEM_PROMPT,
-            )
-            repaired_map = _parse_numbered_response(repair_response, len(repair_candidates))
-            for repair_idx, (mapped_idx, orig_idx, src_text) in enumerate(repair_candidates):
-                fixed = repaired_map.get(repair_idx, "").strip()
-                constraint = (
-                    constraints[orig_idx]
-                    if constraints is not None and orig_idx < len(constraints)
-                    else None
+        for attempt in range(max_retries):
+            try:
+                repair_response = _call_openrouter(
+                    model_name,
+                    repair_message,
+                    system_prompt=REPAIR_SYSTEM_PROMPT,
                 )
-                if fixed and not _needs_repair_translation(src_text, fixed, constraint):
-                    translated_map[mapped_idx] = fixed
-        except Exception as e:
-            logger.warning("Repair translation pass failed: %s", e)
+                repaired_map = _parse_numbered_response(
+                    repair_response, len(repair_candidates)
+                )
+                for repair_idx, (mapped_idx, orig_idx, src_text) in enumerate(
+                    repair_candidates
+                ):
+                    fixed = repaired_map.get(repair_idx, "").strip()
+                    constraint = (
+                        constraints[orig_idx]
+                        if constraints is not None and orig_idx < len(constraints)
+                        else None
+                    )
+                    if fixed and not _needs_repair_translation(src_text, fixed, constraint):
+                        translated_map[mapped_idx] = fixed
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        "Repair translation attempt %d/%d failed: %s",
+                        attempt + 1,
+                        max_retries,
+                        e,
+                    )
+                    time.sleep(2 ** attempt)
+                else:
+                    logger.warning("Repair translation pass failed: %s", e)
 
     # Reconstruct the full results list (preserving empty string positions)
     results = ["" for _ in texts]
@@ -227,13 +244,16 @@ def _call_openrouter(
 
     logger.info("Calling OpenRouter API (model: %s)...", model)
 
-    with httpx.Client(timeout=60.0) as client:
-        response = client.post(
-            f"{settings.openrouter_base_url}/chat/completions",
-            json=payload,
-            headers=headers,
-        )
-        response.raise_for_status()
+    # Serialize outbound OpenRouter requests across page-worker threads.
+    # This avoids provider-side empty-content responses seen under burst concurrency.
+    with _OPENROUTER_CALL_LOCK:
+        with httpx.Client(timeout=60.0) as client:
+            response = client.post(
+                f"{settings.openrouter_base_url}/chat/completions",
+                json=payload,
+                headers=headers,
+            )
+            response.raise_for_status()
 
     data = response.json()
 
@@ -242,9 +262,13 @@ def _call_openrouter(
     if not choices:
         raise ValueError("No choices returned from OpenRouter API")
 
-    content = choices[0].get("message", {}).get("content", "")
-    logger.info("Translation received (%d chars).", len(content))
-    return content.strip()
+    message = choices[0].get("message", {})
+    content = message.get("content", "")
+    text = _coerce_message_content(content).strip()
+    if not text:
+        raise ValueError("OpenRouter returned empty translation content.")
+    logger.info("Translation received (%d chars).", len(text))
+    return text
 
 
 def _contains_cjk(text: str) -> bool:
@@ -272,6 +296,8 @@ def _needs_repair_translation(
     if tgt == src:
         return True
     if tgt in {"[", "]", "[8", "[9", "...", ".."}:
+        return True
+    if _looks_like_refusal_text(tgt):
         return True
     if _contains_cjk(tgt):
         return True
@@ -437,3 +463,44 @@ def _parse_numbered_response(response: str, expected_count: int) -> dict[int, st
             result[next_idx] = line
 
     return result
+
+
+def _coerce_message_content(content: object) -> str:
+    """
+    Normalize OpenRouter message content to plain text.
+
+    Handles both legacy string responses and structured content lists.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            if block.strip():
+                parts.append(block.strip())
+            continue
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            text_value = block.get("text")
+            if isinstance(text_value, str) and text_value.strip():
+                parts.append(text_value.strip())
+    return "\n".join(parts)
+
+
+def _looks_like_refusal_text(text: str) -> bool:
+    lower = text.lower()
+    markers = (
+        "i can't provide",
+        "i cannot provide",
+        "i can't assist",
+        "i cannot assist",
+        "i'm unable to",
+        "i am unable to",
+        "sorry, i can't",
+        "sorry, i cannot",
+    )
+    return any(marker in lower for marker in markers)
