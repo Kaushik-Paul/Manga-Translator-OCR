@@ -68,6 +68,11 @@ class Settings:
         default_factory=lambda: _int_env("MODAL_MAX_PARALLEL_PAGES", 2)
     )
 
+    # Gradio UI auth gate for costly actions (translate / download).
+    gradio_action_password: str = field(
+        default_factory=lambda: os.getenv("GRADIO_ACTION_PASSWORD", "")
+    )
+
     # Output
     output_dir: Path = field(default_factory=lambda: Path("./output"))
 

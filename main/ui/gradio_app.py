@@ -10,6 +10,7 @@ Provides a web interface to:
 
 from __future__ import annotations
 
+import hmac
 import logging
 import threading
 
@@ -30,7 +31,7 @@ GLOBAL_STATE = {
     "is_running": False,
     "log_text": "",
     "failed_text": "",
-    "download_html": "",
+    "download_url": "",
 }
 
 
@@ -50,6 +51,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
 
         # Hidden state component to trigger auto-updates
         timer = gr.Timer(value=1.0, active=False)
+        auth_action = gr.State("")
 
         # ── Header ─────────────────────────────────────
         gr.HTML(
@@ -116,7 +118,78 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     interactive=False,
                     visible=False,
                 )
-            download_html = gr.HTML(visible=False)
+            download_btn = gr.Button(
+                "📥 Download Translated Manga (CBZ) — Expires in 24 hours",
+                variant="primary",
+                elem_classes=["download-btn"],
+                interactive=True,
+                visible=False,
+            )
+
+        # Hidden trigger value. JS listener opens this URL in a new tab.
+        download_launch_url = gr.Textbox(value="", visible=False, interactive=False)
+
+        # Password popup shown before costly/protected actions.
+        with gr.Group(visible=False, elem_classes=["auth-modal-overlay"]) as auth_modal:
+            with gr.Group(elem_classes=["auth-modal-card"]):
+                gr.HTML('<div class="auth-modal-title">🔒 Password Required</div>')
+                auth_prompt = gr.HTML()
+                auth_password = gr.Textbox(
+                    label="Password",
+                    type="password",
+                    placeholder="Enter password",
+                    interactive=True,
+                )
+                auth_error = gr.HTML(visible=False)
+                with gr.Row():
+                    auth_submit_btn = gr.Button(
+                        "Continue",
+                        variant="primary",
+                        elem_classes=["primary-btn"],
+                    )
+                    auth_cancel_btn = gr.Button("Cancel")
+
+        def _action_prompt(action: str) -> str:
+            if action == "download":
+                text = "Enter password to open the download link."
+            else:
+                text = "Enter password to start translation."
+            return f'<div class="auth-modal-message">{text}</div>'
+
+        def _close_auth_modal():
+            return (
+                "",
+                gr.update(visible=False),
+                gr.update(value=""),
+                gr.update(value=""),
+                gr.update(visible=False, value=""),
+            )
+
+        def _open_auth_modal(action: str):
+            if action == "download" and not GLOBAL_STATE.get("download_url"):
+                return _close_auth_modal()
+            return (
+                action,
+                gr.update(visible=True),
+                gr.update(value=_action_prompt(action)),
+                gr.update(value=""),
+                gr.update(visible=False, value=""),
+            )
+
+        def _validate_action_password(password: str) -> tuple[bool, str]:
+            configured_password = settings.gradio_action_password.strip()
+
+            if not configured_password:
+                return (
+                    False,
+                    "⚠️ GRADIO_ACTION_PASSWORD is not configured in .env. "
+                    "Set it and restart the app.",
+                )
+            if not password:
+                return False, "⚠️ Password is required."
+            if not hmac.compare_digest(password, configured_password):
+                return False, "❌ Incorrect password."
+            return True, ""
 
         def sync_state_from_global():
             """Called by Timer or on page load to perfectly reflect global state."""
@@ -127,7 +200,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             
             show_results = bool(GLOBAL_STATE.get("log_text"))
             failed_vis = bool(GLOBAL_STATE.get("failed_text"))
-            dl_vis = bool(GLOBAL_STATE.get("download_html"))
+            dl_vis = bool(GLOBAL_STATE.get("download_url"))
             
             choices = ["All"] + loaded_imgs if loaded_imgs else []
             show_image_sec = bool(choices)
@@ -141,7 +214,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                 gr.update(visible=show_results), # results_section
                 GLOBAL_STATE.get("log_text", ""), # progress_log
                 gr.update(visible=failed_vis, value=GLOBAL_STATE.get("failed_text", "")), # failed_images_box
-                gr.update(visible=dl_vis, value=GLOBAL_STATE.get("download_html", "")), # download_html
+                gr.update(visible=dl_vis, interactive=not is_running), # download_btn
                 gr.update(active=is_running) # timer active while running
             )
 
@@ -153,8 +226,6 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     gr.update(visible=True, value='<span class="result-error">⚠️ Please enter a folder name.</span>'),
                     gr.update(visible=False),
                     gr.update(choices=[], value=[]),
-                    "",
-                    [],
                 )
 
             try:
@@ -166,8 +237,6 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                         ),
                         gr.update(visible=False),
                         gr.update(choices=[], value=[]),
-                        "",
-                        [],
                     )
 
                 images = list_images_in_folder(folder_name)
@@ -179,8 +248,6 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                         ),
                         gr.update(visible=False),
                         gr.update(choices=[], value=[]),
-                        "",
-                        [],
                     )
 
                 # Build choices: "All" + numbered image names
@@ -207,8 +274,6 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     ),
                     gr.update(visible=False),
                     gr.update(choices=[], value=[]),
-                    "",
-                    [],
                 )
 
         def on_image_selection_change(selected: list[str]):
@@ -257,17 +322,13 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
 
             if not selected_images:
                 GLOBAL_STATE["log_text"] = "⚠️ No images selected."
-                yield sync_state_from_global()
-                return
+                return sync_state_from_global()
 
             # Lock global state
             GLOBAL_STATE["is_running"] = True
             GLOBAL_STATE["log_text"] = f"🚀 Starting translation for {len(selected_images)} image(s) from '{folder_name}'...\n"
             GLOBAL_STATE["failed_text"] = ""
-            GLOBAL_STATE["download_html"] = ""
-            
-            # Show disabled UI immediately
-            yield sync_state_from_global()
+            GLOBAL_STATE["download_url"] = ""
 
             def _background_task():
                 log_lines = [GLOBAL_STATE["log_text"]]
@@ -304,12 +365,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
 
                     # Download link
                     if final_result.download_url:
-                        GLOBAL_STATE["download_html"] = (
-                            f'<div class="download-link" style="padding: 1rem; text-align: center;">'
-                            f'<a href="{final_result.download_url}" target="_blank" '
-                            f'style="font-size: 1.1rem;">📥 Download Translated Manga (CBZ) — Expires in 24 hours</a>'
-                            f"</div>"
-                        )
+                        GLOBAL_STATE["download_url"] = final_result.download_url
                 except Exception as e:
                     logger.error("Background task error: %s", e)
                     log_lines.append(f"\n❌ Pipeline crashed: {e}")
@@ -321,6 +377,64 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             # Start thread and let Gradio handler exit, preventing websocket tie-up
             thread = threading.Thread(target=_background_task, daemon=True)
             thread.start()
+            return sync_state_from_global()
+
+        def authorize_action(password: str, action: str):
+            action = (action or "").strip()
+            is_valid, err_message = _validate_action_password(password)
+
+            if not action:
+                is_valid = False
+                err_message = "⚠️ No action selected. Please try again."
+
+            if not is_valid:
+                return (
+                    action,
+                    gr.update(visible=True),
+                    gr.update(value=_action_prompt(action or "translate")),
+                    gr.update(value=""),
+                    gr.update(
+                        visible=True,
+                        value=f'<span class="result-error">{err_message}</span>',
+                    ),
+                    *sync_state_from_global(),
+                    "",
+                )
+
+            if action == "translate":
+                sync_updates = run_pipeline()
+                return (
+                    *_close_auth_modal(),
+                    *sync_updates,
+                    "",
+                )
+
+            if action == "download":
+                download_url = GLOBAL_STATE.get("download_url", "")
+                if not download_url:
+                    return (
+                        action,
+                        gr.update(visible=True),
+                        gr.update(value=_action_prompt(action)),
+                        gr.update(value=""),
+                        gr.update(
+                            visible=True,
+                            value='<span class="result-error">❌ Download link is not ready yet.</span>',
+                        ),
+                        *sync_state_from_global(),
+                        "",
+                    )
+                return (
+                    *_close_auth_modal(),
+                    *sync_state_from_global(),
+                    download_url,
+                )
+
+            return (
+                *_close_auth_modal(),
+                *sync_state_from_global(),
+                "",
+            )
 
         # ── Wire Events ────────────────────────────────
 
@@ -361,8 +475,15 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             results_section,
             progress_log,
             failed_images_box,
-            download_html,
+            download_btn,
             timer,
+        ]
+        auth_outputs = [
+            auth_action,
+            auth_modal,
+            auth_prompt,
+            auth_password,
+            auth_error,
         ]
         
         app.load(
@@ -377,9 +498,52 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
         )
 
         translate_btn.click(
-            fn=run_pipeline,
+            fn=lambda: _open_auth_modal("translate"),
             inputs=[],
-            outputs=sync_outputs,
+            outputs=auth_outputs,
+            queue=False,
+        )
+
+        download_btn.click(
+            fn=lambda: _open_auth_modal("download"),
+            inputs=[],
+            outputs=auth_outputs,
+            queue=False,
+        )
+
+        auth_cancel_btn.click(
+            fn=_close_auth_modal,
+            inputs=[],
+            outputs=auth_outputs,
+            queue=False,
+        )
+
+        auth_submit_outputs = [*auth_outputs, *sync_outputs, download_launch_url]
+
+        auth_submit_btn.click(
+            fn=authorize_action,
+            inputs=[auth_password, auth_action],
+            outputs=auth_submit_outputs,
+        )
+        auth_password.submit(
+            fn=authorize_action,
+            inputs=[auth_password, auth_action],
+            outputs=auth_submit_outputs,
+        )
+
+        download_launch_url.change(
+            fn=lambda _url: "",
+            inputs=[download_launch_url],
+            outputs=[download_launch_url],
+            js="""
+                (url) => {
+                    if (url) {
+                        window.open(url, "_blank", "noopener");
+                    }
+                    return "";
+                }
+            """,
+            queue=False,
         )
 
     return app, theme, CUSTOM_CSS
