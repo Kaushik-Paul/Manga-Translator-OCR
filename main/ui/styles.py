@@ -93,6 +93,27 @@ CUSTOM_CSS = """
     cursor: not-allowed !important;
 }
 
+.download-btn {
+    background: linear-gradient(135deg, #1b9aaa, #2d3047) !important;
+    border: none !important;
+    color: white !important;
+    font-weight: 700 !important;
+    border-radius: 10px !important;
+    transition: all 0.2s ease !important;
+}
+
+.download-btn:hover {
+    transform: translateY(-1px) !important;
+    box-shadow: 0 6px 16px rgba(45, 48, 71, 0.35) !important;
+}
+
+.download-btn:disabled {
+    opacity: 0.5 !important;
+    transform: none !important;
+    box-shadow: none !important;
+    cursor: not-allowed !important;
+}
+
 /* ── Progress ───────────────────────────────────────── */
 .progress-box textarea {
     font-family: 'JetBrains Mono', 'Fira Code', monospace !important;
@@ -115,6 +136,38 @@ CUSTOM_CSS = """
     color: #6c5ce7 !important;
     font-weight: 600;
     text-decoration: underline;
+}
+
+/* ── Password modal ────────────────────────────────── */
+.auth-modal-overlay {
+    position: fixed !important;
+    inset: 0 !important;
+    z-index: 9999 !important;
+    background: rgba(10, 10, 15, 0.55) !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    padding: 1rem !important;
+}
+
+.auth-modal-card {
+    width: min(480px, 100%) !important;
+    border: 1px solid var(--border-color-primary) !important;
+    border-radius: 12px !important;
+    background: var(--background-fill-primary) !important;
+    padding: 1rem !important;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.25) !important;
+}
+
+.auth-modal-title {
+    font-size: 1.1rem;
+    font-weight: 700;
+    margin-bottom: 0.4rem;
+}
+
+.auth-modal-message {
+    margin-bottom: 0.7rem;
+    opacity: 0.85;
 }
 
 /* ── Checkbox group (image selector) ────────────────── */

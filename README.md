@@ -58,6 +58,10 @@ We recommend using [`uv`](https://github.com/astral-sh/uv) for lightning-fast de
    
    # Optional: Override the translation model
    TRANSLATION_MODEL="deepseek/deepseek-chat"
+
+   # Optional but recommended for Gradio abuse protection:
+   # required to run "Translate Selected" and to open the download link
+   GRADIO_ACTION_PASSWORD="change-this-password"
    ```
 
 ---
