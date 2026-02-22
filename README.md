@@ -1,3 +1,10 @@
+---
+title: Manga-Translator-OCR
+app_file: main/app.py
+sdk: gradio
+sdk_version: 6.6.0
+---
+
 # 🎌 Manga Translator OCR 🎌
 
 [![Hugging Face Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue)](https://huggingface.co/spaces/kaushikpaul/Manga-Translator-OCR)
@@ -52,6 +59,9 @@ We recommend using [`uv`](https://github.com/astral-sh/uv) for lightning-fast de
 
    # Optional: Enable Modal for GPU-accelerated OCR
    USE_MODAL="false" 
+   
+   # Optional: Max parallel OpenRouter requests (set to 1 to fully serialize)
+   OPENROUTER_MAX_CONCURRENT_CALLS="3"
    
    # Optional: Override the translation model
    TRANSLATION_MODEL="deepseek/deepseek-chat"

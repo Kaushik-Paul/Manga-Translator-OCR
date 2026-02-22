@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from itertools import count
 import logging
 import re
-from threading import Lock
+from threading import BoundedSemaphore
 import time
 
 import httpx
@@ -19,7 +19,9 @@ import httpx
 from .config import settings
 
 logger = logging.getLogger(__name__)
-_OPENROUTER_CALL_LOCK = Lock()
+_OPENROUTER_CALL_SEMAPHORE = BoundedSemaphore(
+    value=max(1, int(getattr(settings, "openrouter_max_concurrent_calls", 1)))
+)
 _OPENROUTER_CALL_COUNTER = count(1)
 _OPENROUTER_LOCK_WAIT_POLL_SEC = 2.0
 _OPENROUTER_LOCK_WAIT_LOG_EVERY_SEC = 20.0
@@ -254,12 +256,15 @@ def _call_openrouter(
     call_started_at = time.monotonic()
     logger.info("Calling OpenRouter API #%d (model: %s)...", call_id, model)
 
-    # Serialize outbound OpenRouter requests across page-worker threads.
-    # This avoids provider-side empty-content responses seen under burst concurrency.
-    lock_wait_sec = _acquire_openrouter_lock(call_id)
+    # Bound outbound OpenRouter concurrency across page-worker threads.
+    # This avoids provider-side empty-content responses seen under burst concurrency
+    # while still allowing parallel calls.
+    slot_wait_sec = _acquire_openrouter_lock(call_id)
 
     try:
-        logger.info("OpenRouter API #%d lock acquired (wait %.2fs).", call_id, lock_wait_sec)
+        logger.info(
+            "OpenRouter API #%d slot acquired (wait %.2fs).", call_id, slot_wait_sec
+        )
         try:
             with httpx.Client(timeout=_OPENROUTER_HTTP_TIMEOUT) as client:
                 response = client.post(
@@ -272,7 +277,7 @@ def _call_openrouter(
             elapsed = time.monotonic() - call_started_at
             raise TimeoutError(
                 f"OpenRouter API timeout for call #{call_id} after {elapsed:.2f}s "
-                f"(lock wait {lock_wait_sec:.2f}s): {e}"
+                f"(slot wait {slot_wait_sec:.2f}s): {e}"
             ) from e
         except httpx.HTTPStatusError as e:
             response_preview = _truncate_for_log(e.response.text)
@@ -287,7 +292,7 @@ def _call_openrouter(
                 f"OpenRouter API request error for call #{call_id} after {elapsed:.2f}s: {e}"
             ) from e
     finally:
-        _OPENROUTER_CALL_LOCK.release()
+        _OPENROUTER_CALL_SEMAPHORE.release()
 
     try:
         data = response.json()
@@ -325,18 +330,18 @@ def _truncate_for_log(text: str, limit: int = 400) -> str:
 
 
 def _acquire_openrouter_lock(call_id: int) -> float:
-    """Wait for the OpenRouter lock, logging periodically while queued."""
+    """Wait for an OpenRouter concurrency slot, logging periodically while queued."""
     wait_started_at = time.monotonic()
     next_log_after_sec = _OPENROUTER_LOCK_WAIT_LOG_EVERY_SEC
 
     while True:
-        if _OPENROUTER_CALL_LOCK.acquire(timeout=_OPENROUTER_LOCK_WAIT_POLL_SEC):
+        if _OPENROUTER_CALL_SEMAPHORE.acquire(timeout=_OPENROUTER_LOCK_WAIT_POLL_SEC):
             return time.monotonic() - wait_started_at
 
         waited_sec = time.monotonic() - wait_started_at
         if waited_sec >= next_log_after_sec:
             logger.warning(
-                "OpenRouter API #%d still waiting on call lock (%.2fs).",
+                "OpenRouter API #%d still waiting on concurrency slot (%.2fs).",
                 call_id,
                 waited_sec,
             )
