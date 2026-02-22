@@ -216,16 +216,6 @@ def translate_texts(
     return results
 
 
-def translate_single(
-    text: str,
-    source_lang: str | None = None,
-    model: str | None = None,
-) -> str:
-    """Translate a single text string. Convenience wrapper."""
-    results = translate_texts([text], source_lang=source_lang, model=model)
-    return results[0]
-
-
 def _call_openrouter(
     model: str,
     user_message: str,
