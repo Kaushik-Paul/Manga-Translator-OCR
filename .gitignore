@@ -718,3 +718,4 @@ pyrightconfig.json
 # Local AI briefing files (ignored from git)
 CLAUDE.md
 AGENTS.md
+/gradio_sdk.txt
