@@ -74,10 +74,6 @@ class Settings:
             raise ValueError(
                 "OPENROUTER_API_KEY is required. Set it in .env or pass via environment."
             )
-        if self.source_lang != "ja":
-            raise ValueError(
-                f"Unsupported source language '{self.source_lang}'. Use 'ja'."
-            )
         if self.modal_max_parallel_pages < 1:
             raise ValueError("MODAL_MAX_PARALLEL_PAGES must be >= 1.")
 
