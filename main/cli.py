@@ -2,8 +2,8 @@
 CLI entry point for the Manga Translator.
 
 Usage:
-    uv run python main.py --input <image_or_directory> [<image_or_directory> ...]
-    [--output <dir>] [--lang ja] [--model <model>]
+    uv run python -m main.cli --input <image_or_directory> [<image_or_directory> ...]
+    [--output <dir>] [--model <model>]
 """
 
 from __future__ import annotations
@@ -40,17 +40,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Translate a single page (Japanese)
-  uv run python main.py --input page01.jpg
+  # Translate a single page
+  uv run python -m main.cli --input page01.jpg
 
   # Translate multiple pages
-  uv run python main.py --input page01.jpg page02.jpg page03.webp
+  uv run python -m main.cli --input page01.jpg page02.jpg page03.webp
 
   # Translate a directory of pages
-  uv run python main.py --input ./manga_pages/ --output ./translated/
+  uv run python -m main.cli --input ./manga_pages/ --output ./translated/
 
   # Use a specific model
-  uv run python main.py --input page.png --model mistralai/mistral-large-latest
+  uv run python -m main.cli --input page.png --model mistralai/mistral-large-latest
         """,
     )
 
@@ -68,13 +68,7 @@ Examples:
         default="./output",
         help="Output directory for translated images (default: ./output)",
     )
-    parser.add_argument(
-        "--lang",
-        "-l",
-        choices=["ja"],
-        default="ja",
-        help="Source language: 'ja' (Japanese only)",
-    )
+
     parser.add_argument(
         "--model",
         "-m",
@@ -101,7 +95,6 @@ def run(argv: list[str] | None = None) -> None:
     logger.info("─" * 40)
 
     # Apply CLI args to settings
-    settings.source_lang = args.lang
     settings.output_dir = Path(args.output)
     if args.model:
         settings.translation_model = args.model
