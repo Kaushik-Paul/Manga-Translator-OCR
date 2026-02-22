@@ -50,6 +50,9 @@ class Settings:
         )
     )
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_max_concurrent_calls: int = field(
+        default_factory=lambda: _int_env("OPENROUTER_MAX_CONCURRENT_CALLS", 3)
+    )
 
     # OCR
     source_lang: str = "ja"  # "ja" for Japanese
