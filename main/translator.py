@@ -8,6 +8,7 @@ using models that handle NSFW text content without moderation issues.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import count
 import logging
 import re
 from threading import Lock
@@ -19,6 +20,10 @@ from .config import settings
 
 logger = logging.getLogger(__name__)
 _OPENROUTER_CALL_LOCK = Lock()
+_OPENROUTER_CALL_COUNTER = count(1)
+_OPENROUTER_LOCK_WAIT_POLL_SEC = 2.0
+_OPENROUTER_LOCK_WAIT_LOG_EVERY_SEC = 20.0
+_OPENROUTER_HTTP_TIMEOUT = httpx.Timeout(connect=15.0, read=75.0, write=30.0, pool=15.0)
 
 # System prompt designed for manga/doujinshi translation
 SYSTEM_PROMPT = """You are an expert manga/doujinshi translator specializing in Japanese and Chinese to English translation.
@@ -242,23 +247,56 @@ def _call_openrouter(
         "max_tokens": 4096,
         "reasoning": {
             "effort": "none",
-        }
+        },
     }
 
-    logger.info("Calling OpenRouter API (model: %s)...", model)
+    call_id = next(_OPENROUTER_CALL_COUNTER)
+    call_started_at = time.monotonic()
+    logger.info("Calling OpenRouter API #%d (model: %s)...", call_id, model)
 
     # Serialize outbound OpenRouter requests across page-worker threads.
     # This avoids provider-side empty-content responses seen under burst concurrency.
-    with _OPENROUTER_CALL_LOCK:
-        with httpx.Client(timeout=60.0) as client:
-            response = client.post(
-                f"{settings.openrouter_base_url}/chat/completions",
-                json=payload,
-                headers=headers,
-            )
-            response.raise_for_status()
+    lock_wait_sec = _acquire_openrouter_lock(call_id)
 
-    data = response.json()
+    try:
+        logger.info("OpenRouter API #%d lock acquired (wait %.2fs).", call_id, lock_wait_sec)
+        try:
+            with httpx.Client(timeout=_OPENROUTER_HTTP_TIMEOUT) as client:
+                response = client.post(
+                    f"{settings.openrouter_base_url}/chat/completions",
+                    json=payload,
+                    headers=headers,
+                )
+                response.raise_for_status()
+        except httpx.TimeoutException as e:
+            elapsed = time.monotonic() - call_started_at
+            raise TimeoutError(
+                f"OpenRouter API timeout for call #{call_id} after {elapsed:.2f}s "
+                f"(lock wait {lock_wait_sec:.2f}s): {e}"
+            ) from e
+        except httpx.HTTPStatusError as e:
+            response_preview = _truncate_for_log(e.response.text)
+            status_code = e.response.status_code
+            raise RuntimeError(
+                f"OpenRouter API HTTP {status_code} for call #{call_id}: "
+                f"{response_preview or '<empty response body>'}"
+            ) from e
+        except httpx.RequestError as e:
+            elapsed = time.monotonic() - call_started_at
+            raise RuntimeError(
+                f"OpenRouter API request error for call #{call_id} after {elapsed:.2f}s: {e}"
+            ) from e
+    finally:
+        _OPENROUTER_CALL_LOCK.release()
+
+    try:
+        data = response.json()
+    except ValueError as e:
+        body_preview = _truncate_for_log(response.text)
+        raise ValueError(
+            f"OpenRouter returned invalid JSON for call #{call_id}: "
+            f"{body_preview or '<empty body>'}"
+        ) from e
 
     # Extract the response text
     choices = data.get("choices", [])
@@ -270,8 +308,39 @@ def _call_openrouter(
     text = _coerce_message_content(content).strip()
     if not text:
         raise ValueError("OpenRouter returned empty translation content.")
-    logger.info("Translation received (%d chars).", len(text))
+    logger.info(
+        "Translation received from OpenRouter API #%d (%d chars, %.2fs total).",
+        call_id,
+        len(text),
+        time.monotonic() - call_started_at,
+    )
     return text
+
+
+def _truncate_for_log(text: str, limit: int = 400) -> str:
+    cleaned = " ".join(text.split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 3] + "..."
+
+
+def _acquire_openrouter_lock(call_id: int) -> float:
+    """Wait for the OpenRouter lock, logging periodically while queued."""
+    wait_started_at = time.monotonic()
+    next_log_after_sec = _OPENROUTER_LOCK_WAIT_LOG_EVERY_SEC
+
+    while True:
+        if _OPENROUTER_CALL_LOCK.acquire(timeout=_OPENROUTER_LOCK_WAIT_POLL_SEC):
+            return time.monotonic() - wait_started_at
+
+        waited_sec = time.monotonic() - wait_started_at
+        if waited_sec >= next_log_after_sec:
+            logger.warning(
+                "OpenRouter API #%d still waiting on call lock (%.2fs).",
+                call_id,
+                waited_sec,
+            )
+            next_log_after_sec += _OPENROUTER_LOCK_WAIT_LOG_EVERY_SEC
 
 
 def _contains_cjk(text: str) -> bool:
