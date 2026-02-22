@@ -13,4 +13,6 @@ dependencies = [
     "onnxruntime>=1.17",
     "huggingface-hub>=0.20",
     "modal>=0.73",
+    "gradio>=5.0",
+    "google-cloud-storage>=2.14",
 ]
