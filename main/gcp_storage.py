@@ -62,29 +62,6 @@ def get_bucket() -> storage.Bucket:
     return client.bucket(bucket_name)
 
 
-def list_manga_folders() -> list[str]:
-    """List all manga folder names under raw-manga/."""
-    client = get_gcs_client()
-    bucket_name = _get_bucket_name()
-    bucket = client.bucket(bucket_name)
-
-    prefix = f"{_RAW_PREFIX}/"
-    # Use delimiter to get "subdirectories"
-    blobs = client.list_blobs(bucket, prefix=prefix, delimiter="/")
-
-    # We need to consume the iterator to populate prefixes
-    _ = list(blobs)
-
-    folders = []
-    for p in blobs.prefixes:
-        # p looks like "raw-manga/folder_name/"
-        folder_name = p[len(prefix) :].rstrip("/")
-        if folder_name:
-            folders.append(folder_name)
-
-    return sorted(folders)
-
-
 def folder_exists(folder_name: str) -> bool:
     """Check if a manga folder exists under raw-manga/."""
     client = get_gcs_client()
