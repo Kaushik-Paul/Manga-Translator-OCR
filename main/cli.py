@@ -171,3 +171,6 @@ def run(argv: list[str] | None = None) -> None:
             len(unique_images),
             settings.output_dir,
         )
+
+if __name__ == "__main__":
+    run()
