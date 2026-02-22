@@ -347,7 +347,7 @@ def _resolve_output_path(
     if output_path:
         return Path(output_path)
     out_dir = cfg.output_dir
-    return out_dir / f"{image_path.stem}_translated{image_path.suffix}"
+    return out_dir / image_path.name
 
 
 def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:

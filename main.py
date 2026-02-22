@@ -1,11 +1,11 @@
 """
-Manga Translator OCR - Entry Point
+Manga Translator OCR - CLI Entry Point
 
 Usage:
     uv run python main.py --input <image_or_directory> [--output <dir>] [--lang ja]
 """
 
-from main.app import run
+from main.cli import run
 
 if __name__ == "__main__":
     run()
