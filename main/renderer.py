@@ -370,20 +370,7 @@ def render_text_on_image(
 
     # Convert back to BGR
     rendered = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-    if (
-        bubble_clip_mask_local is None
-        or bubble_clip_mask_local.shape[:2] != (h, w)
-        or cv2.countNonZero(bubble_clip_mask_local.astype(np.uint8)) == 0
-    ):
-        return rendered
-
-    # Keep new text only inside the detected bubble mask.
-    clip_mask_full = np.zeros(result.shape[:2], dtype=np.uint8)
-    clip_mask_full[y : y + h, x : x + w] = bubble_clip_mask_local.astype(np.uint8)
-    keep = clip_mask_full > 0
-    clipped = pre_render.copy()
-    clipped[keep] = rendered[keep]
-    return clipped
+    return rendered
 
 
 def _infer_text_style(text: str, w: int, h: int) -> str:
@@ -509,7 +496,7 @@ def _resolve_dialogue_box(
     if fit_bbox is None:
         return (*fallback_box, False, None)
     x1, y1, x2, y2 = fit_bbox
-    shrink_ratio = 0.12 if (y2 - y1) > (x2 - x1) * 1.20 else 0.08
+    shrink_ratio = 0.16 if (y2 - y1) > (x2 - x1) * 1.20 else 0.12
     x1, y1, x2, y2 = _shrink_centered_box(x1, y1, x2, y2, shrink_ratio)
     fit_w = x2 - x1
     fit_h = y2 - y1
@@ -986,7 +973,7 @@ def _fit_text_to_box(
 
     if style == "dialogue":
         # Scale max font size based on available box height for better fill
-        dynamic_max = min(48, max(18, max_h // 2))
+        dynamic_max = min(48, max(32, int(max_h / 1.2)))
         max_size = min(max_size, dynamic_max)
     else:
         max_size = min(max_size, 54)
@@ -1042,6 +1029,20 @@ def _fit_text_to_box(
     while lo <= hi:
         mid = (lo + hi) // 2
         font, lines, spacing, used_w, used_h = _layout_at_size(mid, allow_hyphenation=False)
+        if lines and used_w <= max_w and used_h <= max_h:
+            best = (font, lines, spacing)
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    if best is not None:
+        return best
+
+    # Binary search WITH hyphenation if the first pass failed.
+    lo, hi = min_size, max_size
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        font, lines, spacing, used_w, used_h = _layout_at_size(mid, allow_hyphenation=True)
         if lines and used_w <= max_w and used_h <= max_h:
             best = (font, lines, spacing)
             lo = mid + 1
