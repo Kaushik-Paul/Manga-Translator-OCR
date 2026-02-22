@@ -1,10 +1,3 @@
----
-title: Manga-Translator-OCR
-app_file: main/app.py
-sdk: gradio
-sdk_version: 6.6.0
----
-
 # 🎌 Manga Translator OCR 🎌
 
 [![Hugging Face Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue)](https://huggingface.co/spaces/kaushikpaul/Manga-Translator-OCR)
