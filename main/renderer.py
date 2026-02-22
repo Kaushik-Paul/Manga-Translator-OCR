@@ -176,6 +176,45 @@ def render_text_on_image(
     else:
         text_style = _infer_text_style(text, w, h)
 
+    # Heuristic override: the detector/OCR may label a region as SFX based on
+    # short source text, but the translation can clearly be dialogue.
+    if text_style == "sfx":
+        maybe_dialogue = _infer_text_style(text, w, h) == "dialogue"
+        word_count = len(text.strip().split())
+        has_sentence_punct = any(c in text for c in ".?!")
+        dialogue_markers = {
+            "i",
+            "i'm",
+            "im",
+            "you",
+            "you're",
+            "youre",
+            "we",
+            "he",
+            "she",
+            "they",
+            "it",
+            "this",
+            "that",
+            "that's",
+            "thats",
+            "what",
+            "why",
+            "how",
+            "when",
+            "where",
+        }
+        alpha_words = [w.lower() for w in re.findall(r"[A-Za-z']+", text)]
+        marker_like = word_count >= 3 and any(w in dialogue_markers for w in alpha_words)
+
+        if (
+            maybe_dialogue
+            or word_count >= 4
+            or (word_count >= 2 and has_sentence_punct)
+            or marker_like
+        ):
+            text_style = "dialogue"
+
     # Convert BGR to RGB for PIL
     rgb = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
     pil_image = Image.fromarray(rgb)
@@ -264,8 +303,9 @@ def render_text_on_image(
         style=text_style,
         max_size_cap=font_cap,
     )
+    stroke_width = _stroke_width_for_font(font)
     if text_style == "sfx" and lines:
-        widest = _max_line_width(draw, lines, font)
+        widest = _max_line_width(draw, lines, font, stroke_width=stroke_width)
         if widest > int(avail_w * 1.08):
             compact_text = _compact_sfx_text(text)
             if compact_text and compact_text != text:
@@ -281,7 +321,8 @@ def render_text_on_image(
                 if lines2:
                     font, lines, line_spacing = font2, lines2, line_spacing2
                     text = compact_text
-                    widest = _max_line_width(draw, lines, font)
+                    stroke_width = _stroke_width_for_font(font)
+                    widest = _max_line_width(draw, lines, font, stroke_width=stroke_width)
         if (not bubble_used) and widest > int(avail_w * 1.12):
             return image
 
@@ -309,6 +350,8 @@ def render_text_on_image(
             )
             if lines2:
                 font, lines, line_spacing = font2, lines2, line_spacing2
+                text = short_text
+                stroke_width = _stroke_width_for_font(font)
 
     if not lines:
         return image
@@ -323,25 +366,108 @@ def render_text_on_image(
     ):
         return image
 
-    # Calculate total text height
-    line_metrics = []
+    # Calculate total text height (anchor-aware to avoid clipping)
+    line_metrics: list[tuple[int, int, int, int]] = []
     for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=font)
-        lw = bbox[2] - bbox[0]
-        lh = bbox[3] - bbox[1]
-        line_metrics.append((lw, lh))
+        left, top, right, bottom = draw.textbbox(
+            (0, 0),
+            line,
+            font=font,
+            anchor="lt",
+            stroke_width=stroke_width,
+        )
+        lw = max(0, int(right - left))
+        lh = max(0, int(bottom - top))
+        line_metrics.append((lw, lh, int(left), int(top)))
 
-    total_text_height = sum(lh for _, lh in line_metrics) + (len(lines) - 1) * line_spacing
+    total_text_height = (
+        sum(lh for _, lh, _, _ in line_metrics) + (len(lines) - 1) * line_spacing
+    )
 
     # Center vertically
     start_y = box_y + text_padding + max(0, (avail_h - total_text_height) // 2)
     x_anchor = box_x + text_padding
-    stroke_width = 1 if getattr(font, "size", 12) < 18 else 2
+
+    # Bubble masks can be narrower near the top/bottom. If a centered layout would
+    # spill outside the mask, try shifting vertically within the slack, then
+    # retry with a slightly narrower wrap width to keep text inside the bubble.
+    if box_clip_mask is not None and text_style == "dialogue":
+        base_local_start = int(start_y - box_y)
+        if not _layout_fits_bubble_mask(
+            mask=box_clip_mask,
+            start_y=base_local_start,
+            line_metrics=line_metrics,
+            line_spacing=line_spacing,
+            margin=2,
+        ):
+            slack = max(0, int(avail_h - total_text_height))
+            local_min = int(text_padding)
+            local_max = int(text_padding + slack)
+            max_shift = min(12, slack)
+            shift_candidates = [min(6, max_shift), -min(6, max_shift), max_shift, -max_shift]
+            for shift in shift_candidates:
+                cand = int(np.clip(base_local_start + shift, local_min, local_max))
+                if _layout_fits_bubble_mask(
+                    mask=box_clip_mask,
+                    start_y=cand,
+                    line_metrics=line_metrics,
+                    line_spacing=line_spacing,
+                    margin=2,
+                ):
+                    start_y = box_y + cand
+                    break
+            else:
+                narrowed_w = int(avail_w)
+                for _ in range(2):
+                    narrowed_w = max(10, int(narrowed_w * 0.90))
+                    font2, lines2, line_spacing2 = _fit_text_to_box(
+                        draw=draw,
+                        text=text,
+                        max_w=narrowed_w,
+                        max_h=avail_h,
+                        font_path=font_file,
+                        style=text_style,
+                        max_size_cap=font_cap,
+                    )
+                    if not lines2:
+                        break
+                    font, lines, line_spacing = font2, lines2, line_spacing2
+                    stroke_width = _stroke_width_for_font(font)
+
+                    line_metrics = []
+                    for line in lines:
+                        left, top, right, bottom = draw.textbbox(
+                            (0, 0),
+                            line,
+                            font=font,
+                            anchor="lt",
+                            stroke_width=stroke_width,
+                        )
+                        lw = max(0, int(right - left))
+                        lh = max(0, int(bottom - top))
+                        line_metrics.append((lw, lh, int(left), int(top)))
+
+                    total_text_height = (
+                        sum(lh for _, lh, _, _ in line_metrics)
+                        + (len(lines) - 1) * line_spacing
+                    )
+                    start_y = box_y + text_padding + max(
+                        0, (avail_h - total_text_height) // 2
+                    )
+                    base_local_start = int(start_y - box_y)
+                    if _layout_fits_bubble_mask(
+                        mask=box_clip_mask,
+                        start_y=base_local_start,
+                        line_metrics=line_metrics,
+                        line_spacing=line_spacing,
+                        margin=2,
+                    ):
+                        break
 
     # Draw each line centered horizontally
     current_y = start_y
     for i, line in enumerate(lines):
-        lw, lh = line_metrics[i]
+        lw, lh, left, top = line_metrics[i]
         line_x = x_anchor + max(0, (avail_w - lw) // 2)
         if box_clip_mask is not None:
             local_y = current_y - box_y
@@ -358,9 +484,10 @@ def render_text_on_image(
 
         # Draw outline for readability (stroke)
         draw.text(
-            (line_x, current_y),
+            (int(line_x - left), int(current_y - top)),
             line,
             font=font,
+            anchor="lt",
             fill=text_color,
             stroke_width=stroke_width,
             stroke_fill=outline_color,
@@ -999,6 +1126,7 @@ def _fit_text_to_box(
         int,
         int,
     ]:
+        stroke_width = 1 if size < 18 else 2
         font = _load_font(size)
         lines = _wrap_text(
             draw,
@@ -1007,6 +1135,7 @@ def _fit_text_to_box(
             max_w,
             allow_char_wrap=(style != "sfx"),
             allow_hyphenation=allow_hyphenation,
+            stroke_width=stroke_width,
         )
         spacing = _line_spacing_for_size(size, style)
         if not lines:
@@ -1015,9 +1144,15 @@ def _fit_text_to_box(
         widths: list[int] = []
         heights: list[int] = []
         for line in lines:
-            bbox = draw.textbbox((0, 0), line, font=font)
-            widths.append(max(0, bbox[2] - bbox[0]))
-            heights.append(max(0, bbox[3] - bbox[1]))
+            left, top, right, bottom = draw.textbbox(
+                (0, 0),
+                line,
+                font=font,
+                anchor="lt",
+                stroke_width=stroke_width,
+            )
+            widths.append(max(0, int(right - left)))
+            heights.append(max(0, int(bottom - top)))
 
         max_line_w = max(widths) if widths else 0
         total_h = sum(heights) + (len(lines) - 1) * spacing
@@ -1055,6 +1190,12 @@ def _fit_text_to_box(
     # Fallback to minimum size WITH hyphenation as last resort.
     font, lines, spacing, _, _ = _layout_at_size(min_size, allow_hyphenation=True)
     return font, lines, spacing
+
+
+def _stroke_width_for_font(font: ImageFont.FreeTypeFont | ImageFont.ImageFont) -> int:
+    """Match the outline thickness used at render time."""
+    font_size = getattr(font, "size", 12)
+    return 1 if font_size < 18 else 2
 
 
 def _line_spacing_for_size(size: int, style: str) -> int:
@@ -1226,14 +1367,21 @@ def _max_line_width(
     draw: ImageDraw.ImageDraw,
     lines: list[str],
     font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    stroke_width: int = 0,
 ) -> int:
     """Return the widest line in pixels."""
     if not lines:
         return 0
     widths: list[int] = []
     for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=font)
-        widths.append(max(0, bbox[2] - bbox[0]))
+        left, _, right, _ = draw.textbbox(
+            (0, 0),
+            line,
+            font=font,
+            anchor="lt",
+            stroke_width=stroke_width,
+        )
+        widths.append(max(0, int(right - left)))
     return max(widths) if widths else 0
 
 
@@ -1309,14 +1457,8 @@ def _effective_mask_text_width(mask: NDArray) -> int:
     return int(np.percentile(widths, 45))
 
 
-def _fit_line_x_to_mask(
-    mask: NDArray,
-    y: int,
-    line_h: int,
-    line_w: int,
-    default_x: int,
-) -> int | None:
-    """Center a line inside the mask span for the corresponding scan rows."""
+def _mask_band_span(mask: NDArray, y: int, line_h: int, line_w: int) -> tuple[int, int, int] | None:
+    """Return (left, right, avail) span for a horizontal band inside the mask."""
     h, w = mask.shape[:2]
     if h <= 0 or w <= 0:
         return None
@@ -1350,12 +1492,54 @@ def _fit_line_x_to_mask(
 
     if avail <= 6:
         return None
+    return left, right, avail
 
+
+def _fit_line_x_to_mask(
+    mask: NDArray,
+    y: int,
+    line_h: int,
+    line_w: int,
+    default_x: int,
+) -> int | None:
+    """Center a line inside the mask span for the corresponding scan rows."""
+    span = _mask_band_span(mask=mask, y=y, line_h=line_h, line_w=line_w)
+    if span is None:
+        return None
+    left, right, avail = span
+    if avail < line_w:
+        return None
+
+    h, w = mask.shape[:2]
     x = left + max(0, (avail - line_w) // 2)
     max_x = max(0, w - line_w)
     if max_x <= 0:
         return 0
     return int(np.clip(x, 0, max_x))
+
+
+def _layout_fits_bubble_mask(
+    mask: NDArray,
+    start_y: int,
+    line_metrics: list[tuple[int, int, int, int]],
+    line_spacing: int,
+    margin: int = 2,
+) -> bool:
+    """Return True if every line's width fits within the bubble mask band."""
+    if mask.size == 0:
+        return True
+
+    current_y = int(start_y)
+    for line_w, line_h, _, _ in line_metrics:
+        span = _mask_band_span(mask=mask, y=current_y, line_h=line_h, line_w=line_w)
+        if span is None:
+            return False
+        _, _, avail = span
+        if avail < (line_w + margin):
+            return False
+        current_y += int(line_h + line_spacing)
+
+    return True
 
 
 def _is_ellipsis_like(text: str) -> bool:
@@ -1380,6 +1564,73 @@ def _contains_cjk(text: str) -> bool:
     return False
 
 
+def _split_long_token_to_fit(
+    *,
+    draw: ImageDraw.ImageDraw,
+    token: str,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    max_width: int,
+    stroke_width: int = 0,
+) -> list[str]:
+    """
+    Split a single token into multiple pieces so each piece fits max_width.
+
+    This is a last-resort safeguard for extremely long words or hyphenation
+    parts that still don't fit, to avoid rendering outside the bubble.
+    """
+    if not token:
+        return [token]
+
+    left, _, right, _ = draw.textbbox(
+        (0, 0),
+        token,
+        font=font,
+        anchor="lt",
+        stroke_width=stroke_width,
+    )
+    if (right - left) <= max_width:
+        return [token]
+
+    # If the token already ends with a hyphen (e.g. from hyphenation),
+    # drop it here — this fallback prefers breaking without inserting
+    # additional hyphens.
+    core = token[:-1] if token.endswith("-") and len(token) > 1 else token
+
+    # Keep trailing punctuation on the last piece when possible.
+    suffix = ""
+    while core and core[-1] in ".,;:!?)]}\"":
+        suffix = core[-1] + suffix
+        core = core[:-1]
+
+    pieces: list[str] = []
+    current = ""
+    for idx, ch in enumerate(core):
+        candidate = current + ch
+        t_left, _, t_right, _ = draw.textbbox(
+            (0, 0),
+            candidate,
+            font=font,
+            anchor="lt",
+            stroke_width=stroke_width,
+        )
+        if (t_right - t_left) <= max_width or not current:
+            current = candidate
+            continue
+
+        pieces.append(current)
+        current = ch
+
+    if current:
+        pieces.append(current + suffix)
+    elif suffix:
+        if pieces:
+            pieces[-1] = pieces[-1].rstrip("-") + suffix
+        else:
+            pieces.append(suffix)
+
+    return pieces if pieces else [token]
+
+
 def _wrap_text(
     draw: ImageDraw.ImageDraw,
     text: str,
@@ -1387,6 +1638,7 @@ def _wrap_text(
     max_width: int,
     allow_char_wrap: bool = True,
     allow_hyphenation: bool = True,
+    stroke_width: int = 0,
 ) -> list[str]:
     """Wrap text to fit within max_width pixels.
 
@@ -1409,7 +1661,13 @@ def _wrap_text(
         current_line = words[0]
         for word in words[1:]:
             test_line = current_line + " " + word
-            bbox = draw.textbbox((0, 0), test_line, font=font)
+            bbox = draw.textbbox(
+                (0, 0),
+                test_line,
+                font=font,
+                anchor="lt",
+                stroke_width=stroke_width,
+            )
             if bbox[2] - bbox[0] <= max_width:
                 current_line = test_line
             else:
@@ -1420,7 +1678,13 @@ def _wrap_text(
         # Handle lines that exceed max_width — try hyphenation instead of
         # arbitrary character breaks.
         for line in lines:
-            bbox = draw.textbbox((0, 0), line, font=font)
+            bbox = draw.textbbox(
+                (0, 0),
+                line,
+                font=font,
+                anchor="lt",
+                stroke_width=stroke_width,
+            )
             if bbox[2] - bbox[0] <= max_width:
                 wrapped.append(line)
                 continue
@@ -1433,13 +1697,25 @@ def _wrap_text(
             line_words = line.split()
             sub_lines: list[str] = []
             for lw in line_words:
-                lw_bbox = draw.textbbox((0, 0), lw, font=font)
+                lw_bbox = draw.textbbox(
+                    (0, 0),
+                    lw,
+                    font=font,
+                    anchor="lt",
+                    stroke_width=stroke_width,
+                )
                 lw_width = lw_bbox[2] - lw_bbox[0]
                 if lw_width <= max_width:
                     # Word fits — append or extend current sub-line
                     if sub_lines:
                         test = sub_lines[-1] + " " + lw
-                        test_bbox = draw.textbbox((0, 0), test, font=font)
+                        test_bbox = draw.textbbox(
+                            (0, 0),
+                            test,
+                            font=font,
+                            anchor="lt",
+                            stroke_width=stroke_width,
+                        )
                         if test_bbox[2] - test_bbox[0] <= max_width:
                             sub_lines[-1] = test
                         else:
@@ -1448,40 +1724,62 @@ def _wrap_text(
                         sub_lines.append(lw)
                 else:
                     # Single word too wide — try hyphenation if allowed
-                    if not allow_hyphenation:
-                        # Keep word whole; the caller (binary search) will
-                        # detect overflow and try a smaller font size.
-                        sub_lines.append(lw)
-                    else:
+                    tokens: list[str]
+                    if allow_hyphenation:
                         parts = _hyphenate_word(lw)
                         if len(parts) > 1:
-                            for part_idx, part in enumerate(parts):
-                                display = part + "-" if part_idx < len(parts) - 1 else part
-                                p_bbox = draw.textbbox((0, 0), display, font=font)
-                                if p_bbox[2] - p_bbox[0] <= max_width:
-                                    if sub_lines and part_idx > 0:
-                                        test = sub_lines[-1] + display
-                                        t_bbox = draw.textbbox((0, 0), test, font=font)
-                                        if t_bbox[2] - t_bbox[0] <= max_width:
-                                            sub_lines[-1] = test
-                                        else:
-                                            sub_lines.append(display)
-                                    else:
-                                        if sub_lines:
-                                            test = sub_lines[-1] + " " + display
-                                            t_bbox = draw.textbbox((0, 0), test, font=font)
-                                            if t_bbox[2] - t_bbox[0] <= max_width:
-                                                sub_lines[-1] = test
-                                            else:
-                                                sub_lines.append(display)
-                                        else:
-                                            sub_lines.append(display)
-                                else:
-                                    # Even hyphenated part doesn't fit — just add it
-                                    sub_lines.append(display)
+                            tokens = [
+                                part + "-" if part_idx < len(parts) - 1 else part
+                                for part_idx, part in enumerate(parts)
+                            ]
                         else:
-                            # No hyphenation possible — keep word whole
-                            sub_lines.append(lw)
+                            tokens = [lw]
+                    else:
+                        tokens = [lw]
+
+                    # Ensure every token fits, falling back to hard char splits.
+                    safe_tokens: list[str] = []
+                    for token in tokens:
+                        token_bbox = draw.textbbox(
+                            (0, 0),
+                            token,
+                            font=font,
+                            anchor="lt",
+                            stroke_width=stroke_width,
+                        )
+                        if token_bbox[2] - token_bbox[0] <= max_width:
+                            safe_tokens.append(token)
+                        else:
+                            safe_tokens.extend(
+                                _split_long_token_to_fit(
+                                    draw=draw,
+                                    token=token,
+                                    font=font,
+                                    max_width=max_width,
+                                    stroke_width=stroke_width,
+                                )
+                            )
+
+                    for token_idx, token in enumerate(safe_tokens):
+                        if not sub_lines:
+                            sub_lines.append(token)
+                            continue
+
+                        if token_idx == 0:
+                            test = sub_lines[-1] + " " + token
+                        else:
+                            test = sub_lines[-1] + token
+                        t_bbox = draw.textbbox(
+                            (0, 0),
+                            test,
+                            font=font,
+                            anchor="lt",
+                            stroke_width=stroke_width,
+                        )
+                        if t_bbox[2] - t_bbox[0] <= max_width:
+                            sub_lines[-1] = test
+                        else:
+                            sub_lines.append(token)
             wrapped.extend(sub_lines if sub_lines else [line])
 
     return wrapped
