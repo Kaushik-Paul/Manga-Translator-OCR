@@ -85,6 +85,7 @@ def run_translation_pipeline(
         translation_model=cfg.translation_model,
         source_lang=cfg.source_lang,
         use_modal=cfg.use_modal,
+        use_mangaocr_cpu=cfg.use_mangaocr_cpu,
         use_detection_model=cfg.use_detection_model,
         modal_max_parallel_pages=cfg.modal_max_parallel_pages,
         output_dir=translated_dir,
