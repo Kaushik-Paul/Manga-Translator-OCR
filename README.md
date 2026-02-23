@@ -50,8 +50,16 @@ We recommend using [`uv`](https://github.com/astral-sh/uv) for lightning-fast de
    # Required for LLM translations
    OPENROUTER_API_KEY="your-openrouter-api-key-here"
 
-   # Optional: Enable Modal for GPU-accelerated OCR
-   USE_MODAL="false" 
+   # Optional: Enable Modal OCR offloading
+   USE_MODAL="false"
+
+   # Optional (only when USE_MODAL=true):
+   # false -> Modal T4 GPU OCR (faster, higher cost)
+   # true  -> Modal CPU OCR (slower, lower cost)
+   USE_MANGAOCR_CPU="false"
+
+   # Optional: Hugging Face token (helps authenticated/faster model downloads)
+   HF_TOKEN="hf_xxx"
    
    # Optional: Max parallel OpenRouter requests (set to 1 to fully serialize)
    OPENROUTER_MAX_CONCURRENT_CALLS="3"

@@ -59,6 +59,11 @@ class Settings:
     use_modal: bool = field(
         default_factory=lambda: _bool_env("USE_MODAL", False)
     )
+    # Only used when USE_MODAL=true:
+    # False -> Modal GPU OCR service, True -> Modal CPU OCR service.
+    use_mangaocr_cpu: bool = field(
+        default_factory=lambda: _bool_env("USE_MANGAOCR_CPU", False)
+    )
     # True -> Modal detector service. False -> local ONNX detector.
     use_detection_model: bool = field(
         default_factory=lambda: _bool_env("USE_DETECTION_MODEL", False)

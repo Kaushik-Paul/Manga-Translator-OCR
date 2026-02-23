@@ -29,9 +29,12 @@ detector_image = (
     )
 )
 
+_MODAL_SECRETS = [modal.Secret.from_name("huggingface-secret")]
+
 
 @app.cls(
     image=detector_image,
+    secrets=_MODAL_SECRETS,
     cpu=1,
     memory=2048,
     scaledown_window=120,

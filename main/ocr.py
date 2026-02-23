@@ -23,6 +23,9 @@ _MANGA_OCR_MODEL_ENV = "MANGA_OCR_MODEL_PATH"
 _LOCAL_MANGA_OCR_MODEL_DIR = (
     Path(__file__).resolve().parent / "weights" / "manga-ocr-base"
 )
+_MODAL_OCR_APP_NAME = "manga-ocr-service"
+_MODAL_GPU_CLS_NAME = "MangaOCR"
+_MODAL_CPU_CLS_NAME = "MangaOCRCPU"
 
 
 class OCREngine(ABC):
@@ -220,7 +223,7 @@ class MangaOCREngine(OCREngine):
 
 class ModalOCREngine(MangaOCREngine):
     """
-    OCR engine that offloads manga-ocr inference to a Modal.com T4 GPU.
+    OCR engine that offloads manga-ocr inference to Modal.
 
     Inherits all preprocessing, noise detection, and multi-pass refinement
     from MangaOCREngine — only the raw model call is remote.
@@ -229,6 +232,8 @@ class ModalOCREngine(MangaOCREngine):
     _instance: ModalOCREngine | None = None
     _modal_ocr = None
     _modal_lock = Lock()
+    _modal_cls_name = _MODAL_GPU_CLS_NAME
+    _runtime_label = "GPU"
 
     def __new__(cls) -> ModalOCREngine:
         if cls._instance is None:
@@ -243,13 +248,21 @@ class ModalOCREngine(MangaOCREngine):
                 return
             import modal
 
-            logger.info("Connecting to Modal manga-ocr-service...")
-            MangaOCRCls = modal.Cls.from_name("manga-ocr-service", "MangaOCR")
+            logger.info(
+                "Connecting to Modal %s OCR service (%s.%s)...",
+                self._runtime_label,
+                _MODAL_OCR_APP_NAME,
+                self._modal_cls_name,
+            )
+            MangaOCRCls = modal.Cls.from_name(_MODAL_OCR_APP_NAME, self._modal_cls_name)
             self._modal_ocr = MangaOCRCls()
-            logger.info("Connected to Modal manga-ocr-service.")
+            logger.info(
+                "Connected to Modal %s OCR service.",
+                self._runtime_label,
+            )
 
     def _run_manga_ocr(self, image: NDArray) -> str:
-        """Send the image to Modal GPU for manga-ocr inference."""
+        """Send the image to Modal for manga-ocr inference."""
         self._ensure_modal()
         png_bytes = self._encode_png(image)
 
@@ -314,6 +327,16 @@ class ModalOCREngine(MangaOCREngine):
         pass
 
 
+class ModalCPUOCREngine(ModalOCREngine):
+    """Modal OCR engine variant that targets the CPU-backed service."""
+
+    _instance: ModalCPUOCREngine | None = None
+    _modal_ocr = None
+    _modal_lock = Lock()
+    _modal_cls_name = _MODAL_CPU_CLS_NAME
+    _runtime_label = "CPU"
+
+
 def get_ocr_engine(lang: str = "ja") -> OCREngine:
     """
     Factory function to get the OCR engine.
@@ -322,7 +345,9 @@ def get_ocr_engine(lang: str = "ja") -> OCREngine:
         lang: Source language. Only "ja" is supported for OCR.
 
     Returns:
-        An OCR engine instance (ModalOCREngine if enabled, else local).
+        An OCR engine instance:
+        - Modal GPU/CPU engine (when USE_MODAL=true)
+        - Local manga-ocr engine (when USE_MODAL=false)
     """
     if lang != "ja":
         logger.warning(
@@ -333,6 +358,10 @@ def get_ocr_engine(lang: str = "ja") -> OCREngine:
     from .config import settings
 
     if settings.use_modal:
+        if settings.use_mangaocr_cpu:
+            logger.info("Using Modal CPU OCR engine.")
+            return ModalCPUOCREngine()
+
         logger.info("Using Modal GPU OCR engine.")
         return ModalOCREngine()
 

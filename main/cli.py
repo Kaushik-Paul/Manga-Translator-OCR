@@ -112,6 +112,15 @@ def run(argv: list[str] | None = None) -> None:
         "Detection backend: %s",
         "modal service" if settings.use_detection_model else "local model",
     )
+    if settings.use_modal:
+        ocr_backend = (
+            "modal cpu service"
+            if settings.use_mangaocr_cpu
+            else "modal gpu service"
+        )
+    else:
+        ocr_backend = "local manga-ocr (cpu)"
+    logger.info("OCR backend: %s", ocr_backend)
     logger.info("Output directory: %s", settings.output_dir)
     logger.info("─" * 40)
 
