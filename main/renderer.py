@@ -148,7 +148,7 @@ def render_text_on_image(
     font_path: str | None = None,
     region_mask: NDArray | None = None,
     style_hint: str | None = None,
-    padding: int = 6,
+    padding: int = 4,
 ) -> NDArray:
     """
     Render translated text within a bounding box on the image.
@@ -260,7 +260,7 @@ def render_text_on_image(
     if font_file is None:
         font_file = _DEFAULT_FONT_PATH
 
-    text_padding = max(2, padding - 2) if text_style == "dialogue" else padding
+    text_padding = max(2, padding - 2) if text_style == "dialogue" else max(1, padding - 3)
     avail_w = box_w - 2 * text_padding
     avail_h = box_h - 2 * text_padding
     box_clip_mask = _crop_clip_mask_to_box(
@@ -277,7 +277,10 @@ def render_text_on_image(
     if box_clip_mask is not None:
         effective_w = _effective_mask_text_width(box_clip_mask)
         if effective_w > 14:
-            avail_w = min(avail_w, max(10, effective_w - 2 * text_padding))
+            # Only narrow if the mask is meaningfully narrower than the box
+            mask_avail = max(10, effective_w - 2 * text_padding)
+            if mask_avail < avail_w * 0.85:
+                avail_w = int(max(avail_w * 0.85, mask_avail))
     if avail_w <= 10 or avail_h <= 10:
         return image
 
@@ -293,7 +296,6 @@ def render_text_on_image(
         outline_color = (0, 0, 0)
 
     # Auto-size font to fit
-    font_cap = 34 if non_bubble_dialogue else None
     font, lines, line_spacing = _fit_text_to_box(
         draw=draw,
         text=text,
@@ -301,7 +303,6 @@ def render_text_on_image(
         max_h=avail_h,
         font_path=font_file,
         style=text_style,
-        max_size_cap=font_cap,
     )
     stroke_width = _stroke_width_for_font(font)
     if text_style == "sfx" and lines:
@@ -316,7 +317,6 @@ def render_text_on_image(
                     max_h=avail_h,
                     font_path=font_file,
                     style=text_style,
-                    max_size_cap=font_cap,
                 )
                 if lines2:
                     font, lines, line_spacing = font2, lines2, line_spacing2
@@ -330,13 +330,13 @@ def render_text_on_image(
     rendered_area = box_w * box_h
     if (
         text_style == "dialogue"
-        and rendered_area < 9000
+        and rendered_area < 4000
         and lines
-        and (len(lines) >= 5 or getattr(font, "size", 12) <= 11)
+        and (len(lines) >= 6 or getattr(font, "size", 12) <= 9)
     ):
         short_text = _compress_dialogue_for_tiny_box(
             text,
-            max_words=4 if rendered_area < 6000 else 6,
+            max_words=3 if rendered_area < 2500 else 5,
         )
         if short_text != text:
             font2, lines2, line_spacing2 = _fit_text_to_box(
@@ -346,7 +346,6 @@ def render_text_on_image(
                 max_h=avail_h,
                 font_path=font_file,
                 style=text_style,
-                max_size_cap=font_cap,
             )
             if lines2:
                 font, lines, line_spacing = font2, lines2, line_spacing2
@@ -427,7 +426,6 @@ def render_text_on_image(
                         max_h=avail_h,
                         font_path=font_file,
                         style=text_style,
-                        max_size_cap=font_cap,
                     )
                     if not lines2:
                         break
@@ -559,7 +557,7 @@ def _resolve_dialogue_box(
     This follows the same idea as comic-translate's best-render-area flow:
     prioritize bubble interior (when detectable), otherwise keep the full region.
     """
-    inset = max(3, int(min(w, h) * 0.05))
+    inset = max(2, int(min(w, h) * 0.03))
     default_box = (
         x + inset,
         y + inset,
@@ -623,7 +621,7 @@ def _resolve_dialogue_box(
     if fit_bbox is None:
         return (*fallback_box, False, None)
     x1, y1, x2, y2 = fit_bbox
-    shrink_ratio = 0.16 if (y2 - y1) > (x2 - x1) * 1.20 else 0.12
+    shrink_ratio = 0.08 if (y2 - y1) > (x2 - x1) * 1.20 else 0.06
     x1, y1, x2, y2 = _shrink_centered_box(x1, y1, x2, y2, shrink_ratio)
     fit_w = x2 - x1
     fit_h = y2 - y1
