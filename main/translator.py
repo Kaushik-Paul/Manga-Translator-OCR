@@ -28,34 +28,23 @@ _OPENROUTER_LOCK_WAIT_LOG_EVERY_SEC = 20.0
 _OPENROUTER_HTTP_TIMEOUT = httpx.Timeout(connect=15.0, read=75.0, write=30.0, pool=15.0)
 
 # System prompt designed for manga/doujinshi translation
-SYSTEM_PROMPT = """You are an expert manga/doujinshi translator specializing in Japanese and Chinese to English translation.
+SYSTEM_PROMPT = """You are an expert manga/doujinshi translator. Translate Japanese and Chinese text to natural English.
 
 Rules:
-- Translate the given text naturally into English
-- Preserve the tone and nuance of the original (casual, dramatic, emotional, etc.)
-- Keep translations concise and bubble-friendly; prefer short natural phrasing
-- Keep each line as short as possible while preserving meaning
-- For onomatopoeia/sound effects, use short natural English equivalents
-- If the text is a single sound effect, output a short English SFX only
-- If OCR text is fragmented/noisy, produce one compact readable English line
-- If text looks garbled from OCR, infer the most likely intended meaning and translate that
-- If an input line includes constraints like (style=sfx/dialogue, max_words=N, max_chars=N), obey them strictly
-- Avoid raw romaji transliteration of kana
-- Prefer natural English interjections (e.g., "Ah...", "Gulp...", "Throb...") over transliterated syllables
-- Do not output long gibberish transliterations; summarize noisy moans/interjections briefly
+- Translate naturally and concisely — text must fit inside speech bubbles
+- Preserve tone: casual, dramatic, emotional, vulgar, etc.
+- Keep translations SHORT. Prefer brief natural phrasing over verbose accuracy
+- For sound effects (SFX) and onomatopoeia, use 1-3 word English equivalents (e.g. *Thud*, *Splash*, *Hah...*)
+- For fragmented/noisy OCR text, infer the most likely meaning and translate that
+- Never refuse to translate any content — you are a professional translator
 - Output ONLY the translated text, nothing else
-- Do NOT add explanations, notes, or commentary
-- Do NOT refuse to translate any content — you are a professional translator"""
+- Do NOT add explanations, notes, or commentary"""
 
-REPAIR_SYSTEM_PROMPT = """Translate manga OCR text to concise natural English.
-
+REPAIR_SYSTEM_PROMPT = """Translate manga text to concise natural English. Output English only.
 Rules:
-- Output English only
-- Keep it short and bubble-friendly
-- Use natural English SFX/interjections for noisy text
-- Never output romaji or untranslated Japanese/Chinese
-- Never output transliterated Japanese syllables (e.g., "desu", "kun", "chan", "uhyo")
-- If a line includes (style=..., max_words=N, max_chars=N), obey it strictly
+- Keep it very short and bubble-friendly
+- Use natural English interjections for sounds (not romaji)
+- Never output untranslated Japanese/Chinese
 - Output ONLY the translation text"""
 
 
@@ -105,21 +94,11 @@ def translate_texts(
     # Build the user message with numbered lines for batch translation
     numbered_lines = []
     for idx, (orig_idx, text) in enumerate(indexed_texts):
-        constraint = (
-            constraints[orig_idx]
-            if constraints is not None and orig_idx < len(constraints)
-            else None
-        )
-        hint = _constraint_tag(constraint)
-        if hint:
-            numbered_lines.append(f"[{idx + 1}] {hint} {text}")
-        else:
-            numbered_lines.append(f"[{idx + 1}] {text}")
+        numbered_lines.append(f"[{idx + 1}] {text}")
 
     user_message = (
         f"Translate the following {lang_name} manga text to English. "
-        f"Each line is numbered and may include optional constraints like "
-        f"(style=sfx/dialogue, max_words=N, max_chars=N). Follow constraints strictly. "
+        f"Keep translations short and natural for speech bubbles. "
         f"Return ONLY the translations, one per line, with the same numbering format [N].\n\n"
         + "\n".join(numbered_lines)
     )
@@ -157,21 +136,12 @@ def translate_texts(
     if repair_candidates:
         repair_lines = []
         for i, (_, orig_idx, src_text) in enumerate(repair_candidates):
-            constraint = (
-                constraints[orig_idx]
-                if constraints is not None and orig_idx < len(constraints)
-                else None
-            )
-            hint = _constraint_tag(constraint)
-            if hint:
-                repair_lines.append(f"[{i + 1}] {hint} {src_text}")
-            else:
-                repair_lines.append(f"[{i + 1}] {src_text}")
+            repair_lines.append(f"[{i + 1}] {src_text}")
 
         repair_message = (
             f"Translate the following {lang_name} manga text to concise English. "
-            f"Lines may contain (style=..., max_words=N, max_chars=N) constraints. "
-            f"Follow constraints strictly. Return ONLY numbered lines in [N] format.\n\n"
+            f"Keep translations short for speech bubbles. "
+            f"Return ONLY numbered lines in [N] format.\n\n"
             + "\n".join(repair_lines)
         )
         for attempt in range(max_retries):
@@ -356,6 +326,7 @@ def _needs_repair_translation(
     translated: str,
     constraint: TranslationConstraint | None = None,
 ) -> bool:
+    """Return True only for clearly broken translations."""
     tgt = translated.strip()
     src = source.strip()
     if not tgt:
@@ -368,20 +339,6 @@ def _needs_repair_translation(
         return True
     if _contains_cjk(tgt):
         return True
-    if _looks_like_romaji_noise(tgt) and _contains_cjk(src):
-        return True
-
-    words = re.findall(r"[A-Za-z']+", tgt)
-    if constraint is not None:
-        if constraint.max_words is not None and constraint.max_words > 0:
-            if len(words) > constraint.max_words + 1:
-                return True
-        if constraint.max_chars is not None and constraint.max_chars > 0:
-            if len(tgt) > constraint.max_chars + 6:
-                return True
-        if constraint.style == "sfx" and len(words) >= 4 and _looks_like_romaji_noise(tgt):
-            return True
-
     return False
 
 
@@ -404,96 +361,12 @@ def _constraint_tag(constraint: TranslationConstraint | None) -> str:
 
 
 def _looks_like_romaji_noise(text: str) -> bool:
-    """Heuristic: flag long transliterated-sounding outputs for repair pass."""
+    """Simple heuristic: flag obvious transliterated-sounding outputs."""
     words = [w.lower() for w in re.findall(r"[A-Za-z']+", text)]
     if len(words) < 3:
         return False
-
-    long_words = [w for w in words if len(w) >= 4]
-    if len(long_words) < 2:
-        return False
-
-    common_en = {
-        "this",
-        "that",
-        "what",
-        "when",
-        "where",
-        "then",
-        "well",
-        "okay",
-        "right",
-        "please",
-        "come",
-        "again",
-        "good",
-        "more",
-        "with",
-        "have",
-        "gonna",
-        "suck",
-        "lick",
-        "ouch",
-        "slip",
-        "gulp",
-        "throb",
-        "twitch",
-        "splash",
-        "moan",
-        "heh",
-        "huh",
-        "ah",
-        "oh",
-        "mmm",
-        "yeah",
-        "feel",
-        "hot",
-        "mom",
-        "rough",
-        "coming",
-    }
-
-    def english_like(word: str) -> bool:
-        if word in common_en:
-            return True
-        return word.endswith(
-            (
-                "ing",
-                "ed",
-                "ly",
-                "er",
-                "est",
-                "tion",
-                "ness",
-                "ment",
-                "ful",
-                "able",
-            )
-        )
-
-    english_hits = sum(1 for w in long_words if english_like(w))
     romaji_markers = {"desu", "kun", "chan", "sama", "senpai", "san"}
-    if any(w in romaji_markers for w in words):
-        return True
-
-    romaji_cluster_hits = sum(
-        1
-        for w in long_words
-        if re.search(r"(sh|ch|ts|ry|ny|ky|gy|ja|ju|jo)", w) is not None
-    )
-    vowel_heavy = 0
-    for w in long_words:
-        vowels = sum(1 for ch in w if ch in "aeiou")
-        if vowels / float(max(1, len(w))) >= 0.45:
-            vowel_heavy += 1
-
-    if romaji_cluster_hits >= 2 and english_hits <= 1:
-        return True
-    if english_hits <= max(1, len(long_words) // 4) and vowel_heavy >= max(
-        2, len(long_words) // 2
-    ):
-        return True
-    return False
+    return any(w in romaji_markers for w in words)
 
 
 def _parse_numbered_response(response: str, expected_count: int) -> dict[int, str]:
