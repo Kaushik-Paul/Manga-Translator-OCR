@@ -179,8 +179,8 @@ class ComicTextDetector:
     def detect(
         self,
         image: NDArray,
-        text_threshold: float = 0.5,
-        min_area: int = 100,
+        text_threshold: float = 0.35,
+        min_area: int = 50,
         padding: int = 5,
     ) -> tuple[list[TextRegion], NDArray]:
         """
@@ -585,18 +585,13 @@ class ComicTextDetector:
 
     def _is_region_viable(self, region: TextRegion) -> bool:
         """Filter noisy tiny detections that are unlikely to be useful text regions."""
-        if region.w < 18 or region.h < 18:
+        if region.w < 12 or region.h < 12:
             return False
         if region.mask is None:
             return True
 
         non_zero = cv2.countNonZero(region.mask.astype(np.uint8))
-        if non_zero < 20:
-            return False
-
-        area = max(1, region.w * region.h)
-        density = non_zero / float(area)
-        if area < 1800 and density < 0.028:
+        if non_zero < 10:
             return False
         return True
 
@@ -659,8 +654,8 @@ class ModalTextDetector(ComicTextDetector):
     def detect(
         self,
         image: NDArray,
-        text_threshold: float = 0.5,
-        min_area: int = 100,
+        text_threshold: float = 0.35,
+        min_area: int = 50,
         padding: int = 5,
     ) -> tuple[list[TextRegion], NDArray]:
         self._ensure_modal()

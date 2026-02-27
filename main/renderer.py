@@ -1093,17 +1093,26 @@ def _fit_text_to_box(
     font_path: str | None,
     style: str = "dialogue",
     min_size: int = 8,
-    max_size: int = 48,
+    max_size: int = 120,
     max_size_cap: int | None = None,
 ) -> tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, list[str], int]:
     """Find the largest font size where the wrapped text fits in the box."""
 
+    # Dynamically compute max font size from box dimensions so text fills
+    # the available space, similar to comic-translate's approach.
+    word_count = len(text.split())
     if style == "dialogue":
-        # Scale max font size based on available box height for better fill
-        dynamic_max = min(48, max(32, int(max_h / 1.2)))
+        # For dialogue: scale based on box height but also consider width.
+        # More words need smaller starting sizes to leave room for wrapping.
+        if word_count <= 3:
+            dynamic_max = min(120, max(max_h, max_w))
+        else:
+            dynamic_max = min(120, max(24, int(max_h * 0.7)))
         max_size = min(max_size, dynamic_max)
     else:
-        max_size = min(max_size, 54)
+        # SFX: can go large, scale with box dimensions
+        dynamic_max = min(120, max(max_h, max_w))
+        max_size = min(max_size, dynamic_max)
         min_size = min(min_size, 6)
     if max_size_cap is not None:
         max_size = min(max_size, max_size_cap)
@@ -1126,14 +1135,14 @@ def _fit_text_to_box(
         int,
         int,
     ]:
-        stroke_width = 1 if size < 18 else 2
+        stroke_width = max(1, size // 12)
         font = _load_font(size)
         lines = _wrap_text(
             draw,
             text,
             font,
             max_w,
-            allow_char_wrap=(style != "sfx"),
+            allow_char_wrap=False,
             allow_hyphenation=allow_hyphenation,
             stroke_width=stroke_width,
         )
@@ -1195,14 +1204,14 @@ def _fit_text_to_box(
 def _stroke_width_for_font(font: ImageFont.FreeTypeFont | ImageFont.ImageFont) -> int:
     """Match the outline thickness used at render time."""
     font_size = getattr(font, "size", 12)
-    return 1 if font_size < 18 else 2
+    return max(1, font_size // 12)
 
 
 def _line_spacing_for_size(size: int, style: str) -> int:
     """Compute line spacing as a function of font size and text style."""
     if style == "sfx":
-        return max(1, int(size * 0.10))
-    return max(2, int(size * 0.18))
+        return max(1, int(size * 0.08))
+    return max(2, int(size * 0.12))
 
 
 def _compress_dialogue_for_tiny_box(text: str, max_words: int) -> str:
@@ -1220,33 +1229,17 @@ def _compress_dialogue_for_tiny_box(text: str, max_words: int) -> str:
 
 
 def _tighten_non_bubble_dialogue(text: str, box_w: int, box_h: int) -> str:
-    """Apply hard budgets for dialogue rendered outside detected bubbles."""
+    """Apply light budgets for dialogue rendered outside detected bubbles."""
     clean = " ".join(text.replace("\r", " ").replace("\n", " ").split())
     if not clean:
         return clean
-
+    # Just return the cleaned text — let the renderer handle fitting.
+    # Only do a light trim for extremely long text in tiny boxes.
     area = max(1, box_w * box_h)
-    aspect = box_h / float(max(1, box_w))
-    if area < 5000:
-        max_words = 3
-        max_chars = 18
-    elif area < 12000:
-        max_words = 4
-        max_chars = 30
-    else:
-        max_words = 4
-        max_chars = 32
-
-    if aspect >= 1.50:
-        max_words = min(max_words, 4)
-        max_chars = min(max_chars, 26)
-
-    clipped = _compress_dialogue_for_tiny_box(clean, max_words=max_words)
-    if len(clipped) > max_chars:
-        clipped = clipped[:max_chars].rstrip(".,;:!?- ")
-        if clipped and not clipped.endswith("..."):
-            clipped += "..."
-    return clipped
+    words = clean.split()
+    if area < 3000 and len(words) > 6:
+        return _compress_dialogue_for_tiny_box(clean, max_words=4)
+    return clean
 
 
 def _is_punctuation_only(text: str) -> bool:
@@ -1267,7 +1260,7 @@ def _should_skip_render_text(
     text_style: str,
     bubble_used: bool,
 ) -> bool:
-    """Suppress tiny noisy fragments that produce unreadable clutter."""
+    """Suppress truly tiny noise that would be unreadable."""
     clean = " ".join(text.split())
     if not clean:
         return True
@@ -1277,68 +1270,23 @@ def _should_skip_render_text(
         return False
 
     area = max(1, box_w * box_h)
-    alpha_num = sum(1 for c in clean if c.isalnum())
-    words = clean.split(" ")
-
-    if area < 900 and alpha_num <= 2:
-        return True
-    if text_style == "sfx" and area < 1400 and len(words) <= 1 and alpha_num <= 3:
-        return True
-    if (not bubble_used) and area < 1700 and len(words) <= 2 and alpha_num <= 4:
-        return True
-    if (not bubble_used) and area < 2400 and len(words) <= 1 and alpha_num <= 5:
-        return True
-    if (not bubble_used) and area < 3000 and len(words) <= 2 and alpha_num <= 3:
+    # Only skip truly tiny regions where no text could be legible
+    if area < 400:
         return True
     return False
 
 
 def _prefer_sfx_for_free_text(text: str, box_w: int, box_h: int) -> bool:
-    """Use SFX style for short non-bubble snippets to avoid heavy dialogue rendering."""
+    """Use SFX style for very short non-bubble snippets."""
     clean = " ".join(text.split())
     words = clean.split(" ") if clean else []
-    alpha = sum(1 for c in clean if c.isalpha())
-    area = max(1, box_w * box_h)
-    if area < 12000 and len(words) <= 4 and alpha <= 24:
-        return True
-    if len(words) <= 2 and alpha <= 18:
-        return True
-    return False
+    return len(words) <= 2
 
 
 def _is_low_signal_dialogue_fragment(text: str) -> bool:
-    """Detect low-information one-word fragments from noisy OCR/translation."""
+    """Detect truly empty/meaningless fragments from noisy OCR/translation."""
     tokens = [w.lower() for w in re.findall(r"[A-Za-z']+", text)]
     if not tokens:
-        return True
-
-    low_signal = {
-        "that",
-        "that's",
-        "this",
-        "there",
-        "then",
-        "well",
-        "okay",
-        "just",
-        "so",
-        "what",
-        "is",
-        "are",
-        "ah",
-        "oh",
-        "huh",
-    }
-    if len(tokens) == 1:
-        return tokens[0] in low_signal
-    if len(tokens) == 2:
-        return all(t in low_signal for t in tokens)
-    if len(tokens) <= 3 and sum(1 for t in tokens if t in low_signal) >= (len(tokens) - 1):
-        return True
-    if len(tokens) <= 4 and (
-        ("happened" in tokens or "happening" in tokens)
-        and tokens[0] in {"that", "that's", "this", "it"}
-    ):
         return True
     return False
 
@@ -1642,14 +1590,20 @@ def _wrap_text(
 ) -> list[str]:
     """Wrap text to fit within max_width pixels.
 
-    Uses word-boundary wrapping. When allow_hyphenation is True, words
-    that don't fit are split at natural English syllable boundaries.
-    When False, oversized words are kept whole (the caller should try
-    a smaller font size instead).
+    Uses word-boundary wrapping only. Words are never split unless
+    allow_hyphenation is True (syllable-aware splits) or allow_char_wrap
+    is True (last-resort character splits).
+
+    When both are False and a word exceeds max_width, returns [] to signal
+    the caller that this font size is too large.
     """
     paragraphs = [p.strip() for p in text.replace("\r", "\n").split("\n") if p.strip()]
     if not paragraphs:
         return []
+
+    def _measure(txt: str) -> int:
+        bbox = draw.textbbox((0, 0), txt, font=font, anchor="lt", stroke_width=stroke_width)
+        return max(0, int(bbox[2] - bbox[0]))
 
     wrapped: list[str] = []
     for paragraph in paragraphs:
@@ -1657,99 +1611,69 @@ def _wrap_text(
         if not words:
             continue
 
+        # Check if any single word exceeds max_width
+        if not allow_char_wrap and not allow_hyphenation:
+            for word in words:
+                if _measure(word) > max_width:
+                    return []  # Signal: font too large, shrink it
+
+        # Greedy word-boundary wrapping
         lines: list[str] = []
         current_line = words[0]
         for word in words[1:]:
             test_line = current_line + " " + word
-            bbox = draw.textbbox(
-                (0, 0),
-                test_line,
-                font=font,
-                anchor="lt",
-                stroke_width=stroke_width,
-            )
-            if bbox[2] - bbox[0] <= max_width:
+            if _measure(test_line) <= max_width:
                 current_line = test_line
             else:
                 lines.append(current_line)
                 current_line = word
         lines.append(current_line)
 
-        # Handle lines that exceed max_width — try hyphenation instead of
-        # arbitrary character breaks.
+        # Post-process lines that still exceed max_width
         for line in lines:
-            bbox = draw.textbbox(
-                (0, 0),
-                line,
-                font=font,
-                anchor="lt",
-                stroke_width=stroke_width,
-            )
-            if bbox[2] - bbox[0] <= max_width:
-                wrapped.append(line)
-                continue
-            if not allow_char_wrap:
+            if _measure(line) <= max_width:
                 wrapped.append(line)
                 continue
 
-            # Try to break at word boundaries within this line (it may be a
-            # single long word or a phrase whose first word is too wide).
+            if not allow_char_wrap and not allow_hyphenation:
+                # Should not happen (checked above), but safety net
+                return []
+
+            # Line exceeds width — split individual words if needed
             line_words = line.split()
             sub_lines: list[str] = []
             for lw in line_words:
-                lw_bbox = draw.textbbox(
-                    (0, 0),
-                    lw,
-                    font=font,
-                    anchor="lt",
-                    stroke_width=stroke_width,
-                )
-                lw_width = lw_bbox[2] - lw_bbox[0]
+                lw_width = _measure(lw)
                 if lw_width <= max_width:
-                    # Word fits — append or extend current sub-line
                     if sub_lines:
                         test = sub_lines[-1] + " " + lw
-                        test_bbox = draw.textbbox(
-                            (0, 0),
-                            test,
-                            font=font,
-                            anchor="lt",
-                            stroke_width=stroke_width,
-                        )
-                        if test_bbox[2] - test_bbox[0] <= max_width:
+                        if _measure(test) <= max_width:
                             sub_lines[-1] = test
                         else:
                             sub_lines.append(lw)
                     else:
                         sub_lines.append(lw)
                 else:
-                    # Single word too wide — try hyphenation if allowed
+                    # Word too wide — try hyphenation first
                     tokens: list[str]
                     if allow_hyphenation:
                         parts = _hyphenate_word(lw)
                         if len(parts) > 1:
                             tokens = [
-                                part + "-" if part_idx < len(parts) - 1 else part
-                                for part_idx, part in enumerate(parts)
+                                part + "-" if pi < len(parts) - 1 else part
+                                for pi, part in enumerate(parts)
                             ]
                         else:
                             tokens = [lw]
                     else:
                         tokens = [lw]
 
-                    # Ensure every token fits, falling back to hard char splits.
+                    # Hard char splits as absolute last resort
                     safe_tokens: list[str] = []
                     for token in tokens:
-                        token_bbox = draw.textbbox(
-                            (0, 0),
-                            token,
-                            font=font,
-                            anchor="lt",
-                            stroke_width=stroke_width,
-                        )
-                        if token_bbox[2] - token_bbox[0] <= max_width:
+                        if _measure(token) <= max_width:
                             safe_tokens.append(token)
-                        else:
+                        elif allow_char_wrap:
                             safe_tokens.extend(
                                 _split_long_token_to_fit(
                                     draw=draw,
@@ -1759,24 +1683,16 @@ def _wrap_text(
                                     stroke_width=stroke_width,
                                 )
                             )
+                        else:
+                            return []  # Can't fit without char splitting
 
-                    for token_idx, token in enumerate(safe_tokens):
+                    for ti, token in enumerate(safe_tokens):
                         if not sub_lines:
                             sub_lines.append(token)
                             continue
-
-                        if token_idx == 0:
-                            test = sub_lines[-1] + " " + token
-                        else:
-                            test = sub_lines[-1] + token
-                        t_bbox = draw.textbbox(
-                            (0, 0),
-                            test,
-                            font=font,
-                            anchor="lt",
-                            stroke_width=stroke_width,
-                        )
-                        if t_bbox[2] - t_bbox[0] <= max_width:
+                        sep = " " if ti == 0 else ""
+                        test = sub_lines[-1] + sep + token
+                        if _measure(test) <= max_width:
                             sub_lines[-1] = test
                         else:
                             sub_lines.append(token)

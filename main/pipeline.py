@@ -32,8 +32,6 @@ class RenderTextUnit:
     region: TextRegion
     source_text: str
     style_hint: str
-    max_words: int
-    max_chars: int
     parent_region_index: int
 
 
@@ -122,26 +120,20 @@ def translate_page(
             continue
 
         style_hint = _infer_unit_style(text, ocr_region.w, ocr_region.h)
-        max_words = _max_words_for_unit(style_hint, ocr_region.w, ocr_region.h)
-        max_chars = _max_chars_for_unit(style_hint, ocr_region.w, ocr_region.h)
         units.append(
             RenderTextUnit(
                 region=ocr_region,
                 source_text=text,
                 style_hint=style_hint,
-                max_words=max_words,
-                max_chars=max_chars,
                 parent_region_index=region_idx,
             )
         )
         inpaint_region_indices.add(region_idx)
         logger.info(
-            "  Region %d.%d [%s, max_words=%d, max_chars=%d]: '%s'",
+            "  Region %d.%d [%s]: '%s'",
             region_idx + 1,
             sub_idx,
             style_hint,
-            max_words,
-            max_chars,
             text[:80],
         )
 
@@ -156,11 +148,7 @@ def translate_page(
     logger.info("Step 3/4: Translating %d text segments...", len(units))
     source_texts = [unit.source_text for unit in units]
     constraints = [
-        TranslationConstraint(
-            style=unit.style_hint,
-            max_words=unit.max_words,
-            max_chars=unit.max_chars,
-        )
+        TranslationConstraint(style=unit.style_hint)
         for unit in units
     ]
     translated_texts = translate_texts(
@@ -169,9 +157,10 @@ def translate_page(
         model=cfg.translation_model,
         constraints=constraints,
     )
+    # Light sanitization: only block CJK leakage, let renderer handle sizing
     translated_texts = [
-        _sanitize_translated_text(text=text, unit=unit)
-        for text, unit in zip(translated_texts, units)
+        _sanitize_translated_text(text=text)
+        for text in translated_texts
     ]
     renderable_unit_mask = [
         _is_renderable_translation(text) for text in translated_texts
@@ -508,155 +497,45 @@ def _merge_nearby_boxes(
 
 
 def _infer_unit_style(source_text: str, w: int, h: int) -> str:
-    """Coarse style hint for translation constraints."""
+    """Coarse style hint: SFX for short sounds, dialogue for everything else."""
     clean = "".join(source_text.split())
     if not clean:
         return "sfx"
 
     script_total, kana_count, kanji_count, punct_count = _script_profile(clean)
-    area = max(1, w * h)
     char_count = len(clean)
     has_sentence_punct = any(c in clean for c in "。！？?!")
-    kana_ratio = kana_count / float(max(1, script_total))
-    punct_ratio = punct_count / float(max(1, char_count))
-    aspect = h / float(max(1, w))
 
-    if char_count <= 2:
+    # Short text without sentence punctuation is likely SFX
+    if char_count <= 3:
         return "sfx"
-    if char_count <= 6 and not has_sentence_punct:
-        return "sfx"
-    if char_count <= 8 and punct_ratio >= 0.28 and kanji_count <= 1:
-        return "sfx"
-    if char_count <= 10 and aspect >= 1.45 and kana_count >= 3 and kanji_count <= 1:
-        return "sfx"
-    # Noisy kana-heavy OCR tends to transliterate badly; force concise SFX style.
-    if area < 8500 and kana_count >= 8 and kanji_count <= 1 and punct_ratio >= 0.18:
-        return "sfx"
-    if area < 7000 and kana_ratio >= 0.90 and kanji_count <= 1 and char_count >= 12:
-        return "sfx"
-    if h < int(w * 0.58) and char_count <= 12:
+    if char_count <= 6 and not has_sentence_punct and kanji_count <= 1:
         return "sfx"
     return "dialogue"
 
 
-def _max_words_for_unit(style_hint: str, w: int, h: int) -> int:
-    """Word-budget heuristic used before rendering."""
-    area = max(1, w * h)
-    aspect = h / float(max(1, w))
-    if style_hint == "sfx":
-        if area < 2500:
-            return 2
-        if area < 7000:
-            return 3
-        if area < 14000:
-            return 4
-        return 6
-
-    if area < 2500:
-        base = 4
-    elif area < 5000:
-        base = 6
-    elif area < 9000:
-        base = 8
-    elif area < 14000:
-        base = 10
-    else:
-        base = 13
-
-    if aspect >= 1.45:
-        base = min(base, 8)
-    if aspect >= 1.90:
-        base = min(base, 6)
-    return base
 
 
-def _max_chars_for_unit(style_hint: str, w: int, h: int) -> int:
-    """Character-budget heuristic to prevent long transliterated render strings."""
-    area = max(1, w * h)
-    aspect = h / float(max(1, w))
-    if style_hint == "sfx":
-        if area < 2500:
-            return 12
-        if area < 7000:
-            return 18
-        if area < 14000:
-            return 24
-        return 34
-
-    if area < 2500:
-        base = 26
-    elif area < 5000:
-        base = 38
-    elif area < 9000:
-        base = 56
-    elif area < 14000:
-        base = 72
-    else:
-        base = 96
-
-    if aspect >= 1.45:
-        base = min(base, 56)
-    if aspect >= 1.90:
-        base = min(base, 40)
-    return base
-
-
-def _apply_word_limit(text: str, max_words: int) -> str:
-    """Hard clamp translated text to a max word count before rendering."""
+def _sanitize_translated_text(text: str) -> str:
+    """Guard against untranslated CJK leakage before rendering."""
     clean = " ".join(text.replace("\r", " ").replace("\n", " ").split())
-    if not clean:
-        return clean
-    if max_words <= 0:
-        return clean
-
-    words = clean.split(" ")
-    if len(words) <= max_words:
-        return clean
-
-    trimmed = " ".join(words[:max_words]).rstrip(".,;:!?")
-    return f"{trimmed}..."
-
-
-def _apply_char_limit(text: str, max_chars: int) -> str:
-    """Hard clamp translated text to a max character count before rendering."""
-    clean = " ".join(text.replace("\r", " ").replace("\n", " ").split())
-    if not clean:
-        return clean
-    if max_chars <= 0 or len(clean) <= max_chars:
-        return clean
-
-    clipped = clean[:max_chars].rstrip(".,;:!?- ")
-    if not clipped:
-        return clean[:max_chars]
-    return f"{clipped}..."
-
-
-def _sanitize_translated_text(text: str, unit: RenderTextUnit) -> str:
-    """Clamp and guard against untranslated CJK leakage before rendering."""
-    clipped = _apply_char_limit(
-        _apply_word_limit(text, unit.max_words),
-        unit.max_chars,
-    )
-    if not _contains_cjk(clipped) and not _looks_like_romaji_noise(clipped):
-        return clipped
-    # Last-resort fallback: keep output English-only when model returns untranslated text.
-    if unit.style_hint == "dialogue":
+    if _contains_cjk(clean):
         return "..."
-    return "Ah..."
+    return clean
 
 
 def _is_renderable_translation(text: str) -> bool:
     """
     Return True if translation should be rendered on-page.
 
-    Reject empty strings and punctuation-only placeholders (e.g. "...").
+    Only reject empty strings and clear refusals.
     """
     cleaned = " ".join(text.replace("\r", " ").replace("\n", " ").split()).strip()
     if not cleaned:
         return False
     if _looks_like_refusal_text(cleaned):
         return False
-    return re.search(r"[A-Za-z0-9]", cleaned) is not None
+    return True
 
 
 def _looks_like_refusal_text(text: str) -> bool:
