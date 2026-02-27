@@ -432,7 +432,7 @@ def render_text_on_image(
                     font, lines, line_spacing = font2, lines2, line_spacing2
                     stroke_width = _stroke_width_for_font(font)
 
-                    line_metrics = []
+                    line_metrics.clear()
                     for line in lines:
                         left, top, right, bottom = draw.textbbox(
                             (0, 0),
@@ -449,18 +449,10 @@ def render_text_on_image(
                         sum(lh for _, lh, _, _ in line_metrics)
                         + (len(lines) - 1) * line_spacing
                     )
+
                     start_y = box_y + text_padding + max(
                         0, (avail_h - total_text_height) // 2
                     )
-                    base_local_start = int(start_y - box_y)
-                    if _layout_fits_bubble_mask(
-                        mask=box_clip_mask,
-                        start_y=base_local_start,
-                        line_metrics=line_metrics,
-                        line_spacing=line_spacing,
-                        margin=2,
-                    ):
-                        break
 
     # Draw each line centered horizontally
     current_y = start_y
@@ -621,7 +613,8 @@ def _resolve_dialogue_box(
     if fit_bbox is None:
         return (*fallback_box, False, None)
     x1, y1, x2, y2 = fit_bbox
-    shrink_ratio = 0.08 if (y2 - y1) > (x2 - x1) * 1.20 else 0.06
+    # The mask is already eroded; we don't need additional aggressive shrinkage.
+    shrink_ratio = 0.00
     x1, y1, x2, y2 = _shrink_centered_box(x1, y1, x2, y2, shrink_ratio)
     fit_w = x2 - x1
     fit_h = y2 - y1
@@ -1100,12 +1093,13 @@ def _fit_text_to_box(
     # the available space, similar to comic-translate's approach.
     word_count = len(text.split())
     if style == "dialogue":
-        # For dialogue: scale based on box height but also consider width.
-        # More words need smaller starting sizes to leave room for wrapping.
-        if word_count <= 3:
-            dynamic_max = min(120, max(max_h, max_w))
+        # Allow dialogue text to grow much larger if the bubble permits it
+        if word_count <= 2:
+            dynamic_max = min(200, max(max_h, int(max_w * 1.5)))
+        elif word_count <= 5:
+            dynamic_max = min(160, max(max_h, int(max_w * 1.2)))
         else:
-            dynamic_max = min(120, max(24, int(max_h * 0.7)))
+            dynamic_max = min(150, max(24, int(max_h * 0.9)))
         max_size = min(max_size, dynamic_max)
     else:
         # SFX: can go large, scale with box dimensions
@@ -1209,7 +1203,8 @@ def _line_spacing_for_size(size: int, style: str) -> int:
     """Compute line spacing as a function of font size and text style."""
     if style == "sfx":
         return max(1, int(size * 0.08))
-    return max(2, int(size * 0.12))
+    # Comic fonts typically have generous built-in descent/ascent metrics.
+    return max(1, int(size * 0.02))
 
 
 def _compress_dialogue_for_tiny_box(text: str, max_words: int) -> str:

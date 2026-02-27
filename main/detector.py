@@ -349,7 +349,7 @@ class ComicTextDetector:
                 continue
 
             rx, ry, rw, rh = cv2.boundingRect(contour)
-            if rw < 15 or rh < 15:
+            if rw < 8 or rh < 8:
                 continue
             candidate_boxes.append((rx, ry, rx + rw, ry + rh))
 
@@ -466,7 +466,7 @@ class ComicTextDetector:
                 continue
 
             sx, sy, sw, sh = cv2.boundingRect(contour)
-            if sw < 12 or sh < 12:
+            if sw < 8 or sh < 8:
                 continue
 
             x1 = max(0, rx + sx - padding)
@@ -545,7 +545,7 @@ class ComicTextDetector:
             if area < min_sub_area:
                 continue
             sx, sy, sw, sh = cv2.boundingRect(contour)
-            if sw < 12 or sh < 12:
+            if sw < 8 or sh < 8:
                 continue
 
             x1 = max(0, rx + sx - padding)
@@ -585,7 +585,7 @@ class ComicTextDetector:
 
     def _is_region_viable(self, region: TextRegion) -> bool:
         """Filter noisy tiny detections that are unlikely to be useful text regions."""
-        if region.w < 12 or region.h < 12:
+        if region.w < 8 or region.h < 8:
             return False
         if region.mask is None:
             return True

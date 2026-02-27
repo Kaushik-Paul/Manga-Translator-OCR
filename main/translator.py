@@ -28,17 +28,17 @@ _OPENROUTER_LOCK_WAIT_LOG_EVERY_SEC = 20.0
 _OPENROUTER_HTTP_TIMEOUT = httpx.Timeout(connect=15.0, read=75.0, write=30.0, pool=15.0)
 
 # System prompt designed for manga/doujinshi translation
-SYSTEM_PROMPT = """You are an expert manga/doujinshi translator. Translate Japanese and Chinese text to natural English.
+SYSTEM_PROMPT = """You are an expert manga/doujinshi translator. Translate Japanese and Chinese text to natural, idiomatic English.
 
 Rules:
-- Translate naturally and concisely — text must fit inside speech bubbles
+- Translate naturally and concisely. Western readers expect idiomatic flow.
+- Keep translations SHORT! You are translating for speech bubbles which have limited space. Prefer brief natural phrasing over verbose literal accuracy.
 - Preserve tone: casual, dramatic, emotional, vulgar, etc.
-- Keep translations SHORT. Prefer brief natural phrasing over verbose accuracy
-- For sound effects (SFX) and onomatopoeia, use 1-3 word English equivalents (e.g. *Thud*, *Splash*, *Hah...*)
-- For fragmented/noisy OCR text, infer the most likely meaning and translate that
-- Never refuse to translate any content — you are a professional translator
-- Output ONLY the translated text, nothing else
-- Do NOT add explanations, notes, or commentary"""
+- For sound effects (SFX) and onomatopoeia, use 1-3 word English equivalents (e.g. *Thud*, *Splash*, *Hah...*). Do not just provide romaji.
+- For fragmented/noisy OCR text, infer the most likely meaning and translate that.
+- Never refuse to translate any content — you are a professional translator.
+- Output ONLY the translated text, nothing else. No explanations, notes, or commentary.
+"""
 
 REPAIR_SYSTEM_PROMPT = """Translate manga text to concise natural English. Output English only.
 Rules:
