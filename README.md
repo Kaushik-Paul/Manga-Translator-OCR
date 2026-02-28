@@ -17,7 +17,8 @@ Whether you're looking for an interactive reading experience through a clean Web
 * **Cutting-Edge Japanese OCR**: Utilizes `manga-ocr` to handle vertical text, furigana, and varied manga fonts with incredibly high accuracy.
 * **Smart LLM Translations**: Context-aware translations powered by your choice of LLM (via OpenRouter)! Defaulting to powerful models like DeepSeek or Mistral to preserve the tone and nuance of the original Japanese.
 * **Seamless Inpainting & Rendering**: Dynamically removes original Japanese text from the image and smartly renders the translated English text to fit perfectly inside the speech bubbles.
-* **Cloud GPU Acceleration**: Need speed? Toggle Modal.com integration to offload OCR to remote GPUs and process entire chapters in parallel!
+* **Parallel Page Processing**: Processes multiple pages concurrently out of the box — overlapping I/O-bound API calls with CPU-bound detection/OCR for faster batch translations, even without a GPU.
+* **Cloud GPU Acceleration**: Need more speed? Toggle Modal.com integration to offload OCR to remote GPUs and process entire chapters in parallel!
 * **Flexibility & Speed**: Use the interactive Gradio Web UI for single page experimentation, or the robust CLI for automated, folder-wide batch processing.
 
 ## 🚀 Try It Live
@@ -63,6 +64,13 @@ We recommend using [`uv`](https://github.com/astral-sh/uv) for lightning-fast de
    
    # Optional: Max parallel OpenRouter requests (set to 1 to fully serialize)
    OPENROUTER_MAX_CONCURRENT_CALLS="3"
+
+   # Optional: Parallel pages when running locally (USE_MODAL=false).
+   # 2 is ideal for dual-core CPU + 16 GB RAM setups (e.g. HF Spaces).
+   LOCAL_MAX_PARALLEL_PAGES="2"
+
+   # Optional (only when USE_MODAL=true): max parallel pages per batch
+   MODAL_MAX_PARALLEL_PAGES="2"
    
    # Optional: Override the translation model
    TRANSLATION_MODEL="deepseek/deepseek-chat"

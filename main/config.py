@@ -72,6 +72,11 @@ class Settings:
     modal_max_parallel_pages: int = field(
         default_factory=lambda: _int_env("MODAL_MAX_PARALLEL_PAGES", 2)
     )
+    # Parallel pages when running locally (USE_MODAL=false).
+    # 2 is ideal for dual-core CPU + 16 GB RAM (overlaps I/O waits).
+    local_max_parallel_pages: int = field(
+        default_factory=lambda: _int_env("LOCAL_MAX_PARALLEL_PAGES", 2)
+    )
 
     # Gradio UI auth gate for costly actions (translate / download).
     gradio_action_password: str = field(
@@ -89,6 +94,8 @@ class Settings:
             )
         if self.modal_max_parallel_pages < 1:
             raise ValueError("MODAL_MAX_PARALLEL_PAGES must be >= 1.")
+        if self.local_max_parallel_pages < 1:
+            raise ValueError("LOCAL_MAX_PARALLEL_PAGES must be >= 1.")
 
 
 # Singleton
