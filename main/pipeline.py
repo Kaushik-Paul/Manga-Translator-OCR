@@ -14,6 +14,7 @@ import re
 
 import cv2
 import numpy as np
+from PIL import Image as PILImage
 
 from .config import Settings, settings
 from .detector import TextRegion, detect_text_regions
@@ -23,6 +24,11 @@ from .translator import TranslationConstraint, translate_texts
 
 logger = logging.getLogger(__name__)
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+
+# WebP / JPEG quality targets that produce sizes close to professional scanlations.
+_WEBP_QUALITY = 82
+_WEBP_METHOD = 6  # slower but best compression
+_JPEG_QUALITY = 85
 
 
 @dataclass
@@ -76,7 +82,7 @@ def translate_page(
         logger.warning("No text regions detected. Saving original image.")
         out = _resolve_output_path(image_path, output_path, cfg)
         out.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(out), image)
+        _save_image(out, image)
         return out
 
     # 3. OCR - extract text from each region
@@ -141,7 +147,7 @@ def translate_page(
         logger.warning("No text extracted from any region. Saving original image.")
         out = _resolve_output_path(image_path, output_path, cfg)
         out.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(out), image)
+        _save_image(out, image)
         return out
 
     # 4. Translate
@@ -214,7 +220,7 @@ def translate_page(
     # 6. Save output
     out = _resolve_output_path(image_path, output_path, cfg)
     out.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(out), result)
+    _save_image(out, result)
     logger.info("Saved translated image: %s", out)
     logger.info("=" * 60)
 
@@ -337,6 +343,36 @@ def _resolve_output_path(
         return Path(output_path)
     out_dir = cfg.output_dir
     return out_dir / image_path.name
+
+
+def _save_image(output_path: Path, image_bgr: np.ndarray) -> None:
+    """Save an image with format-aware compression to avoid file-size bloat.
+
+    For WebP and JPEG, uses PIL with tuned quality settings that produce sizes
+    close to professional scanlation quality.  Other formats fall back to
+    cv2.imwrite for simplicity.
+    """
+    ext = output_path.suffix.lower()
+    if ext in (".webp", ".jpg", ".jpeg"):
+        # cv2 stores BGR; PIL expects RGB
+        rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        pil_img = PILImage.fromarray(rgb)
+        if ext == ".webp":
+            pil_img.save(
+                str(output_path),
+                format="WEBP",
+                quality=_WEBP_QUALITY,
+                method=_WEBP_METHOD,
+            )
+        else:
+            pil_img.save(
+                str(output_path),
+                format="JPEG",
+                quality=_JPEG_QUALITY,
+                optimize=True,
+            )
+    else:
+        cv2.imwrite(str(output_path), image_bgr)
 
 
 def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:

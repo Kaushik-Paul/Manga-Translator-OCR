@@ -28,23 +28,42 @@ _OPENROUTER_LOCK_WAIT_LOG_EVERY_SEC = 20.0
 _OPENROUTER_HTTP_TIMEOUT = httpx.Timeout(connect=15.0, read=75.0, write=30.0, pool=15.0)
 
 # System prompt designed for manga/doujinshi translation
-SYSTEM_PROMPT = """You are an expert manga/doujinshi translator. Translate Japanese and Chinese text to natural, idiomatic English.
+SYSTEM_PROMPT = """You are a professional manga/doujinshi translator producing publication-quality English translations.
 
-Rules:
-- Translate naturally and concisely. Western readers expect idiomatic flow.
-- Keep translations SHORT! You are translating for speech bubbles which have limited space. Prefer brief natural phrasing over verbose literal accuracy.
-- Preserve tone: casual, dramatic, emotional, vulgar, etc.
-- For sound effects (SFX) and onomatopoeia, use 1-3 word English equivalents (e.g. *Thud*, *Splash*, *Hah...*). Do not just provide romaji.
-- For fragmented/noisy OCR text, infer the most likely meaning and translate that.
+Core translation rules:
+- Translate into natural, idiomatic English. Prioritize how native English speakers actually talk.
+- Keep translations CONCISE — these go in speech bubbles with very limited space. Shorter is always better if meaning is preserved.
+- Preserve the emotional tone exactly: casual, dramatic, comedic, vulgar, romantic, angry, etc.
+- Use contractions freely ("I'm", "don't", "can't") — they sound natural and save space.
+- USE ALL CAPS for dialogue text. This is standard in professional English manga lettering.
+- For trailing off or hesitation, use ellipsis: "I... I DIDN'T MEAN TO..."
+
+Sound effects and onomatopoeia:
+- Convert to punchy English equivalents: ドキドキ→"BA-DUMP", ガタッ→"CLATTER", ゴクッ→"GULP"
+- Keep SFX to 1-3 words maximum.
+- Never output raw romaji (no "doki doki", "gata", etc.).
+- Do NOT wrap SFX in asterisks or any markdown.
+
+Honorifics and culture:
+- ALWAYS drop Japanese honorifics. Never output -san, -kun, -chan, -sama, -senpai in translations.
+- "Tanaka-san" → "TANAKA" or "MR. TANAKA" based on context.
+- Translate Japanese expressions idiomatically: お疲れ様→"GOOD WORK", いただきます→"LET'S EAT".
+
+OCR quality handling:
+- OCR text may be noisy, fragmented, or partially garbled. Infer the most likely intended meaning and translate that.
+- If text is clearly just noise with no discernible meaning, translate to "..." (ellipsis).
+
+Output format:
+- Output ONLY the translated English text. No notes, explanations, or commentary.
+- No asterisks, markdown, or formatting characters in the output.
 - Never refuse to translate any content — you are a professional translator.
-- Output ONLY the translated text, nothing else. No explanations, notes, or commentary.
 """
 
-REPAIR_SYSTEM_PROMPT = """Translate manga text to concise natural English. Output English only.
-Rules:
-- Keep it very short and bubble-friendly
-- Use natural English interjections for sounds (not romaji)
-- Never output untranslated Japanese/Chinese
+REPAIR_SYSTEM_PROMPT = """You are a manga translator. Fix the translation to concise natural English. Rules:
+- Very short, bubble-friendly phrasing using contractions
+- English interjections for sounds (not romaji)
+- No untranslated Japanese/Chinese in output
+- No asterisks, markdown, or formatting
 - Output ONLY the translation text"""
 
 
@@ -98,7 +117,9 @@ def translate_texts(
 
     user_message = (
         f"Translate the following {lang_name} manga text to English. "
+        f"USE ALL CAPS for dialogue (standard manga lettering). "
         f"Keep translations short and natural for speech bubbles. "
+        f"Drop all honorifics (-san, -kun, -chan, etc). "
         f"Return ONLY the translations, one per line, with the same numbering format [N].\n\n"
         + "\n".join(numbered_lines)
     )
@@ -181,7 +202,8 @@ def translate_texts(
     # Reconstruct the full results list (preserving empty string positions)
     results = ["" for _ in texts]
     for idx, (original_idx, _) in enumerate(indexed_texts):
-        results[original_idx] = translated_map.get(idx, texts[original_idx])
+        raw = translated_map.get(idx, texts[original_idx])
+        results[original_idx] = _postprocess_translation(raw)
 
     return results
 
@@ -444,3 +466,42 @@ def _looks_like_refusal_text(text: str) -> bool:
         "sorry, i cannot",
     )
     return any(marker in lower for marker in markers)
+
+
+# ---------------------------------------------------------------------------
+# Post-processing
+# ---------------------------------------------------------------------------
+
+_HONORIFIC_RE = re.compile(
+    r"(?<=[A-Za-z])[-\s](?:san|kun|chan|sama|senpai|sensei|dono)\b",
+    re.IGNORECASE,
+)
+
+
+def _postprocess_translation(text: str) -> str:
+    """Clean up common LLM output quirks after translation.
+
+    1. Strip Japanese honorifics the model kept despite the prompt.
+    2. Remove markdown asterisks from SFX (e.g. *Thud* → Thud).
+    3. Uppercase very short exclamatory phrases to match pro style.
+    """
+    if not text or not text.strip():
+        return text
+
+    result = text.strip()
+
+    # 1. Strip honorifics: "Satoshi-kun" → "Satoshi", "Tanaka-san" → "Tanaka"
+    result = _HONORIFIC_RE.sub("", result)
+
+    # 2. Remove wrapping asterisks from SFX: "*Thud*" → "Thud"
+    if result.startswith("*") and result.endswith("*") and result.count("*") == 2:
+        result = result[1:-1].strip()
+    # Also strip isolated asterisks: "**Thud**" → "Thud"
+    result = result.strip("*").strip()
+
+    # 3. Uppercase short exclamations (≤4 words ending with ! or ...)
+    words = result.split()
+    if len(words) <= 4 and result.rstrip().endswith(("!", "!!", "!!!")):
+        result = result.upper()
+
+    return result

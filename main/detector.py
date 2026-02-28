@@ -179,8 +179,8 @@ class ComicTextDetector:
     def detect(
         self,
         image: NDArray,
-        text_threshold: float = 0.35,
-        min_area: int = 50,
+        text_threshold: float = 0.25,
+        min_area: int = 30,
         padding: int = 5,
     ) -> tuple[list[TextRegion], NDArray]:
         """
@@ -321,8 +321,8 @@ class ComicTextDetector:
         # Fixed, very-large kernels tend to over-merge across nearby bubbles/panels.
         short_side = min(h, w)
         close_size = _odd(max(5, int(round(short_side * 0.006))))
-        dilate_size = _odd(max(11, int(round(short_side * 0.013))))
-        close2_size = _odd(max(9, int(round(short_side * 0.010))))
+        dilate_size = _odd(max(11, int(round(short_side * 0.018))))
+        close2_size = _odd(max(9, int(round(short_side * 0.014))))
 
         kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (close_size, close_size))
         cleaned = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
@@ -353,7 +353,7 @@ class ComicTextDetector:
                 continue
             candidate_boxes.append((rx, ry, rx + rw, ry + rh))
 
-        merge_gap = max(10, int(short_side * 0.012))
+        merge_gap = max(10, int(short_side * 0.016))
         merged_boxes = _merge_nearby_boxes(candidate_boxes, gap=merge_gap)
 
         regions: list[TextRegion] = []
@@ -654,8 +654,8 @@ class ModalTextDetector(ComicTextDetector):
     def detect(
         self,
         image: NDArray,
-        text_threshold: float = 0.35,
-        min_area: int = 50,
+        text_threshold: float = 0.25,
+        min_area: int = 30,
         padding: int = 5,
     ) -> tuple[list[TextRegion], NDArray]:
         self._ensure_modal()

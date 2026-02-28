@@ -260,7 +260,7 @@ def render_text_on_image(
     if font_file is None:
         font_file = _DEFAULT_FONT_PATH
 
-    text_padding = max(2, padding - 2) if text_style == "dialogue" else max(1, padding - 3)
+    text_padding = max(2, padding - 3) if text_style == "dialogue" else max(1, padding - 3)
     avail_w = box_w - 2 * text_padding
     avail_h = box_h - 2 * text_padding
     box_clip_mask = _crop_clip_mask_to_box(
@@ -279,8 +279,8 @@ def render_text_on_image(
         if effective_w > 14:
             # Only narrow if the mask is meaningfully narrower than the box
             mask_avail = max(10, effective_w - 2 * text_padding)
-            if mask_avail < avail_w * 0.85:
-                avail_w = int(max(avail_w * 0.85, mask_avail))
+            if mask_avail < avail_w * 0.92:
+                avail_w = int(max(avail_w * 0.92, mask_avail))
     if avail_w <= 10 or avail_h <= 10:
         return image
 
@@ -549,7 +549,7 @@ def _resolve_dialogue_box(
     This follows the same idea as comic-translate's best-render-area flow:
     prioritize bubble interior (when detectable), otherwise keep the full region.
     """
-    inset = max(2, int(min(w, h) * 0.03))
+    inset = max(2, int(min(w, h) * 0.02))
     default_box = (
         x + inset,
         y + inset,
@@ -618,15 +618,15 @@ def _resolve_dialogue_box(
     x1, y1, x2, y2 = _shrink_centered_box(x1, y1, x2, y2, shrink_ratio)
     fit_w = x2 - x1
     fit_h = y2 - y1
-    min_w = max(28, int(w * 0.30))
-    min_h = max(24, int(h * 0.30))
+    min_w = max(28, int(w * 0.25))
+    min_h = max(24, int(h * 0.25))
     if fit_w < min_w or fit_h < min_h:
         return (*fallback_box, False, None)
 
     # For longer dialogue, avoid overly tight boxes.
     if len(translated_text.strip()) >= 18:
-        min_long_w = max(min_w, int(w * 0.45))
-        min_long_h = max(min_h, int(h * 0.42))
+        min_long_w = max(min_w, int(w * 0.40))
+        min_long_h = max(min_h, int(h * 0.38))
         if fit_w < min_long_w or fit_h < min_long_h:
             return (*fallback_box, False, None)
 
@@ -944,7 +944,7 @@ def _prepare_bubble_render_mask(mask: NDArray) -> NDArray | None:
     if comp_area < 180:
         return None
 
-    k = _odd(max(3, int(round(np.sqrt(comp_area) / 36))))
+    k = _odd(max(3, int(round(np.sqrt(comp_area) / 50))))
     eroded = cv2.erode(
         mask.astype(np.uint8),
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)),
@@ -1083,7 +1083,7 @@ def _fit_text_to_box(
     max_h: int,
     font_path: str | None,
     style: str = "dialogue",
-    min_size: int = 8,
+    min_size: int = 10,
     max_size: int = 120,
     max_size_cap: int | None = None,
 ) -> tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, list[str], int]:
@@ -1095,11 +1095,11 @@ def _fit_text_to_box(
     if style == "dialogue":
         # Allow dialogue text to grow much larger if the bubble permits it
         if word_count <= 2:
-            dynamic_max = min(200, max(max_h, int(max_w * 1.5)))
+            dynamic_max = min(300, max(max_h, int(max_w * 1.8)))
         elif word_count <= 5:
-            dynamic_max = min(160, max(max_h, int(max_w * 1.2)))
+            dynamic_max = min(200, max(max_h, int(max_w * 1.4)))
         else:
-            dynamic_max = min(150, max(24, int(max_h * 0.9)))
+            dynamic_max = min(180, max(24, int(max_h * 1.0)))
         max_size = min(max_size, dynamic_max)
     else:
         # SFX: can go large, scale with box dimensions
@@ -1204,7 +1204,7 @@ def _line_spacing_for_size(size: int, style: str) -> int:
     if style == "sfx":
         return max(1, int(size * 0.08))
     # Comic fonts typically have generous built-in descent/ascent metrics.
-    return max(1, int(size * 0.02))
+    return max(1, int(size * 0.01))
 
 
 def _compress_dialogue_for_tiny_box(text: str, max_words: int) -> str:
