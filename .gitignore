@@ -247,16 +247,13 @@ __marimo__/
 
 # Project folders: keep directories, ignore contents
 output/**
-!output/.gitkeep
 
 implementation/**
 !implementation/.gitkeep
 
 manga_testing/**
-!manga_testing/.gitkeep
 
 temp_repo/**
-!temp_repo/.gitkeep
 
 main/fonts/**
 !main/fonts/.gitkeep
