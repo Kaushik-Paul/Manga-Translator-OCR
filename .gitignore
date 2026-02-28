@@ -247,6 +247,7 @@ __marimo__/
 
 # Project folders: keep directories, ignore contents
 output/**
+!output/.gitkeep
 
 implementation/**
 !implementation/.gitkeep
