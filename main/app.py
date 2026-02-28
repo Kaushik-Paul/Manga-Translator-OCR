@@ -24,12 +24,14 @@ def setup_logging() -> None:
         format="%(asctime)s | %(levelname)-7s | %(message)s",
         datefmt="%H:%M:%S",
     )
-    # Quiet noisy libraries
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("PIL").setLevel(logging.WARNING)
-    logging.getLogger("transformers").setLevel(logging.WARNING)
-    logging.getLogger("torch").setLevel(logging.WARNING)
-    logging.getLogger("gradio").setLevel(logging.WARNING)
+    # Quiet noisy third-party libraries
+    for lib in (
+        "httpx", "httpcore", "h2", "hpack",
+        "PIL", "transformers", "torch",
+        "gradio", "modal", "grpc", "grpclib",
+        "urllib3", "onnxruntime",
+    ):
+        logging.getLogger(lib).setLevel(logging.WARNING)
 
 
 def launch() -> None:
