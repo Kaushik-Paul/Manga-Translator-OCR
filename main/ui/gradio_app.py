@@ -80,6 +80,12 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                 variant="stop",
                 elem_classes=["delete-folder-btn"],
             )
+            clear_btn = gr.Button(
+                "🧹 Clear",
+                variant="secondary",
+                elem_classes=["clear-btn"],
+                interactive=True,
+            )
 
         # ── Section 1: Folder Input ────────────────────
         with gr.Group(elem_classes=["section-card"]):
@@ -318,6 +324,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                 gr.update(visible=dl_vis, interactive=not is_running), # download_btn
                 gr.update(interactive=not is_running), # upload_zip_btn
                 gr.update(interactive=not is_running), # delete_folder_btn
+                gr.update(interactive=not is_running), # clear_btn
                 gr.update(active=is_running) # timer active while running
             )
 
@@ -568,8 +575,21 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             )
 
         def confirm_zip_upload(zip_file_path: str | None):
+            # Disable Clear immediately while upload is in progress.
+            yield (
+                gr.update(visible=True),
+                gr.update(),
+                gr.update(visible=True, value="⏳ Uploading ZIP..."),
+                gr.update(visible=False, value=""),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(interactive=False),
+            )
+
             if not zip_file_path:
-                return (
+                yield (
                     gr.update(visible=True),
                     gr.update(),
                     gr.update(visible=False, value=""),
@@ -581,7 +601,9 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     gr.update(),
                     gr.update(),
                     gr.update(),
+                    gr.update(interactive=True),
                 )
+                return
 
             try:
                 folder_name, uploaded_count = upload_raw_manga_zip(
@@ -592,7 +614,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     folder_name
                 )
 
-                return (
+                yield (
                     gr.update(visible=True),
                     gr.update(value=None),
                     gr.update(
@@ -607,10 +629,11 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     folder_status_update,
                     image_section_update,
                     image_selector_update,
+                    gr.update(interactive=True),
                 )
             except Exception as e:
                 logger.error("Error uploading ZIP to raw-manga: %s", e)
-                return (
+                yield (
                     gr.update(visible=True),
                     gr.update(value=None),
                     gr.update(visible=False, value=""),
@@ -622,12 +645,26 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     gr.update(),
                     gr.update(),
                     gr.update(),
+                    gr.update(interactive=True),
                 )
 
         def confirm_delete_folder(folder_name: str):
+            # Disable Clear immediately while delete is in progress.
+            yield (
+                gr.update(visible=True),
+                gr.update(),
+                gr.update(visible=True, value="⏳ Deleting folder..."),
+                gr.update(visible=False, value=""),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(interactive=False),
+            )
+
             normalized = (folder_name or "").strip().strip("/")
             if not normalized:
-                return (
+                yield (
                     gr.update(visible=True),
                     gr.update(),
                     gr.update(visible=False, value=""),
@@ -639,13 +676,15 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     gr.update(),
                     gr.update(),
                     gr.update(),
+                    gr.update(interactive=True),
                 )
+                return
 
             try:
                 raw_deleted, translated_deleted = delete_manga_folder(normalized)
                 total_deleted = raw_deleted + translated_deleted
                 if total_deleted == 0:
-                    return (
+                    yield (
                         gr.update(visible=True),
                         gr.update(value=normalized),
                         gr.update(visible=False, value=""),
@@ -661,7 +700,9 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                         gr.update(),
                         gr.update(),
                         gr.update(),
+                        gr.update(interactive=True),
                     )
+                    return
 
                 if GLOBAL_STATE.get("folder_name") == normalized:
                     GLOBAL_STATE["folder_name"] = ""
@@ -677,7 +718,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     image_section_update = gr.update()
                     image_selector_update = gr.update()
 
-                return (
+                yield (
                     gr.update(visible=True),
                     gr.update(value=normalized),
                     gr.update(
@@ -693,10 +734,11 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     folder_status_update,
                     image_section_update,
                     image_selector_update,
+                    gr.update(interactive=True),
                 )
             except Exception as e:
                 logger.error("Error deleting folder from GCS: %s", e)
-                return (
+                yield (
                     gr.update(visible=True),
                     gr.update(value=normalized),
                     gr.update(visible=False, value=""),
@@ -708,7 +750,36 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     gr.update(),
                     gr.update(),
                     gr.update(),
+                    gr.update(interactive=True),
                 )
+
+        def clear_all_ui():
+            GLOBAL_STATE["folder_name"] = ""
+            GLOBAL_STATE["loaded_images"] = []
+            GLOBAL_STATE["selected_images"] = []
+            GLOBAL_STATE["is_running"] = False
+            GLOBAL_STATE["log_text"] = ""
+            GLOBAL_STATE["failed_text"] = ""
+            GLOBAL_STATE["download_url"] = ""
+
+            return (
+                gr.update(visible=False, value=""),  # folder_status
+                "",  # auth_action
+                gr.update(visible=False),  # auth_modal
+                gr.update(value=""),  # auth_prompt
+                gr.update(value=""),  # auth_password
+                gr.update(visible=False, value=""),  # auth_error
+                gr.update(visible=False),  # upload_modal
+                gr.update(value=None),  # upload_zip_file
+                gr.update(visible=False, value=""),  # upload_status
+                gr.update(visible=False, value=""),  # upload_error
+                gr.update(visible=False),  # delete_modal
+                gr.update(value=""),  # delete_folder_name
+                gr.update(visible=False, value=""),  # delete_status
+                gr.update(visible=False, value=""),  # delete_error
+                "",  # download_launch_url
+                *sync_state_from_global(),
+            )
 
         # ── Wire Events ────────────────────────────────
 
@@ -752,6 +823,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             download_btn,
             upload_zip_btn,
             delete_folder_btn,
+            clear_btn,
             timer,
         ]
         auth_outputs = [
@@ -772,6 +844,15 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             delete_folder_name,
             delete_status,
             delete_error,
+        ]
+        clear_outputs = [
+            folder_status,
+            auth_action,
+            *auth_outputs[1:],
+            *upload_modal_outputs,
+            *delete_modal_outputs,
+            download_launch_url,
+            *sync_outputs,
         ]
         
         app.load(
@@ -855,6 +936,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                 folder_status,
                 image_section,
                 image_selector,
+                clear_btn,
             ],
         )
 
@@ -874,7 +956,15 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                 folder_status,
                 image_section,
                 image_selector,
+                clear_btn,
             ],
+        )
+
+        clear_btn.click(
+            fn=clear_all_ui,
+            inputs=[],
+            outputs=clear_outputs,
+            queue=False,
         )
 
         download_launch_url.change(

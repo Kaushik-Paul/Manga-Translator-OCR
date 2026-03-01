@@ -129,6 +129,11 @@ CUSTOM_CSS = """
     font-weight: 700 !important;
 }
 
+.clear-btn {
+    border-radius: 10px !important;
+    font-weight: 600 !important;
+}
+
 /* ── Progress ───────────────────────────────────────── */
 .progress-box textarea {
     font-family: 'JetBrains Mono', 'Fira Code', monospace !important;
