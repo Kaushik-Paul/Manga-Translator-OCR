@@ -13,11 +13,12 @@ from __future__ import annotations
 import hmac
 import logging
 import threading
+from pathlib import Path
 
 import gradio as gr
 
 from ..config import settings
-from ..gcp_storage import folder_exists, list_images_in_folder
+from ..gcp_storage import folder_exists, list_images_in_folder, upload_raw_manga_zip
 from .pipeline_runner import TranslationResult, run_translation_pipeline
 from .styles import CUSTOM_CSS
 
@@ -62,6 +63,13 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             </div>
             """
         )
+
+        with gr.Row(elem_classes=["top-actions-row"]):
+            upload_zip_btn = gr.Button(
+                "📤 Upload ZIP to raw-manga",
+                variant="secondary",
+                elem_classes=["upload-zip-btn"],
+            )
 
         # ── Section 1: Folder Input ────────────────────
         with gr.Group(elem_classes=["section-card"]):
@@ -149,9 +157,34 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     )
                     auth_cancel_btn = gr.Button("Cancel")
 
+        # ZIP upload popup shown after password authorization.
+        with gr.Group(visible=False, elem_classes=["auth-modal-overlay"]) as upload_modal:
+            with gr.Group(elem_classes=["auth-modal-card"]):
+                gr.HTML('<div class="auth-modal-title">📦 Upload Manga ZIP</div>')
+                gr.HTML(
+                    '<div class="auth-modal-message">Select a .zip file. '
+                    'It will be uploaded to raw-manga/&lt;zip-name&gt;/.</div>'
+                )
+                upload_zip_file = gr.File(
+                    label="ZIP file",
+                    file_types=[".zip"],
+                    type="filepath",
+                )
+                upload_status = gr.HTML(visible=False)
+                upload_error = gr.HTML(visible=False)
+                with gr.Row():
+                    upload_confirm_btn = gr.Button(
+                        "Confirm",
+                        variant="primary",
+                        elem_classes=["primary-btn"],
+                    )
+                    upload_close_btn = gr.Button("Close")
+
         def _action_prompt(action: str) -> str:
             if action == "download":
                 text = "Enter password to open the download link."
+            elif action == "upload_zip":
+                text = "Enter password to upload a ZIP file."
             else:
                 text = "Enter password to start translation."
             return f'<div class="auth-modal-message">{text}</div>'
@@ -162,6 +195,22 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                 gr.update(visible=False),
                 gr.update(value=""),
                 gr.update(value=""),
+                gr.update(visible=False, value=""),
+            )
+
+        def _close_upload_modal():
+            return (
+                gr.update(visible=False),
+                gr.update(value=None),
+                gr.update(visible=False, value=""),
+                gr.update(visible=False, value=""),
+            )
+
+        def _open_upload_modal():
+            return (
+                gr.update(visible=True),
+                gr.update(value=None),
+                gr.update(visible=False, value=""),
                 gr.update(visible=False, value=""),
             )
 
@@ -215,6 +264,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                 GLOBAL_STATE.get("log_text", ""), # progress_log
                 gr.update(visible=failed_vis, value=GLOBAL_STATE.get("failed_text", "")), # failed_images_box
                 gr.update(visible=dl_vis, interactive=not is_running), # download_btn
+                gr.update(interactive=not is_running), # upload_zip_btn
                 gr.update(active=is_running) # timer active while running
             )
 
@@ -399,6 +449,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     ),
                     *sync_state_from_global(),
                     "",
+                    *_close_upload_modal(),
                 )
 
             if action == "translate":
@@ -407,6 +458,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     *_close_auth_modal(),
                     *sync_updates,
                     "",
+                    *_close_upload_modal(),
                 )
 
             if action == "download":
@@ -423,18 +475,86 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                         ),
                         *sync_state_from_global(),
                         "",
+                        *_close_upload_modal(),
                     )
                 return (
                     *_close_auth_modal(),
                     *sync_state_from_global(),
                     download_url,
+                    *_close_upload_modal(),
+                )
+
+            if action == "upload_zip":
+                return (
+                    *_close_auth_modal(),
+                    *sync_state_from_global(),
+                    "",
+                    *_open_upload_modal(),
                 )
 
             return (
                 *_close_auth_modal(),
                 *sync_state_from_global(),
                 "",
+                *_close_upload_modal(),
             )
+
+        def confirm_zip_upload(zip_file_path: str | None):
+            if not zip_file_path:
+                return (
+                    gr.update(visible=True),
+                    gr.update(),
+                    gr.update(visible=False, value=""),
+                    gr.update(
+                        visible=True,
+                        value='<span class="result-error">⚠️ Please select a .zip file.</span>',
+                    ),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                )
+
+            try:
+                folder_name, uploaded_count = upload_raw_manga_zip(
+                    zip_path=Path(zip_file_path),
+                    local_dir=settings.output_dir,
+                )
+                folder_status_update, image_section_update, image_selector_update = load_folder(
+                    folder_name
+                )
+
+                return (
+                    gr.update(visible=True),
+                    gr.update(value=None),
+                    gr.update(
+                        visible=True,
+                        value=(
+                            '<span class="result-success">✅ Uploaded '
+                            f'{uploaded_count} file(s) to raw-manga/<b>{folder_name}</b>/.</span>'
+                        ),
+                    ),
+                    gr.update(visible=False, value=""),
+                    gr.update(value=folder_name),
+                    folder_status_update,
+                    image_section_update,
+                    image_selector_update,
+                )
+            except Exception as e:
+                logger.error("Error uploading ZIP to raw-manga: %s", e)
+                return (
+                    gr.update(visible=True),
+                    gr.update(value=None),
+                    gr.update(visible=False, value=""),
+                    gr.update(
+                        visible=True,
+                        value=f'<span class="result-error">❌ Upload failed: {e}</span>',
+                    ),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                )
 
         # ── Wire Events ────────────────────────────────
 
@@ -476,6 +596,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             progress_log,
             failed_images_box,
             download_btn,
+            upload_zip_btn,
             timer,
         ]
         auth_outputs = [
@@ -484,6 +605,12 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             auth_prompt,
             auth_password,
             auth_error,
+        ]
+        upload_modal_outputs = [
+            upload_modal,
+            upload_zip_file,
+            upload_status,
+            upload_error,
         ]
         
         app.load(
@@ -504,6 +631,13 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             queue=False,
         )
 
+        upload_zip_btn.click(
+            fn=lambda: _open_auth_modal("upload_zip"),
+            inputs=[],
+            outputs=auth_outputs,
+            queue=False,
+        )
+
         download_btn.click(
             fn=lambda: _open_auth_modal("download"),
             inputs=[],
@@ -518,7 +652,12 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             queue=False,
         )
 
-        auth_submit_outputs = [*auth_outputs, *sync_outputs, download_launch_url]
+        auth_submit_outputs = [
+            *auth_outputs,
+            *sync_outputs,
+            download_launch_url,
+            *upload_modal_outputs,
+        ]
 
         auth_submit_btn.click(
             fn=authorize_action,
@@ -529,6 +668,25 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             fn=authorize_action,
             inputs=[auth_password, auth_action],
             outputs=auth_submit_outputs,
+        )
+
+        upload_close_btn.click(
+            fn=_close_upload_modal,
+            inputs=[],
+            outputs=upload_modal_outputs,
+            queue=False,
+        )
+
+        upload_confirm_btn.click(
+            fn=confirm_zip_upload,
+            inputs=[upload_zip_file],
+            outputs=[
+                *upload_modal_outputs,
+                folder_input,
+                folder_status,
+                image_section,
+                image_selector,
+            ],
         )
 
         download_launch_url.change(

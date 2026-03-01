@@ -31,6 +31,11 @@ CUSTOM_CSS = """
     margin-top: 0.25rem;
 }
 
+.top-actions-row {
+    justify-content: flex-end !important;
+    margin-bottom: 0.75rem !important;
+}
+
 /* ── Sections ───────────────────────────────────────── */
 .section-card {
     border: 1px solid var(--border-color-primary) !important;
@@ -112,6 +117,11 @@ CUSTOM_CSS = """
     transform: none !important;
     box-shadow: none !important;
     cursor: not-allowed !important;
+}
+
+.upload-zip-btn {
+    border-radius: 10px !important;
+    font-weight: 600 !important;
 }
 
 /* ── Progress ───────────────────────────────────────── */

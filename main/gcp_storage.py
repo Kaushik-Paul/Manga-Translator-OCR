@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import shutil
+import uuid
 import zipfile
 from datetime import timedelta
 from pathlib import Path
@@ -144,6 +145,74 @@ def upload_translated_images(
     """Upload all translated images to the bucket."""
     for local_path in translated_paths:
         upload_translated_image(folder_name, local_path.name, local_path)
+
+
+def upload_raw_manga_zip(zip_path: Path, local_dir: Path) -> tuple[str, int]:
+    """
+    Upload ZIP contents to raw-manga/<zip-stem>/ in GCS.
+
+    The ZIP is copied into local_dir for extraction, then both the copied ZIP and
+    extracted files are always cleaned up from local storage.
+
+    Returns:
+        tuple[str, int]: (folder_name, uploaded_file_count)
+    """
+    if zip_path.suffix.lower() != ".zip":
+        raise ValueError("Only .zip files are allowed.")
+    if not zip_path.exists() or not zip_path.is_file():
+        raise ValueError("ZIP file was not found.")
+    if not zipfile.is_zipfile(zip_path):
+        raise ValueError("Uploaded file is not a valid ZIP archive.")
+
+    folder_name = zip_path.stem.strip()
+    if not folder_name:
+        raise ValueError("ZIP filename must not be empty.")
+
+    upload_root = local_dir / "raw-upload-temp" / f"{folder_name}-{uuid.uuid4().hex[:8]}"
+    extracted_dir = upload_root / "extracted"
+    copied_zip_path = upload_root / zip_path.name
+
+    bucket = get_bucket()
+    uploaded_count = 0
+
+    try:
+        extracted_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(zip_path, copied_zip_path)
+
+        with zipfile.ZipFile(copied_zip_path, "r") as archive:
+            for member in archive.infolist():
+                member_path = Path(member.filename)
+
+                if member.is_dir():
+                    continue
+                if member_path.is_absolute() or ".." in member_path.parts:
+                    raise ValueError(
+                        f"ZIP contains unsafe path: {member.filename}"
+                    )
+
+                destination = extracted_dir / member_path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+
+                with archive.open(member, "r") as src, destination.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
+
+        files_to_upload = [p for p in extracted_dir.rglob("*") if p.is_file()]
+        if not files_to_upload:
+            raise ValueError("ZIP archive does not contain any files.")
+
+        for local_file in files_to_upload:
+            relative_path = local_file.relative_to(extracted_dir).as_posix()
+            blob_path = f"{_RAW_PREFIX}/{folder_name}/{relative_path}"
+            blob = bucket.blob(blob_path)
+            blob.upload_from_filename(str(local_file))
+            uploaded_count += 1
+            logger.info("Uploaded raw file: %s", blob_path)
+
+        return folder_name, uploaded_count
+    finally:
+        if upload_root.exists():
+            shutil.rmtree(upload_root, ignore_errors=True)
+            logger.info("Cleaned up local upload temp directory: %s", upload_root)
 
 
 def generate_download_url(folder_name: str, ttl_hours: int = 24) -> str:
