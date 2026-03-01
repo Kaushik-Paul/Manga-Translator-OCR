@@ -265,17 +265,23 @@ def generate_download_url(folder_name: str, ttl_hours: int = 24) -> str:
 
     prefix = f"{_TRANSLATED_PREFIX}/{folder_name}/"
     blobs = list(client.list_blobs(bucket, prefix=prefix))
+    image_blobs = []
+    for blob in blobs:
+        filename = blob.name[len(prefix) :]
+        if not filename or "/" in filename:
+            continue
+        ext = Path(filename).suffix.lower()
+        if ext in _IMAGE_EXTENSIONS:
+            image_blobs.append(blob)
 
-    if not blobs:
+    if not image_blobs:
         raise ValueError(f"No translated images found for '{folder_name}'")
 
     # Create zip in memory
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for blob in blobs:
+        for blob in image_blobs:
             filename = blob.name[len(prefix) :]
-            if not filename or "/" in filename:
-                continue
             data = blob.download_as_bytes()
             zf.writestr(filename, data)
 
