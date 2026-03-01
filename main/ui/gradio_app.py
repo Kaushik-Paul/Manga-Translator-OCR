@@ -18,7 +18,12 @@ from pathlib import Path
 import gradio as gr
 
 from ..config import settings
-from ..gcp_storage import folder_exists, list_images_in_folder, upload_raw_manga_zip
+from ..gcp_storage import (
+    delete_manga_folder,
+    folder_exists,
+    list_images_in_folder,
+    upload_raw_manga_zip,
+)
 from .pipeline_runner import TranslationResult, run_translation_pipeline
 from .styles import CUSTOM_CSS
 
@@ -69,6 +74,11 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                 "📤 Upload ZIP to raw-manga",
                 variant="secondary",
                 elem_classes=["upload-zip-btn"],
+            )
+            delete_folder_btn = gr.Button(
+                "🗑️ Delete Folder",
+                variant="stop",
+                elem_classes=["delete-folder-btn"],
             )
 
         # ── Section 1: Folder Input ────────────────────
@@ -180,11 +190,36 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     )
                     upload_close_btn = gr.Button("Close")
 
+        # Folder deletion popup shown after password authorization.
+        with gr.Group(visible=False, elem_classes=["auth-modal-overlay"]) as delete_modal:
+            with gr.Group(elem_classes=["auth-modal-card"]):
+                gr.HTML('<div class="auth-modal-title">🗑️ Delete Manga Folder</div>')
+                gr.HTML(
+                    '<div class="auth-modal-message">Delete folder from both '
+                    "raw-manga/ and translated-manga/.</div>"
+                )
+                delete_folder_name = gr.Textbox(
+                    label="Folder name",
+                    placeholder="Enter folder name to delete",
+                    interactive=True,
+                )
+                delete_status = gr.HTML(visible=False)
+                delete_error = gr.HTML(visible=False)
+                with gr.Row():
+                    delete_confirm_btn = gr.Button(
+                        "Confirm",
+                        variant="stop",
+                        elem_classes=["delete-folder-btn"],
+                    )
+                    delete_close_btn = gr.Button("Close")
+
         def _action_prompt(action: str) -> str:
             if action == "download":
                 text = "Enter password to open the download link."
             elif action == "upload_zip":
                 text = "Enter password to upload a ZIP file."
+            elif action == "delete_folder":
+                text = "Enter password to delete a manga folder."
             else:
                 text = "Enter password to start translation."
             return f'<div class="auth-modal-message">{text}</div>'
@@ -210,6 +245,23 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             return (
                 gr.update(visible=True),
                 gr.update(value=None),
+                gr.update(visible=False, value=""),
+                gr.update(visible=False, value=""),
+            )
+
+        def _close_delete_modal():
+            return (
+                gr.update(visible=False),
+                gr.update(value=""),
+                gr.update(visible=False, value=""),
+                gr.update(visible=False, value=""),
+            )
+
+        def _open_delete_modal():
+            default_folder = GLOBAL_STATE.get("folder_name", "")
+            return (
+                gr.update(visible=True),
+                gr.update(value=default_folder),
                 gr.update(visible=False, value=""),
                 gr.update(visible=False, value=""),
             )
@@ -265,6 +317,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                 gr.update(visible=failed_vis, value=GLOBAL_STATE.get("failed_text", "")), # failed_images_box
                 gr.update(visible=dl_vis, interactive=not is_running), # download_btn
                 gr.update(interactive=not is_running), # upload_zip_btn
+                gr.update(interactive=not is_running), # delete_folder_btn
                 gr.update(active=is_running) # timer active while running
             )
 
@@ -450,6 +503,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     *sync_state_from_global(),
                     "",
                     *_close_upload_modal(),
+                    *_close_delete_modal(),
                 )
 
             if action == "translate":
@@ -459,6 +513,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     *sync_updates,
                     "",
                     *_close_upload_modal(),
+                    *_close_delete_modal(),
                 )
 
             if action == "download":
@@ -476,12 +531,14 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                         *sync_state_from_global(),
                         "",
                         *_close_upload_modal(),
+                        *_close_delete_modal(),
                     )
                 return (
                     *_close_auth_modal(),
                     *sync_state_from_global(),
                     download_url,
                     *_close_upload_modal(),
+                    *_close_delete_modal(),
                 )
 
             if action == "upload_zip":
@@ -490,6 +547,16 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     *sync_state_from_global(),
                     "",
                     *_open_upload_modal(),
+                    *_close_delete_modal(),
+                )
+
+            if action == "delete_folder":
+                return (
+                    *_close_auth_modal(),
+                    *sync_state_from_global(),
+                    "",
+                    *_close_upload_modal(),
+                    *_open_delete_modal(),
                 )
 
             return (
@@ -497,6 +564,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                 *sync_state_from_global(),
                 "",
                 *_close_upload_modal(),
+                *_close_delete_modal(),
             )
 
         def confirm_zip_upload(zip_file_path: str | None):
@@ -556,6 +624,92 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     gr.update(),
                 )
 
+        def confirm_delete_folder(folder_name: str):
+            normalized = (folder_name or "").strip().strip("/")
+            if not normalized:
+                return (
+                    gr.update(visible=True),
+                    gr.update(),
+                    gr.update(visible=False, value=""),
+                    gr.update(
+                        visible=True,
+                        value='<span class="result-error">⚠️ Please enter a folder name.</span>',
+                    ),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                )
+
+            try:
+                raw_deleted, translated_deleted = delete_manga_folder(normalized)
+                total_deleted = raw_deleted + translated_deleted
+                if total_deleted == 0:
+                    return (
+                        gr.update(visible=True),
+                        gr.update(value=normalized),
+                        gr.update(visible=False, value=""),
+                        gr.update(
+                            visible=True,
+                            value=(
+                                '<span class="result-error">⚠️ Folder '
+                                f'"<b>{normalized}</b>" was not found in raw-manga/ '
+                                "or translated-manga/.</span>"
+                            ),
+                        ),
+                        gr.update(),
+                        gr.update(),
+                        gr.update(),
+                        gr.update(),
+                    )
+
+                if GLOBAL_STATE.get("folder_name") == normalized:
+                    GLOBAL_STATE["folder_name"] = ""
+                    GLOBAL_STATE["loaded_images"] = []
+                    GLOBAL_STATE["selected_images"] = []
+                    folder_input_update = gr.update(value="")
+                    folder_status_update = gr.update(visible=False, value="")
+                    image_section_update = gr.update(visible=False)
+                    image_selector_update = gr.update(choices=[], value=[])
+                else:
+                    folder_input_update = gr.update()
+                    folder_status_update = gr.update()
+                    image_section_update = gr.update()
+                    image_selector_update = gr.update()
+
+                return (
+                    gr.update(visible=True),
+                    gr.update(value=normalized),
+                    gr.update(
+                        visible=True,
+                        value=(
+                            '<span class="result-success">✅ Deleted '
+                            f'{raw_deleted} file(s) from raw-manga/<b>{normalized}</b>/ and '
+                            f'{translated_deleted} file(s) from translated-manga/<b>{normalized}</b>/.</span>'
+                        ),
+                    ),
+                    gr.update(visible=False, value=""),
+                    folder_input_update,
+                    folder_status_update,
+                    image_section_update,
+                    image_selector_update,
+                )
+            except Exception as e:
+                logger.error("Error deleting folder from GCS: %s", e)
+                return (
+                    gr.update(visible=True),
+                    gr.update(value=normalized),
+                    gr.update(visible=False, value=""),
+                    gr.update(
+                        visible=True,
+                        value=f'<span class="result-error">❌ Delete failed: {e}</span>',
+                    ),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                )
+
         # ── Wire Events ────────────────────────────────
 
         load_btn.click(
@@ -597,6 +751,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             failed_images_box,
             download_btn,
             upload_zip_btn,
+            delete_folder_btn,
             timer,
         ]
         auth_outputs = [
@@ -611,6 +766,12 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             upload_zip_file,
             upload_status,
             upload_error,
+        ]
+        delete_modal_outputs = [
+            delete_modal,
+            delete_folder_name,
+            delete_status,
+            delete_error,
         ]
         
         app.load(
@@ -638,6 +799,13 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             queue=False,
         )
 
+        delete_folder_btn.click(
+            fn=lambda: _open_auth_modal("delete_folder"),
+            inputs=[],
+            outputs=auth_outputs,
+            queue=False,
+        )
+
         download_btn.click(
             fn=lambda: _open_auth_modal("download"),
             inputs=[],
@@ -657,6 +825,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             *sync_outputs,
             download_launch_url,
             *upload_modal_outputs,
+            *delete_modal_outputs,
         ]
 
         auth_submit_btn.click(
@@ -682,6 +851,25 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             inputs=[upload_zip_file],
             outputs=[
                 *upload_modal_outputs,
+                folder_input,
+                folder_status,
+                image_section,
+                image_selector,
+            ],
+        )
+
+        delete_close_btn.click(
+            fn=_close_delete_modal,
+            inputs=[],
+            outputs=delete_modal_outputs,
+            queue=False,
+        )
+
+        delete_confirm_btn.click(
+            fn=confirm_delete_folder,
+            inputs=[delete_folder_name],
+            outputs=[
+                *delete_modal_outputs,
                 folder_input,
                 folder_status,
                 image_section,
