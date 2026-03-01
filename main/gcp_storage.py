@@ -215,6 +215,38 @@ def upload_raw_manga_zip(zip_path: Path, local_dir: Path) -> tuple[str, int]:
             logger.info("Cleaned up local upload temp directory: %s", upload_root)
 
 
+def _delete_prefix(folder_name: str, prefix_root: str) -> int:
+    """Delete all blobs under <prefix_root>/<folder_name>/ and return deleted count."""
+    client = get_gcs_client()
+    bucket_name = _get_bucket_name()
+    bucket = client.bucket(bucket_name)
+
+    prefix = f"{prefix_root}/{folder_name}/"
+    deleted_count = 0
+    for blob in client.list_blobs(bucket, prefix=prefix):
+        blob.delete()
+        deleted_count += 1
+
+    logger.info("Deleted %d blob(s) from %s", deleted_count, prefix)
+    return deleted_count
+
+
+def delete_manga_folder(folder_name: str) -> tuple[int, int]:
+    """
+    Delete manga folder from both raw-manga/ and translated-manga/ prefixes.
+
+    Returns:
+        tuple[int, int]: (raw_deleted_count, translated_deleted_count)
+    """
+    normalized = folder_name.strip().strip("/")
+    if not normalized:
+        raise ValueError("Folder name is required.")
+
+    raw_deleted = _delete_prefix(normalized, _RAW_PREFIX)
+    translated_deleted = _delete_prefix(normalized, _TRANSLATED_PREFIX)
+    return raw_deleted, translated_deleted
+
+
 def generate_download_url(folder_name: str, ttl_hours: int = 24) -> str:
     """
     Generate a presigned download URL for translated manga.

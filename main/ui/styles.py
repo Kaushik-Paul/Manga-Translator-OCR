@@ -124,6 +124,11 @@ CUSTOM_CSS = """
     font-weight: 600 !important;
 }
 
+.delete-folder-btn {
+    border-radius: 10px !important;
+    font-weight: 700 !important;
+}
+
 /* ── Progress ───────────────────────────────────────── */
 .progress-box textarea {
     font-family: 'JetBrains Mono', 'Fira Code', monospace !important;
