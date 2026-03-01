@@ -167,6 +167,11 @@ def upload_raw_manga_zip(zip_path: Path, local_dir: Path) -> tuple[str, int]:
     folder_name = zip_path.stem.strip()
     if not folder_name:
         raise ValueError("ZIP filename must not be empty.")
+    if folder_exists(folder_name):
+        raise ValueError(
+            f'Folder "{folder_name}" already exists in raw-manga/. '
+            "Delete it first, then upload again."
+        )
 
     upload_root = local_dir / "raw-upload-temp" / f"{folder_name}-{uuid.uuid4().hex[:8]}"
     extracted_dir = upload_root / "extracted"
