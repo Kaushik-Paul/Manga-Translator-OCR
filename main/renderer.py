@@ -29,27 +29,20 @@ def _font_paths(*font_files: str) -> list[str]:
     return [str(_FONTS_DIR / file_name) for file_name in font_files]
 
 
-# Use bundled fonts so deployments (e.g. Spaces) do not depend on host system fonts.
+# Use bundled comic-lettering fonts for natural manga dialogue/SFX rendering.
 _DIALOGUE_FONT_SEARCH_PATHS = _font_paths(
-    "NimbusSans-Bold.otf",
-    "LiberationSansNarrow-Bold.ttf",
-    "DejaVuSans-Bold.ttf",
-    "LiberationSans-Bold.ttf",
-    "FreeSansBold.ttf",
+    "CCWildWordsRoman.ttf",
+    "animeace2.otf",
 )
 
 _SFX_FONT_SEARCH_PATHS = _font_paths(
-    "NimbusSans-BoldItalic.otf",
-    "FreeSansBoldOblique.ttf",
-    "LiberationSansNarrow-BoldItalic.ttf",
-    "LiberationSans-BoldItalic.ttf",
-    "FreeSansOblique.ttf",
+    "animeace2.otf",
+    "CCWildWordsRoman.ttf",
 )
 
 _NARROW_DIALOGUE_FONT_SEARCH_PATHS = _font_paths(
-    "LiberationSansNarrow-Bold.ttf",
-    "NimbusSansNarrow-Bold.otf",
-    "UbuntuSans[wdth,wght].ttf",
+    "CCWildWordsRoman.ttf",
+    "animeace2.otf",
 )
 
 _CJK_DIALOGUE_FONT_SEARCH_PATHS = _font_paths(
