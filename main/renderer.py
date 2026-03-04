@@ -78,6 +78,122 @@ _CJK_DIALOGUE_FONT_PATH = (
 _DEFAULT_FONT_PATH = _DIALOGUE_FONT_PATH or _SFX_FONT_PATH
 
 
+def _snap_extreme_neutrals(rgb: tuple[int, int, int]) -> tuple[int, int, int]:
+    """Snap achromatic colours to pure black or white.
+
+    Comic text is almost never intentionally grey.  If the detected
+    colour is achromatic (low chroma) it is meant to be either black
+    or white, so snap to whichever is closer.  Coloured text (high
+    chroma) is returned unchanged.
+    """
+    r, g, b = int(rgb[0]), int(rgb[1]), int(rgb[2])
+    luma = 0.299 * r + 0.587 * g + 0.114 * b
+    chroma = max(r, g, b) - min(r, g, b)
+
+    # Achromatic → snap to nearest extreme.
+    if chroma < 40:
+        return (0, 0, 0) if luma < 128 else (255, 255, 255)
+
+    return (r, g, b)
+
+
+def detect_text_color(
+    region_image: NDArray,
+    region_mask: NDArray | None = None,
+) -> tuple[int, int, int] | None:
+    """Detect the foreground (text) colour from an original manga region.
+
+    Uses spatial analysis: border pixels define the background colour,
+    then Otsu thresholding on the colour-distance-from-background map
+    cleanly separates text from background.  The median colour of
+    the text pixels is returned.
+
+    If a text mask is available, it is used to refine the extraction:
+    the median of mask-positive pixels (weighted by distance from
+    background) gives more accurate results than border-only analysis.
+
+    Args:
+        region_image: Cropped region from the *original* image (BGR).
+        region_mask: Per-pixel text mask for this region (255=text).
+
+    Returns:
+        RGB tuple of the detected text colour, or None if detection fails.
+    """
+    if region_image is None or region_image.size == 0:
+        return None
+
+    h, w = region_image.shape[:2]
+    if h < 6 or w < 6:
+        return None
+
+    if len(region_image.shape) != 3 or region_image.shape[2] < 3:
+        return None
+
+    # Work in RGB for the colour result.
+    img_rgb = cv2.cvtColor(region_image, cv2.COLOR_BGR2RGB)
+
+    # ── Strategy A: use the ML text mask directly if available ──
+    if region_mask is not None and region_mask.shape[:2] == (h, w):
+        if region_mask.max() > 1:
+            _, binary_mask = cv2.threshold(region_mask, 127, 255, cv2.THRESH_BINARY)
+        else:
+            binary_mask = (region_mask > 0).astype(np.uint8) * 255
+
+        text_pixels = img_rgb.reshape(-1, 3)[binary_mask.ravel() > 0]
+        if len(text_pixels) >= 5:
+            median_color = np.median(text_pixels.astype(np.float64), axis=0)
+            rgb = tuple(int(c) for c in median_color.round())
+            return _snap_extreme_neutrals(rgb)
+
+    # ── Strategy B: border-sampling + Otsu (comic-translate approach) ──
+    # 1. Border sampling — thin ring of pixels around the edge = background
+    bw = max(2, min(h, w) // 8)
+    top = img_rgb[:bw, :]
+    bottom = img_rgb[-bw:, :]
+    left = img_rgb[bw:-bw, :bw]
+    right = img_rgb[bw:-bw, -bw:]
+
+    border_pixels = np.concatenate(
+        [
+            top.reshape(-1, 3),
+            bottom.reshape(-1, 3),
+            left.reshape(-1, 3),
+            right.reshape(-1, 3),
+        ],
+        axis=0,
+    ).astype(np.float64)
+
+    bg = np.median(border_pixels, axis=0)
+
+    # 2. Per-pixel Euclidean distance from the background colour.
+    flat = img_rgb.reshape(-1, 3).astype(np.float64)
+    dist = np.sqrt(np.sum((flat - bg) ** 2, axis=1))
+
+    # 3. Otsu threshold on the distance map.
+    dist_u8 = np.clip(dist, 0, 255).astype(np.uint8)
+    _, otsu_mask = cv2.threshold(dist_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    threshold = max(float(cv2.threshold(dist_u8, 0, 255, cv2.THRESH_OTSU)[0]), 25.0)
+
+    # 4. Extract text pixels and compute their median colour.
+    text_mask_flat = dist > threshold
+    n_text = int(np.sum(text_mask_flat))
+    if n_text < 5:
+        return None
+
+    fg = np.median(flat[text_mask_flat], axis=0).round().astype(int)
+    rgb = (int(fg[0]), int(fg[1]), int(fg[2]))
+    return _snap_extreme_neutrals(rgb)
+
+
+def _outline_color_for_text(
+    text_rgb: tuple[int, int, int],
+) -> tuple[int, int, int]:
+    """Choose an outline/stroke colour that contrasts with the text colour."""
+    r, g, b = text_rgb
+    luma = 0.299 * r + 0.587 * g + 0.114 * b
+    return (255, 255, 255) if luma < 128 else (0, 0, 0)
+
+
 def inpaint_text_region(
     image: NDArray,
     x: int,
@@ -149,6 +265,7 @@ def render_text_on_image(
     region_mask: NDArray | None = None,
     style_hint: str | None = None,
     padding: int = 4,
+    text_color: tuple[int, int, int] | None = None,
 ) -> NDArray:
     """
     Render translated text within a bounding box on the image.
@@ -284,16 +401,19 @@ def render_text_on_image(
     if avail_w <= 10 or avail_h <= 10:
         return image
 
-    # Determine text color based on background brightness of the cleaned region
+    # Determine outline color from background brightness (original logic).
     region = result[box_y : box_y + box_h, box_x : box_x + box_w]
     gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
     mean_brightness = np.mean(gray)
     if mean_brightness > 140:
-        text_color = (0, 0, 0)
         outline_color = (255, 255, 255)
+        brightness_color = (0, 0, 0)
     else:
-        text_color = (255, 255, 255)
         outline_color = (0, 0, 0)
+        brightness_color = (255, 255, 255)
+
+    # Use detected text colour for fill if provided, otherwise brightness fallback.
+    render_color = text_color if text_color is not None else brightness_color
 
     # Auto-size font to fit
     font, lines, line_spacing = _fit_text_to_box(
@@ -478,7 +598,7 @@ def render_text_on_image(
             line,
             font=font,
             anchor="lt",
-            fill=text_color,
+            fill=render_color,
             stroke_width=stroke_width,
             stroke_fill=outline_color,
         )
