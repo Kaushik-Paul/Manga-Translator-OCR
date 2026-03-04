@@ -19,7 +19,7 @@ from PIL import Image as PILImage
 from .config import Settings, settings
 from .detector import TextRegion, detect_text_regions
 from .ocr import get_ocr_engine
-from .renderer import inpaint_text_region, render_text_on_image
+from .renderer import detect_text_color, inpaint_text_region, render_text_on_image
 from .translator import TranslationConstraint, translate_texts
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,7 @@ class RenderTextUnit:
     source_text: str
     style_hint: str
     parent_region_index: int
+    text_color: tuple[int, int, int] | None = None
 
 
 def translate_page(
@@ -190,8 +191,26 @@ def translate_page(
             "No renderable translations for this page; preserving original text regions."
         )
 
-    # 5. Inpaint original text, then render translated text
-    logger.info("Step 4/4: Inpainting and rendering translated text...")
+    # 5. Detect original text colours *before* inpainting erases them.
+    logger.info("Step 4/5: Detecting original text colours...")
+    for unit, can_render in zip(units, renderable_unit_mask):
+        if not can_render:
+            continue
+        region = unit.region
+        unit.text_color = detect_text_color(
+            region_image=region.cropped,
+            region_mask=region.mask,
+        )
+        if unit.text_color is not None:
+            logger.info(
+                "  Region at (%d,%d): detected colour RGB%s",
+                region.x,
+                region.y,
+                unit.text_color,
+            )
+
+    # 6. Inpaint original text, then render translated text
+    logger.info("Step 5/5: Inpainting and rendering translated text...")
     result = image.copy()
 
     # First pass: inpaint only regions that have at least one renderable translation.
@@ -215,6 +234,7 @@ def translate_page(
                 region.h,
                 region_mask=region.mask,
                 style_hint=unit.style_hint,
+                text_color=unit.text_color,
             )
 
     # 6. Save output
