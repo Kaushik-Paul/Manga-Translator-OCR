@@ -77,15 +77,18 @@ def _snap_extreme_neutrals(rgb: tuple[int, int, int]) -> tuple[int, int, int]:
     Comic text is almost never intentionally grey.  If the detected
     colour is achromatic (low chroma) it is meant to be either black
     or white, so snap to whichever is closer.  Coloured text (high
-    chroma) is returned unchanged.
+    chroma) is returned unchanged.  For achromatic (low chroma)
+    colours, returns ``None`` — the caller should fall back to its
+    own brightness-based logic, which is more reliable for B&W manga.
     """
     r, g, b = int(rgb[0]), int(rgb[1]), int(rgb[2])
-    luma = 0.299 * r + 0.587 * g + 0.114 * b
     chroma = max(r, g, b) - min(r, g, b)
 
-    # Achromatic → snap to nearest extreme.
-    if chroma < 40:
-        return (0, 0, 0) if luma < 128 else (255, 255, 255)
+    # Achromatic → return None so the brightness fallback handles it.
+    # Most manga text is pure black or white; the brightness-based
+    # fallback in render_text_on_image is more reliable for these.
+    if chroma < 60:
+        return None
 
     return (r, g, b)
 
@@ -101,16 +104,18 @@ def detect_text_color(
     cleanly separates text from background.  The median colour of
     the text pixels is returned.
 
-    If a text mask is available, it is used to refine the extraction:
-    the median of mask-positive pixels (weighted by distance from
-    background) gives more accurate results than border-only analysis.
+    Only returns a colour for clearly *chromatic* text (e.g. coloured
+    dialogue in colour manga).  For black, white, or grey text the
+    function returns ``None`` so that the caller's brightness-based
+    fallback handles it — that logic is more robust for B&W pages.
 
     Args:
         region_image: Cropped region from the *original* image (BGR).
         region_mask: Per-pixel text mask for this region (255=text).
 
     Returns:
-        RGB tuple of the detected text colour, or None if detection fails.
+        RGB tuple of the detected text colour, or None if detection
+        fails or the colour is achromatic (black/white/grey).
     """
     if region_image is None or region_image.size == 0:
         return None
