@@ -321,8 +321,8 @@ class ComicTextDetector:
         # Fixed, very-large kernels tend to over-merge across nearby bubbles/panels.
         short_side = min(h, w)
         close_size = _odd(max(5, int(round(short_side * 0.006))))
-        dilate_size = _odd(max(11, int(round(short_side * 0.018))))
-        close2_size = _odd(max(9, int(round(short_side * 0.014))))
+        dilate_size = _odd(max(11, int(round(short_side * 0.012))))
+        close2_size = _odd(max(9, int(round(short_side * 0.010))))
 
         kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (close_size, close_size))
         cleaned = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
@@ -353,7 +353,7 @@ class ComicTextDetector:
                 continue
             candidate_boxes.append((rx, ry, rx + rw, ry + rh))
 
-        merge_gap = max(10, int(short_side * 0.016))
+        merge_gap = max(10, int(short_side * 0.010))
         merged_boxes = _merge_nearby_boxes(candidate_boxes, gap=merge_gap)
 
         regions: list[TextRegion] = []
@@ -367,7 +367,7 @@ class ComicTextDetector:
             rw = x2 - x1
             rh = y2 - y1
 
-            if (rw * rh) > 25000:
+            if (rw * rh) > 15000:
                 disconnected_boxes = self._split_disconnected_region(
                     mask=mask,
                     region_bbox=(rx, ry, rw, rh),
@@ -558,7 +558,7 @@ class ComicTextDetector:
         if len(boxes) < 2:
             return []
 
-        merged = _merge_nearby_boxes(boxes, gap=max(10, int(short_side * 0.10)))
+        merged = _merge_nearby_boxes(boxes, gap=max(10, int(short_side * 0.06)))
         if len(merged) < 2:
             return []
 
@@ -567,7 +567,7 @@ class ComicTextDetector:
         if total_area > 0.0 and (max_area / total_area) > 0.82:
             return []
 
-        separation_threshold = max(20, int(short_side * 0.18))
+        separation_threshold = max(20, int(short_side * 0.12))
         separated = False
         for i in range(len(merged)):
             ax1, ay1, ax2, ay2 = merged[i]

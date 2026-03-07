@@ -444,7 +444,7 @@ def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:
     if len(boxes) < 2:
         return [region]
 
-    merge_gap = max(8, int(min(region.w, region.h) * 0.14))
+    merge_gap = max(8, int(min(region.w, region.h) * 0.10))
     merged_boxes = _merge_nearby_boxes(boxes, gap=merge_gap)
     merged_boxes = [
         b
@@ -585,9 +585,20 @@ def _infer_unit_style(source_text: str, w: int, h: int) -> str:
 def _sanitize_translated_text(text: str) -> str:
     """Guard against untranslated CJK leakage before rendering."""
     clean = " ".join(text.replace("\r", " ").replace("\n", " ").split())
-    if _contains_cjk(clean):
-        return "..."
-    return clean
+    if not _contains_cjk(clean):
+        return clean
+    # Strip CJK characters but keep the English/Latin text.
+    stripped = "".join(
+        ch for ch in clean
+        if not (
+            0x3040 <= ord(ch) <= 0x30FF
+            or 0x3400 <= ord(ch) <= 0x4DBF
+            or 0x4E00 <= ord(ch) <= 0x9FFF
+            or 0xF900 <= ord(ch) <= 0xFAFF
+        )
+    )
+    stripped = " ".join(stripped.split()).strip()
+    return stripped if stripped else "..."
 
 
 def _is_renderable_translation(text: str) -> bool:
