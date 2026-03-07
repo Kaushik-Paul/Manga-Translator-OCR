@@ -1211,13 +1211,15 @@ def _fit_text_to_box(
     # the available space, similar to comic-translate's approach.
     word_count = len(text.split())
     if style == "dialogue":
-        # Allow dialogue text to grow much larger if the bubble permits it
+        # Cap font size to be proportional to bubble but not overwhelming.
+        # Professional manga lettering uses consistent moderate font sizes
+        # and lets the padding fill the rest of the bubble.
         if word_count <= 2:
-            dynamic_max = min(300, max(max_h, int(max_w * 1.8)))
+            dynamic_max = min(120, max(max_h, int(max_w * 1.2)))
         elif word_count <= 5:
-            dynamic_max = min(200, max(max_h, int(max_w * 1.4)))
+            dynamic_max = min(150, max(max_h, int(max_w * 1.2)))
         else:
-            dynamic_max = min(180, max(24, int(min(max_h, max_w) * 1.2)))
+            dynamic_max = min(120, max(24, int(min(max_h, max_w) * 1.0)))
         max_size = min(max_size, dynamic_max)
     else:
         # SFX: can go large, scale with box dimensions

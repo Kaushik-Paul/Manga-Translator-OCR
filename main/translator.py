@@ -361,6 +361,8 @@ def _needs_repair_translation(
         return True
     if _contains_cjk(tgt):
         return True
+    if _is_romaji_sfx(tgt):
+        return True
     return False
 
 
@@ -389,6 +391,34 @@ def _looks_like_romaji_noise(text: str) -> bool:
         return False
     romaji_markers = {"desu", "kun", "chan", "sama", "senpai", "san"}
     return any(w in romaji_markers for w in words)
+
+
+# Common romaji SFX that LLMs sometimes output instead of English equivalents.
+_ROMAJI_SFX_SET = {
+    "biku", "gaku", "bakku", "doki", "gata", "goku", "zuru",
+    "piku", "biku", "gishi", "kachi", "pata", "bata", "gata",
+    "zawa", "hiso", "shiin", "pachi", "bashi", "dosa", "gara",
+    "kuru", "suru", "nuru", "furu", "muku", "gyuu",
+    "giin", "biin", "jiwa", "fuwa", "buro", "giro",
+}
+
+
+def _is_romaji_sfx(text: str) -> bool:
+    """Return True if text looks like untranslated romaji SFX (1-2 words)."""
+    words = [w.lower().rstrip(".,;:!?") for w in text.split()]
+    words = [w for w in words if w]
+    if not words or len(words) > 2:
+        return False
+    # Check if all words look like romaji patterns
+    for w in words:
+        if w in _ROMAJI_SFX_SET:
+            return True
+        # Catch doubled romaji: BIKUBIKU, DOKIDOKI, etc.
+        if len(w) >= 6 and w[:len(w)//2] == w[len(w)//2:]:
+            half = w[:len(w)//2]
+            if half in _ROMAJI_SFX_SET or (len(half) >= 3 and half[-1] in "aiueo"):
+                return True
+    return False
 
 
 def _parse_numbered_response(response: str, expected_count: int) -> dict[int, str]:
@@ -503,5 +533,9 @@ def _postprocess_translation(text: str) -> str:
     words = result.split()
     if len(words) <= 4 and result.rstrip().endswith(("!", "!!", "!!!")):
         result = result.upper()
+
+    # 4. Convert remaining romaji SFX to ellipsis as last resort
+    if _is_romaji_sfx(result):
+        result = "..."
 
     return result
