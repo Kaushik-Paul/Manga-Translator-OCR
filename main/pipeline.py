@@ -586,19 +586,34 @@ def _sanitize_translated_text(text: str) -> str:
     """Guard against untranslated CJK leakage before rendering."""
     clean = " ".join(text.replace("\r", " ").replace("\n", " ").split())
     if not _contains_cjk(clean):
-        return clean
+        # Still strip stray CJK punctuation / fullwidth chars even if no CJK text.
+        stripped = _strip_cjk_chars(clean)
+        return stripped if stripped else clean
     # Strip CJK characters but keep the English/Latin text.
-    stripped = "".join(
-        ch for ch in clean
-        if not (
-            0x3040 <= ord(ch) <= 0x30FF
-            or 0x3400 <= ord(ch) <= 0x4DBF
-            or 0x4E00 <= ord(ch) <= 0x9FFF
-            or 0xF900 <= ord(ch) <= 0xFAFF
-        )
-    )
-    stripped = " ".join(stripped.split()).strip()
+    stripped = _strip_cjk_chars(clean)
     return stripped if stripped else "..."
+
+
+def _strip_cjk_chars(text: str) -> str:
+    """Remove CJK characters, CJK punctuation, and fullwidth forms."""
+    out = []
+    for ch in text:
+        code = ord(ch)
+        if (
+            0x3000 <= code <= 0x303F   # CJK symbols and punctuation (「」、。etc)
+            or 0x3040 <= code <= 0x30FF  # Hiragana / Katakana
+            or 0x31F0 <= code <= 0x31FF  # Katakana phonetic extensions
+            or 0x3400 <= code <= 0x4DBF  # CJK Extension A
+            or 0x4E00 <= code <= 0x9FFF  # CJK Unified Ideographs
+            or 0xF900 <= code <= 0xFAFF  # CJK Compatibility Ideographs
+            or 0xFE30 <= code <= 0xFE4F  # CJK Compatibility Forms
+            or 0xFF01 <= code <= 0xFF60  # Fullwidth Latin / punctuation
+            or 0xFFE0 <= code <= 0xFFEF  # Fullwidth signs
+        ):
+            continue
+        out.append(ch)
+    result = " ".join("".join(out).split()).strip()
+    return result
 
 
 def _is_renderable_translation(text: str) -> bool:
