@@ -667,7 +667,7 @@ def _resolve_dialogue_box(
     This follows the same idea as comic-translate's best-render-area flow:
     prioritize bubble interior (when detectable), otherwise keep the full region.
     """
-    inset = max(2, int(min(w, h) * 0.02))
+    inset = max(2, int(min(w, h) * 0.05))
     default_box = (
         x + inset,
         y + inset,
@@ -773,7 +773,7 @@ def _dialogue_fallback_box(
 
     if tight_box[2] < 22 or tight_box[3] < 20:
         return default_box
-    if area_ratio < 0.15:
+    if area_ratio < 0.10:
         return default_box
     if area_ratio > 0.88:
         return default_box
@@ -1217,7 +1217,7 @@ def _fit_text_to_box(
         elif word_count <= 5:
             dynamic_max = min(200, max(max_h, int(max_w * 1.4)))
         else:
-            dynamic_max = min(180, max(24, int(max_h * 1.0)))
+            dynamic_max = min(180, max(24, int(min(max_h, max_w) * 1.2)))
         max_size = min(max_size, dynamic_max)
     else:
         # SFX: can go large, scale with box dimensions
@@ -1322,7 +1322,7 @@ def _line_spacing_for_size(size: int, style: str) -> int:
     if style == "sfx":
         return max(1, int(size * 0.08))
     # Comic fonts typically have generous built-in descent/ascent metrics.
-    return max(1, int(size * 0.01))
+    return max(1, int(size * 0.08))
 
 
 def _compress_dialogue_for_tiny_box(text: str, max_words: int) -> str:
