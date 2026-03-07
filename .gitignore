@@ -256,9 +256,6 @@ manga_testing/**
 
 temp_repo/**
 
-main/fonts/**
-!main/fonts/.gitkeep
-
 main/weights/**
 !main/weights/.gitkeep
 
