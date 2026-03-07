@@ -321,8 +321,8 @@ class ComicTextDetector:
         # Fixed, very-large kernels tend to over-merge across nearby bubbles/panels.
         short_side = min(h, w)
         close_size = _odd(max(5, int(round(short_side * 0.006))))
-        dilate_size = _odd(max(11, int(round(short_side * 0.012))))
-        close2_size = _odd(max(9, int(round(short_side * 0.010))))
+        dilate_size = _odd(max(7, int(round(short_side * 0.008))))
+        close2_size = _odd(max(7, int(round(short_side * 0.008))))
 
         kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (close_size, close_size))
         cleaned = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
@@ -353,7 +353,7 @@ class ComicTextDetector:
                 continue
             candidate_boxes.append((rx, ry, rx + rw, ry + rh))
 
-        merge_gap = max(10, int(short_side * 0.010))
+        merge_gap = max(4, int(short_side * 0.006))
         merged_boxes = _merge_nearby_boxes(candidate_boxes, gap=merge_gap)
 
         regions: list[TextRegion] = []
@@ -367,7 +367,7 @@ class ComicTextDetector:
             rw = x2 - x1
             rh = y2 - y1
 
-            if (rw * rh) > 15000:
+            if (rw * rh) > 8000:
                 disconnected_boxes = self._split_disconnected_region(
                     mask=mask,
                     region_bbox=(rx, ry, rw, rh),
@@ -441,8 +441,8 @@ class ComicTextDetector:
             return []
 
         short_side = max(1, min(rw, rh))
-        close_size = _odd(max(3, int(round(short_side * 0.02))))
-        dilate_size = _odd(max(5, int(round(short_side * 0.035))))
+        close_size = _odd(max(3, int(round(short_side * 0.004))))
+        dilate_size = _odd(max(3, int(round(short_side * 0.006))))
 
         refined = cv2.morphologyEx(
             sub_mask,
@@ -520,8 +520,8 @@ class ComicTextDetector:
             return []
 
         short_side = max(1, min(rw, rh))
-        close_size = _odd(max(3, int(round(short_side * 0.012))))
-        dilate_size = _odd(max(5, int(round(short_side * 0.03))))
+        close_size = _odd(max(3, int(round(short_side * 0.002))))
+        dilate_size = _odd(max(3, int(round(short_side * 0.004))))
 
         refined = cv2.morphologyEx(
             sub_mask,
@@ -567,21 +567,9 @@ class ComicTextDetector:
         if total_area > 0.0 and (max_area / total_area) > 0.82:
             return []
 
-        separation_threshold = max(20, int(short_side * 0.12))
-        separated = False
-        for i in range(len(merged)):
-            ax1, ay1, ax2, ay2 = merged[i]
-            for j in range(i + 1, len(merged)):
-                bx1, by1, bx2, by2 = merged[j]
-                x_gap = max(0, max(ax1, bx1) - min(ax2, bx2))
-                y_gap = max(0, max(ay1, by1) - min(ay2, by2))
-                if x_gap > separation_threshold or y_gap > separation_threshold:
-                    separated = True
-                    break
-            if separated:
-                break
-
-        return merged if separated else []
+        # If we found multiple disconnected clusters, split them unconditionally.
+        # No separation_threshold check — the contours being separate is enough.
+        return merged
 
     def _is_region_viable(self, region: TextRegion) -> bool:
         """Filter noisy tiny detections that are unlikely to be useful text regions."""
