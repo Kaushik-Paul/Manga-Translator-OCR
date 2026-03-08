@@ -30,9 +30,12 @@ def _font_paths(*font_files: str) -> list[str]:
 
 
 # Use bundled comic-lettering fonts for natural manga dialogue/SFX rendering.
+# animeace2.otf has full printable ASCII (0x20-0x7E) and is safer as primary.
+# CCWildWordsRoman.ttf has a limited charset (missing ^, _, {, }, |, ~) and
+# renders unsupported chars as tofu boxes.
 _DIALOGUE_FONT_SEARCH_PATHS = _font_paths(
-    "CCWildWordsRoman.ttf",
     "animeace2.otf",
+    "CCWildWordsRoman.ttf",
 )
 
 _SFX_FONT_SEARCH_PATHS = _font_paths(
@@ -41,8 +44,8 @@ _SFX_FONT_SEARCH_PATHS = _font_paths(
 )
 
 _NARROW_DIALOGUE_FONT_SEARCH_PATHS = _font_paths(
-    "CCWildWordsRoman.ttf",
     "animeace2.otf",
+    "CCWildWordsRoman.ttf",
 )
 
 _CJK_DIALOGUE_FONT_SEARCH_PATHS = _font_paths(
@@ -69,6 +72,99 @@ _CJK_DIALOGUE_FONT_PATH = (
     _find_font(_CJK_DIALOGUE_FONT_SEARCH_PATHS) or _DIALOGUE_FONT_PATH
 )
 _DEFAULT_FONT_PATH = _DIALOGUE_FONT_PATH or _SFX_FONT_PATH
+
+# ---------------------------------------------------------------------------
+# Font charset cache — prevents tofu □ boxes by checking glyph coverage
+# ---------------------------------------------------------------------------
+_FONT_CHARSET_CACHE: dict[str, set[int]] = {}
+
+
+def _get_font_charset(font_path: str) -> set[int]:
+    """Parse supported codepoints from a font file (cached)."""
+    if font_path in _FONT_CHARSET_CACHE:
+        return _FONT_CHARSET_CACHE[font_path]
+
+    import subprocess
+
+    supported: set[int] = set()
+    try:
+        result = subprocess.run(
+            ["fc-query", "--format=%{charset}\n", font_path],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            for part in result.stdout.strip().split():
+                if "-" in part:
+                    start_s, end_s = part.split("-", 1)
+                    for cp in range(int(start_s, 16), int(end_s, 16) + 1):
+                        supported.add(cp)
+                else:
+                    supported.add(int(part, 16))
+    except Exception as e:
+        logger.debug("fc-query failed for %s: %s — using permissive fallback", font_path, e)
+        # Fallback: assume printable ASCII + common Latin-1 are safe
+        for cp in range(0x20, 0x7F):
+            supported.add(cp)
+
+    _FONT_CHARSET_CACHE[font_path] = supported
+    return supported
+
+
+def _sanitize_for_font(text: str, font_path: str | None) -> str:
+    """Strip or replace characters that the given font cannot render.
+
+    Characters outside the font's charset would render as □ (tofu) boxes.
+    Common replacements (smart quotes → ASCII quotes, em-dash → hyphen, etc.)
+    are applied first, then any remaining unsupported chars are removed.
+    """
+    if not font_path or not text:
+        return text
+
+    charset = _get_font_charset(font_path)
+    if not charset:
+        return text  # Can't determine charset, pass through
+
+    # Quick check: if all characters are supported, return as-is
+    if all(ord(c) in charset for c in text):
+        return text
+
+    # Apply common replacements for unsupported chars
+    _REPLACEMENTS = {
+        "\u2018": "'", "\u2019": "'", "\u201A": "'",
+        "\u201C": '"', "\u201D": '"', "\u201E": '"',
+        "\u2013": "-", "\u2014": "-", "\u2012": "-",
+        "\u2026": "...",
+        "\u2605": "*", "\u2606": "*",
+        "\u2022": "-",
+        "\u00B7": ".",
+        "\u2192": "->", "\u2190": "<-",
+        "\u266A": "~", "\u266B": "~",
+        "\u2665": "<3", "\u2764": "<3",
+        "\u301C": "~", "\uFF5E": "~",
+    }
+
+    out: list[str] = []
+    for ch in text:
+        cp = ord(ch)
+        if cp in charset:
+            out.append(ch)
+        elif ch in _REPLACEMENTS:
+            # Replace with ASCII equivalent, but only keep chars the font supports
+            replacement = _REPLACEMENTS[ch]
+            out.append("".join(c for c in replacement if ord(c) in charset) or "")
+        elif 0x20 <= cp <= 0x7E:
+            # Basic ASCII that the font doesn't support — unlikely but skip
+            out.append("")
+        else:
+            # Unknown unsupported char — silently drop
+            pass
+
+    result = "".join(out)
+    # Clean up doubled spaces from removed chars
+    result = " ".join(result.split())
+    return result.strip() if result.strip() else text
 
 
 def _snap_extreme_neutrals(rgb: tuple[int, int, int]) -> tuple[int, int, int]:
@@ -375,7 +471,10 @@ def render_text_on_image(
     if font_file is None:
         font_file = _DEFAULT_FONT_PATH
 
-    text_padding = max(2, padding - 3) if text_style == "dialogue" else max(1, padding - 3)
+    # Strip characters the selected font can't render (prevents □ tofu boxes).
+    text = _sanitize_for_font(text, font_file)
+
+    text_padding = max(1, padding - 4) if text_style == "dialogue" else max(1, padding - 4)
     avail_w = box_w - 2 * text_padding
     avail_h = box_h - 2 * text_padding
     box_clip_mask = _crop_clip_mask_to_box(
@@ -411,7 +510,14 @@ def render_text_on_image(
         brightness_color = (255, 255, 255)
 
     # Use detected text colour for fill if provided, otherwise brightness fallback.
-    render_color = text_color if text_color is not None else brightness_color
+    # Guard: ensure detected colour has sufficient contrast against the background.
+    render_color = brightness_color
+    if text_color is not None:
+        tr, tg, tb = text_color
+        text_luma = 0.299 * tr + 0.587 * tg + 0.114 * tb
+        contrast_ratio = abs(text_luma - mean_brightness)
+        if contrast_ratio >= 40:  # Minimum perceptual contrast
+            render_color = text_color
 
     # Auto-size font to fit
     font, lines, line_spacing = _fit_text_to_box(
@@ -720,7 +826,7 @@ def _resolve_dialogue_box(
     region_area = max(1, w * h)
     if bubble_area < int(region_area * 0.16):
         return (*fallback_box, False, None)
-    if bubble_area > int(region_area * 0.97):
+    if bubble_area > int(region_area * 0.99):
         return (*fallback_box, False, None)
 
     bubble_render_mask = _prepare_bubble_render_mask(bubble_mask)
@@ -736,8 +842,8 @@ def _resolve_dialogue_box(
     x1, y1, x2, y2 = _shrink_centered_box(x1, y1, x2, y2, shrink_ratio)
     fit_w = x2 - x1
     fit_h = y2 - y1
-    min_w = max(28, int(w * 0.25))
-    min_h = max(24, int(h * 0.25))
+    min_w = max(20, int(w * 0.20))
+    min_h = max(18, int(h * 0.20))
     if fit_w < min_w or fit_h < min_h:
         return (*fallback_box, False, None)
 
@@ -1062,7 +1168,7 @@ def _prepare_bubble_render_mask(mask: NDArray) -> NDArray | None:
     if comp_area < 180:
         return None
 
-    k = _odd(max(3, int(round(np.sqrt(comp_area) / 50))))
+    k = _odd(max(3, int(round(np.sqrt(comp_area) / 70))))
     eroded = cv2.erode(
         mask.astype(np.uint8),
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)),
@@ -1201,29 +1307,27 @@ def _fit_text_to_box(
     max_h: int,
     font_path: str | None,
     style: str = "dialogue",
-    min_size: int = 10,
-    max_size: int = 120,
+    min_size: int = 8,
+    max_size: int = 200,
     max_size_cap: int | None = None,
 ) -> tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, list[str], int]:
     """Find the largest font size where the wrapped text fits in the box."""
 
     # Dynamically compute max font size from box dimensions so text fills
-    # the available space, similar to comic-translate's approach.
+    # the available space.  Let the binary search find the largest size that
+    # fits — only cap to prevent absurdly large single-word renders.
     word_count = len(text.split())
     if style == "dialogue":
-        # Cap font size to be proportional to bubble but not overwhelming.
-        # Professional manga lettering uses consistent moderate font sizes
-        # and lets the padding fill the rest of the bubble.
         if word_count <= 2:
-            dynamic_max = min(120, max(max_h, int(max_w * 1.2)))
+            dynamic_max = min(200, max(max_h, int(max_w * 1.5)))
         elif word_count <= 5:
-            dynamic_max = min(150, max(max_h, int(max_w * 1.2)))
+            dynamic_max = min(200, max(max_h, int(max_w * 1.4)))
         else:
-            dynamic_max = min(120, max(24, int(min(max_h, max_w) * 1.0)))
+            dynamic_max = min(200, max(24, int(min(max_h, max_w) * 1.5)))
         max_size = min(max_size, dynamic_max)
     else:
         # SFX: can go large, scale with box dimensions
-        dynamic_max = min(120, max(max_h, max_w))
+        dynamic_max = min(200, max(max_h, max_w))
         max_size = min(max_size, dynamic_max)
         min_size = min(min_size, 6)
     if max_size_cap is not None:
