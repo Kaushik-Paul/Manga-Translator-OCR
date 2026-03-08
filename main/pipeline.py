@@ -585,6 +585,8 @@ def _infer_unit_style(source_text: str, w: int, h: int) -> str:
 def _sanitize_translated_text(text: str) -> str:
     """Guard against untranslated CJK leakage before rendering."""
     clean = " ".join(text.replace("\r", " ").replace("\n", " ").split())
+    # First pass: replace common unsupported unicode chars with ASCII equivalents
+    clean = _replace_unsupported_chars(clean)
     if not _contains_cjk(clean):
         # Still strip stray CJK punctuation / fullwidth chars even if no CJK text.
         stripped = _strip_cjk_chars(clean)
@@ -594,13 +596,49 @@ def _sanitize_translated_text(text: str) -> str:
     return stripped if stripped else "..."
 
 
+def _replace_unsupported_chars(text: str) -> str:
+    """Replace common unicode chars that manga fonts can't render with ASCII equivalents."""
+    replacements = {
+        # Smart quotes → ASCII
+        "\u2018": "'", "\u2019": "'", "\u201A": "'",
+        "\u201C": '"', "\u201D": '"', "\u201E": '"',
+        # Dashes
+        "\u2013": "-", "\u2014": "-", "\u2012": "-",
+        # Ellipsis
+        "\u2026": "...",
+        # Geometric shapes (these cause □ tofu)
+        "\u25A0": "", "\u25A1": "", "\u25AA": "", "\u25AB": "",
+        "\u25B2": "", "\u25B3": "", "\u25B6": "", "\u25BC": "",
+        "\u25CF": "", "\u25CB": "", "\u25FB": "", "\u25FC": "",
+        "\u25FD": "", "\u25FE": "",
+        # Misc symbols that cause tofu
+        "\u2B1C": "", "\u2B1B": "",  # Large squares
+        "\u2605": "*", "\u2606": "*",  # Stars
+        "\u2022": "-",  # Bullet
+        "\u00B7": ".",  # Middle dot
+        # Arrows
+        "\u2192": "->", "\u2190": "<-", "\u2191": "^", "\u2193": "v",
+        # Musical notes
+        "\u266A": "~", "\u266B": "~", "\u266C": "~",
+        # Hearts/symbols that may not render
+        "\u2665": "<3", "\u2764": "<3",
+        # Tildes
+        "\u301C": "~", "\uFF5E": "~",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
+
 def _strip_cjk_chars(text: str) -> str:
-    """Remove CJK characters, CJK punctuation, and fullwidth forms."""
+    """Remove CJK characters, CJK punctuation, fullwidth forms, and unsupported symbols."""
     out = []
     for ch in text:
         code = ord(ch)
         if (
-            0x2500 <= code <= 0x25FF  # Geometric Shapes (e.g. □, ■, △)
+            0x2500 <= code <= 0x25FF  # Box Drawing + Geometric Shapes (e.g. □, ■, △)
+            or 0x2600 <= code <= 0x26FF  # Miscellaneous Symbols
+            or 0x2700 <= code <= 0x27BF  # Dingbats
             or 0x3000 <= code <= 0x303F   # CJK symbols and punctuation (「」、。etc)
             or 0x3040 <= code <= 0x30FF  # Hiragana / Katakana
             or 0x31F0 <= code <= 0x31FF  # Katakana phonetic extensions

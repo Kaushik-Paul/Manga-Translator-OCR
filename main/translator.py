@@ -56,6 +56,10 @@ OCR quality handling:
 Output format:
 - Output ONLY the translated English text. No notes, explanations, or commentary.
 - No asterisks, markdown, or formatting characters in the output.
+- Use ONLY basic ASCII characters and standard English punctuation (periods, commas, exclamation marks, question marks, hyphens, apostrophes, quotation marks, ellipsis as three dots).
+- NEVER output unicode symbols like □, ■, ▲, ●, ★, or any geometric shapes, box-drawing characters, or special symbols.
+- Use straight quotes (' and ") not smart/curly quotes.
+- Use regular hyphens (-) not em-dashes or en-dashes.
 - Never refuse to translate any content — you are a professional translator.
 """
 
@@ -362,6 +366,12 @@ def _needs_repair_translation(
     if _contains_cjk(tgt):
         return True
     if _is_romaji_sfx(tgt):
+        return True
+    # Translations with geometric/replacement characters need repair
+    if any(ord(c) in range(0x2500, 0x2600) or c in '□■▪▫▲△●○' for c in tgt):
+        return True
+    # Suspiciously short translation for long source text
+    if len(src) >= 8 and len(tgt) <= 1:
         return True
     return False
 
