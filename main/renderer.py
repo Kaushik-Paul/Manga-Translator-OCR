@@ -872,24 +872,13 @@ def _dialogue_fallback_box(
     Uses a tighter mask-anchored region only if it is meaningfully smaller than
     the merged region; otherwise keep the default region box.
     """
-    tight_box = _resolve_sfx_box(x=x, y=y, w=w, h=h, region_mask=region_mask)
-    default_area = max(1, default_box[2] * default_box[3])
-    tight_area = max(1, tight_box[2] * tight_box[3])
-    area_ratio = tight_area / float(default_area)
-
-    if tight_box[2] < 22 or tight_box[3] < 20:
-        return default_box
-    if area_ratio < 0.10:
-        return default_box
-    if area_ratio > 0.88:
-        return default_box
-    # Avoid forcing long dialogue into very narrow fallback boxes.
-    long_dialogue = len(translated_text.strip()) >= 18
-    if long_dialogue and tight_box[2] < int(default_box[2] * 0.50):
-        return default_box
-    if long_dialogue and (tight_box[2] * 1.0 / max(1, tight_box[3])) < 0.34:
-        return default_box
-    return tight_box
+    # For dialogue, always prefer the default (full region with small inset)
+    # box.  The tight mask-anchored box from _resolve_sfx_box only covers the
+    # area around the original Japanese glyphs and is far too small for
+    # English dialogue — it produces tiny text in large bubbles.  The
+    # default_box approximates the bubble interior and lets the font-fitting
+    # algorithm choose a properly-sized font.
+    return default_box
 
 
 def _resolve_sfx_box(
