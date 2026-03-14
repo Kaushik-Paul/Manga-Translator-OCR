@@ -320,9 +320,9 @@ class ComicTextDetector:
         # Merge nearby characters into dialogue-sized blocks with dynamic kernels.
         # Fixed, very-large kernels tend to over-merge across nearby bubbles/panels.
         short_side = min(h, w)
-        close_size = _odd(max(5, int(round(short_side * 0.006))))
-        dilate_size = _odd(max(7, int(round(short_side * 0.008))))
-        close2_size = _odd(max(7, int(round(short_side * 0.008))))
+        close_size = _odd(max(5, int(round(short_side * 0.005))))
+        dilate_size = _odd(max(5, int(round(short_side * 0.005))))
+        close2_size = _odd(max(5, int(round(short_side * 0.005))))
 
         kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (close_size, close_size))
         cleaned = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
@@ -353,7 +353,7 @@ class ComicTextDetector:
                 continue
             candidate_boxes.append((rx, ry, rx + rw, ry + rh))
 
-        merge_gap = max(4, int(short_side * 0.006))
+        merge_gap = max(4, int(short_side * 0.003))
         merged_boxes = _merge_nearby_boxes(candidate_boxes, gap=merge_gap)
 
         regions: list[TextRegion] = []
@@ -367,7 +367,7 @@ class ComicTextDetector:
             rw = x2 - x1
             rh = y2 - y1
 
-            if (rw * rh) > 8000:
+            if (rw * rh) > 5000:
                 disconnected_boxes = self._split_disconnected_region(
                     mask=mask,
                     region_bbox=(rx, ry, rw, rh),
@@ -558,7 +558,7 @@ class ComicTextDetector:
         if len(boxes) < 2:
             return []
 
-        merged = _merge_nearby_boxes(boxes, gap=max(10, int(short_side * 0.06)))
+        merged = _merge_nearby_boxes(boxes, gap=max(8, int(short_side * 0.04)))
         if len(merged) < 2:
             return []
 

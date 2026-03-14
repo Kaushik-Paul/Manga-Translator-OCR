@@ -177,7 +177,8 @@ def translate_page(
         for text in translated_texts
     ]
     renderable_unit_mask = [
-        _is_renderable_translation(text) for text in translated_texts
+        _is_renderable_unit(unit, text)
+        for unit, text in zip(units, translated_texts)
     ]
     renderable_region_indices = {
         unit.parent_region_index
@@ -484,20 +485,20 @@ def _build_translation_constraint(unit: RenderTextUnit) -> TranslationConstraint
             max_chars=max_chars,
         )
 
-    max_words = 7
-    max_chars = 36
+    max_words = 10
+    max_chars = 48
     if aspect >= 1.75:
-        max_words = 3 if render_region.w < 120 or area < 24000 else 4
-        max_chars = 16 if render_region.w < 120 else 20
+        max_words = 5 if render_region.w < 120 or area < 24000 else 7
+        max_chars = 24 if render_region.w < 120 else 32
     elif aspect >= 1.35:
-        max_words = 4 if area < 26000 else 5
-        max_chars = 20 if area < 26000 else 24
+        max_words = 6 if area < 26000 else 8
+        max_chars = 28 if area < 26000 else 36
     elif area < 18000:
-        max_words = 5
-        max_chars = 24
+        max_words = 7
+        max_chars = 32
     elif area < 32000:
-        max_words = 6
-        max_chars = 30
+        max_words = 8
+        max_chars = 40
 
     return TranslationConstraint(
         style="dialogue",
@@ -545,7 +546,7 @@ def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:
     if len(boxes) < 2:
         return [region]
 
-    merge_gap = max(8, int(min(region.w, region.h) * 0.10))
+    merge_gap = max(8, int(min(region.w, region.h) * 0.06))
     merged_boxes = _merge_nearby_boxes(boxes, gap=merge_gap)
     merged_boxes = _merge_aligned_ocr_boxes(
         merged_boxes,
@@ -608,8 +609,8 @@ def _merge_aligned_ocr_boxes(
     if len(boxes) < 2:
         return boxes
 
-    x_gap_limit = max(12, int(region_w * 0.16))
-    y_gap_limit = max(10, int(region_h * 0.08))
+    x_gap_limit = max(12, int(region_w * 0.10))
+    y_gap_limit = max(10, int(region_h * 0.05))
 
     def _should_merge(
         a: tuple[int, int, int, int],
@@ -633,7 +634,7 @@ def _merge_aligned_ocr_boxes(
         same_column = x_overlap_ratio >= 0.65 and y_gap <= y_gap_limit
         side_by_side_columns = (
             y_overlap_ratio >= 0.55
-            and x_gap <= min(x_gap_limit, int(max(aw, bw) * 0.45) + 8)
+            and x_gap <= min(x_gap_limit, int(max(aw, bw) * 0.30) + 6)
         )
         return same_column or side_by_side_columns
 
@@ -848,6 +849,39 @@ def _strip_cjk_chars(text: str) -> str:
         out.append(ch)
     result = " ".join("".join(out).split()).strip()
     return result
+
+
+def _is_renderable_unit(unit: RenderTextUnit, text: str) -> bool:
+    """
+    Return True if a translated unit should be rendered on-page.
+
+    Combines basic text checks with context-aware filtering for SFX
+    fragments — tiny regions with single-character source/translated text
+    that are typically noise from individual Japanese characters detected
+    as separate regions.
+    """
+    if not _is_renderable_translation(text):
+        return False
+
+    cleaned = text.strip()
+    region = unit.region
+    area = max(1, region.w * region.h)
+
+    if unit.style_hint == "sfx":
+        # Skip very short SFX translations in small regions (fragment noise).
+        if len(cleaned) <= 2 and area < 4000:
+            return False
+        # Skip single-character source text in small SFX regions — these are
+        # individual Japanese characters (e.g. 'お', 'ん') that shouldn't be
+        # rendered as separate tiny SFX.
+        src_clean = unit.source_text.strip()
+        if len(src_clean) <= 1 and area < 8000:
+            return False
+        # Skip numeric/symbol-only SFX (e.g. "13", "1/", "1:")
+        if re.fullmatch(r'[\d\s/.:;,!?\-()]+', cleaned):
+            return False
+
+    return True
 
 
 def _is_renderable_translation(text: str) -> bool:
