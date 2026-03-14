@@ -36,6 +36,7 @@ class RenderTextUnit:
     """A renderable text unit, potentially split from a larger detected region."""
 
     region: TextRegion
+    context_region: TextRegion | None
     source_text: str
     style_hint: str
     parent_region_index: int
@@ -127,9 +128,15 @@ def translate_page(
             continue
 
         style_hint = _infer_unit_style(text, ocr_region.w, ocr_region.h)
+        parent_region = regions[region_idx]
         units.append(
             RenderTextUnit(
                 region=ocr_region,
+                context_region=_select_render_context_region(
+                    unit_region=ocr_region,
+                    parent_region=parent_region,
+                    style_hint=style_hint,
+                ),
                 source_text=text,
                 style_hint=style_hint,
                 parent_region_index=region_idx,
@@ -155,7 +162,7 @@ def translate_page(
     logger.info("Step 3/4: Translating %d text segments...", len(units))
     source_texts = [unit.source_text for unit in units]
     constraints = [
-        TranslationConstraint(style=unit.style_hint)
+        _build_translation_constraint(unit)
         for unit in units
     ]
     translated_texts = translate_texts(
@@ -224,7 +231,11 @@ def translate_page(
     # Second pass: render translated text onto the cleaned image
     for unit, translated, can_render in zip(units, translated_texts, renderable_unit_mask):
         if can_render:
-            region = unit.region
+            region = unit.context_region or unit.region
+            render_mask = _project_region_mask_into_context(
+                unit_region=unit.region,
+                context_region=region,
+            )
             result = render_text_on_image(
                 result,
                 translated,
@@ -232,7 +243,7 @@ def translate_page(
                 region.y,
                 region.w,
                 region.h,
-                region_mask=region.mask,
+                region_mask=render_mask,
                 style_hint=unit.style_hint,
                 text_color=unit.text_color,
             )
@@ -405,6 +416,96 @@ def _save_image(output_path: Path, image_bgr: np.ndarray) -> None:
         cv2.imwrite(str(output_path), image_bgr)
 
 
+def _select_render_context_region(
+    unit_region: TextRegion,
+    parent_region: TextRegion,
+    style_hint: str,
+) -> TextRegion:
+    """Choose a render context that preserves bubble geometry for dialogue."""
+    if style_hint != "dialogue":
+        return unit_region
+    if (
+        unit_region.x == parent_region.x
+        and unit_region.y == parent_region.y
+        and unit_region.w == parent_region.w
+        and unit_region.h == parent_region.h
+    ):
+        return unit_region
+    return parent_region
+
+
+def _project_region_mask_into_context(
+    unit_region: TextRegion,
+    context_region: TextRegion,
+) -> np.ndarray | None:
+    """Paste a unit mask into the chosen context region for bubble anchoring."""
+    if unit_region.mask is None:
+        return None
+    if unit_region.mask.shape[:2] != (unit_region.h, unit_region.w):
+        return None
+    if (
+        unit_region.x == context_region.x
+        and unit_region.y == context_region.y
+        and unit_region.w == context_region.w
+        and unit_region.h == context_region.h
+    ):
+        return unit_region.mask.copy()
+
+    offset_x = unit_region.x - context_region.x
+    offset_y = unit_region.y - context_region.y
+    if offset_x < 0 or offset_y < 0:
+        return None
+    if offset_x + unit_region.w > context_region.w:
+        return None
+    if offset_y + unit_region.h > context_region.h:
+        return None
+
+    projected = np.zeros((context_region.h, context_region.w), dtype=np.uint8)
+    projected[
+        offset_y : offset_y + unit_region.h,
+        offset_x : offset_x + unit_region.w,
+    ] = unit_region.mask.astype(np.uint8)
+    return projected
+
+
+def _build_translation_constraint(unit: RenderTextUnit) -> TranslationConstraint:
+    """Derive concise translation budgets from the region most likely to be rendered."""
+    render_region = unit.context_region or unit.region
+    area = max(1, int(render_region.w * render_region.h))
+    aspect = render_region.h / float(max(1, render_region.w))
+
+    if unit.style_hint == "sfx":
+        max_chars = 12 if area < 12000 else 16
+        if render_region.w >= 160 or render_region.h >= 220:
+            max_chars = min(18, max_chars + 2)
+        return TranslationConstraint(
+            style="sfx",
+            max_words=3,
+            max_chars=max_chars,
+        )
+
+    max_words = 7
+    max_chars = 36
+    if aspect >= 1.75:
+        max_words = 3 if render_region.w < 120 or area < 24000 else 4
+        max_chars = 16 if render_region.w < 120 else 20
+    elif aspect >= 1.35:
+        max_words = 4 if area < 26000 else 5
+        max_chars = 20 if area < 26000 else 24
+    elif area < 18000:
+        max_words = 5
+        max_chars = 24
+    elif area < 32000:
+        max_words = 6
+        max_chars = 30
+
+    return TranslationConstraint(
+        style="dialogue",
+        max_words=max_words,
+        max_chars=max_chars,
+    )
+
+
 def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:
     """
     Split a merged region into component-level OCR units.
@@ -446,6 +547,11 @@ def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:
 
     merge_gap = max(8, int(min(region.w, region.h) * 0.10))
     merged_boxes = _merge_nearby_boxes(boxes, gap=merge_gap)
+    merged_boxes = _merge_aligned_ocr_boxes(
+        merged_boxes,
+        region_w=region.w,
+        region_h=region.h,
+    )
     merged_boxes = [
         b
         for b in merged_boxes
@@ -491,6 +597,73 @@ def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:
         )
 
     return units if len(units) >= 2 else [region]
+
+
+def _merge_aligned_ocr_boxes(
+    boxes: list[tuple[int, int, int, int]],
+    region_w: int,
+    region_h: int,
+) -> list[tuple[int, int, int, int]]:
+    """Merge OCR boxes that are clearly one phrase split across tight columns/rows."""
+    if len(boxes) < 2:
+        return boxes
+
+    x_gap_limit = max(12, int(region_w * 0.16))
+    y_gap_limit = max(10, int(region_h * 0.08))
+
+    def _should_merge(
+        a: tuple[int, int, int, int],
+        b: tuple[int, int, int, int],
+    ) -> bool:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        aw = max(1, ax2 - ax1)
+        ah = max(1, ay2 - ay1)
+        bw = max(1, bx2 - bx1)
+        bh = max(1, by2 - by1)
+
+        x_overlap = max(0, min(ax2, bx2) - max(ax1, bx1))
+        y_overlap = max(0, min(ay2, by2) - max(ay1, by1))
+        x_gap = max(0, max(ax1, bx1) - min(ax2, bx2))
+        y_gap = max(0, max(ay1, by1) - min(ay2, by2))
+
+        x_overlap_ratio = x_overlap / float(max(1, min(aw, bw)))
+        y_overlap_ratio = y_overlap / float(max(1, min(ah, bh)))
+
+        same_column = x_overlap_ratio >= 0.65 and y_gap <= y_gap_limit
+        side_by_side_columns = (
+            y_overlap_ratio >= 0.55
+            and x_gap <= min(x_gap_limit, int(max(aw, bw) * 0.45) + 8)
+        )
+        return same_column or side_by_side_columns
+
+    merged = boxes.copy()
+    changed = True
+    while changed:
+        changed = False
+        next_boxes: list[tuple[int, int, int, int]] = []
+        used = [False] * len(merged)
+        for i, base in enumerate(merged):
+            if used[i]:
+                continue
+            x1, y1, x2, y2 = base
+            used[i] = True
+            for j in range(i + 1, len(merged)):
+                if used[j]:
+                    continue
+                if not _should_merge((x1, y1, x2, y2), merged[j]):
+                    continue
+                ox1, oy1, ox2, oy2 = merged[j]
+                x1 = min(x1, ox1)
+                y1 = min(y1, oy1)
+                x2 = max(x2, ox2)
+                y2 = max(y2, oy2)
+                used[j] = True
+                changed = True
+            next_boxes.append((x1, y1, x2, y2))
+        merged = next_boxes
+
+    return merged
 
 
 def _sort_local_manga_order(
@@ -571,10 +744,31 @@ def _infer_unit_style(source_text: str, w: int, h: int) -> str:
     script_total, kana_count, kanji_count, punct_count = _script_profile(clean)
     char_count = len(clean)
     has_sentence_punct = any(c in clean for c in "。！？?!")
+    dialogue_markers = (
+        "して",
+        "ない",
+        "れる",
+        "られる",
+        "です",
+        "ます",
+        "たい",
+        "という",
+        "かも",
+        "から",
+        "まで",
+        "よう",
+        "する",
+        "した",
+    )
+    has_dialogue_marker = any(marker in clean for marker in dialogue_markers)
 
     # Short text without sentence punctuation is likely SFX
     if char_count <= 3:
         return "sfx"
+    if has_dialogue_marker and char_count >= 4:
+        return "dialogue"
+    if kanji_count >= 1 and kana_count >= 2 and char_count >= 4:
+        return "dialogue"
     if char_count <= 6 and not has_sentence_punct and kanji_count <= 1:
         return "sfx"
     return "dialogue"

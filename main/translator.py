@@ -52,6 +52,7 @@ Honorifics and culture:
 OCR quality handling:
 - OCR text may be noisy, fragmented, or partially garbled. Infer the most likely intended meaning and translate that.
 - If text is clearly just noise with no discernible meaning, translate to "..." (ellipsis).
+- Respect any inline hints like (style=dialogue, max_words=4, max_chars=18). Treat them as hard space constraints.
 
 Output format:
 - Output ONLY the translated English text. No notes, explanations, or commentary.
@@ -68,6 +69,7 @@ REPAIR_SYSTEM_PROMPT = """You are a manga translator. Fix the translation to con
 - English interjections for sounds (not romaji)
 - No untranslated Japanese/Chinese in output
 - No asterisks, markdown, or formatting
+- Respect any inline hints like (style=dialogue, max_words=4, max_chars=18) as hard limits
 - Output ONLY the translation text"""
 
 
@@ -117,7 +119,17 @@ def translate_texts(
     # Build the user message with numbered lines for batch translation
     numbered_lines = []
     for idx, (orig_idx, text) in enumerate(indexed_texts):
-        numbered_lines.append(f"[{idx + 1}] {text}")
+        constraint = (
+            constraints[orig_idx]
+            if constraints is not None and orig_idx < len(constraints)
+            else None
+        )
+        tag = _constraint_tag(constraint)
+        prefix = f"[{idx + 1}]"
+        if tag:
+            numbered_lines.append(f"{prefix} {tag} {text}")
+        else:
+            numbered_lines.append(f"{prefix} {text}")
 
     user_message = (
         f"Translate the following {lang_name} manga text to English. "
@@ -161,7 +173,17 @@ def translate_texts(
     if repair_candidates:
         repair_lines = []
         for i, (_, orig_idx, src_text) in enumerate(repair_candidates):
-            repair_lines.append(f"[{i + 1}] {src_text}")
+            constraint = (
+                constraints[orig_idx]
+                if constraints is not None and orig_idx < len(constraints)
+                else None
+            )
+            tag = _constraint_tag(constraint)
+            prefix = f"[{i + 1}]"
+            if tag:
+                repair_lines.append(f"{prefix} {tag} {src_text}")
+            else:
+                repair_lines.append(f"{prefix} {src_text}")
 
         repair_message = (
             f"Translate the following {lang_name} manga text to concise English. "
@@ -367,12 +389,40 @@ def _needs_repair_translation(
         return True
     if _is_romaji_sfx(tgt):
         return True
+    if _violates_constraint(tgt, constraint):
+        return True
     # Translations with geometric/replacement characters need repair
     if any(ord(c) in range(0x2500, 0x2600) or c in '□■▪▫▲△●○' for c in tgt):
         return True
     # Suspiciously short translation for long source text
     if len(src) >= 8 and len(tgt) <= 1:
         return True
+    return False
+
+
+def _violates_constraint(
+    translated: str,
+    constraint: TranslationConstraint | None,
+) -> bool:
+    """Return True when a translation obviously exceeds its bubble budget."""
+    if constraint is None:
+        return False
+
+    clean = " ".join(translated.split()).strip()
+    if not clean:
+        return False
+
+    if constraint.max_words is not None:
+        word_budget = max(1, int(constraint.max_words))
+        words = re.findall(r"[A-Za-z0-9']+", clean)
+        if len(words) > word_budget:
+            return True
+
+    if constraint.max_chars is not None:
+        char_budget = max(1, int(constraint.max_chars))
+        if len(clean) > char_budget:
+            return True
+
     return False
 
 
