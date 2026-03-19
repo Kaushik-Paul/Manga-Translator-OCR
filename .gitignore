@@ -714,3 +714,4 @@ pyrightconfig.json
 CLAUDE.md
 AGENTS.md
 /gradio_sdk.txt
+/.kiro/

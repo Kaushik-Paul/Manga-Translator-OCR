@@ -477,17 +477,25 @@ def render_text_on_image(
     text_padding = max(1, padding - 4) if text_style == "dialogue" else max(1, padding - 4)
     avail_w = box_w - 2 * text_padding
     avail_h = box_h - 2 * text_padding
-    box_clip_mask = _crop_clip_mask_to_box(
-        bubble_clip_mask_local=bubble_clip_mask_local,
-        region_x=x,
-        region_y=y,
-        region_w=w,
-        region_h=h,
-        box_x=box_x,
-        box_y=box_y,
-        box_w=box_w,
-        box_h=box_h,
-    )
+    # If the clip mask is already box-sized (from expanded bubble search),
+    # use it directly; otherwise crop from the region-local mask.
+    if (
+        bubble_clip_mask_local is not None
+        and bubble_clip_mask_local.shape[:2] == (box_h, box_w)
+    ):
+        box_clip_mask = bubble_clip_mask_local
+    else:
+        box_clip_mask = _crop_clip_mask_to_box(
+            bubble_clip_mask_local=bubble_clip_mask_local,
+            region_x=x,
+            region_y=y,
+            region_w=w,
+            region_h=h,
+            box_x=box_x,
+            box_y=box_y,
+            box_w=box_w,
+            box_h=box_h,
+        )
     if box_clip_mask is not None:
         effective_w = _effective_mask_text_width(box_clip_mask)
         if effective_w > 14:

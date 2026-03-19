@@ -358,16 +358,16 @@ class ComicTextDetector:
 
         regions: list[TextRegion] = []
         page_area = h * w
-        max_region_area = int(page_area * 0.10)
-        max_region_w = int(w * 0.45)
-        max_region_h = int(h * 0.45)
+        max_region_area = int(page_area * 0.06)
+        max_region_w = int(w * 0.35)
+        max_region_h = int(h * 0.35)
 
         for x1, y1, x2, y2 in merged_boxes:
             rx, ry = x1, y1
             rw = x2 - x1
             rh = y2 - y1
 
-            if (rw * rh) > 5000:
+            if (rw * rh) > 3000:
                 disconnected_boxes = self._split_disconnected_region(
                     mask=mask,
                     region_bbox=(rx, ry, rw, rh),
@@ -441,8 +441,24 @@ class ComicTextDetector:
             return []
 
         short_side = max(1, min(rw, rh))
-        close_size = _odd(max(3, int(round(short_side * 0.004))))
-        dilate_size = _odd(max(3, int(round(short_side * 0.006))))
+        region_area = rw * rh
+
+        # For very large regions, try centroid clustering first (same as
+        # _split_disconnected_region) since morphology tends to re-merge.
+        if region_area > 50_000:
+            clustered = self._split_by_centroid_clustering(
+                sub_mask, rx, ry, min_area, padding, page_w, page_h,
+            )
+            if len(clustered) >= 2:
+                return clustered
+
+        # Fallback: light morphology + merge-gap
+        if region_area > 50_000:
+            close_size = 3
+            dilate_size = 3
+        else:
+            close_size = _odd(max(3, int(round(short_side * 0.004))))
+            dilate_size = _odd(max(3, int(round(short_side * 0.006))))
 
         refined = cv2.morphologyEx(
             sub_mask,
@@ -478,7 +494,10 @@ class ComicTextDetector:
         if not boxes:
             return []
 
-        merge_gap = max(8, int(short_side * 0.05))
+        if region_area > 50_000:
+            merge_gap = max(3, int(short_side * 0.015))
+        else:
+            merge_gap = max(4, int(short_side * 0.03))
         return _merge_nearby_boxes(boxes, gap=merge_gap)
 
     def _make_region(
@@ -513,15 +532,31 @@ class ComicTextDetector:
     ) -> list[tuple[int, int, int, int]]:
         """
         Split medium/large regions that contain clearly disconnected text clusters.
+
+        For very large regions (area > 50 000) the standard morphological approach
+        tends to chain-merge scattered text blobs back into one box.  In that case
+        we fall back to connected-component analysis on the *raw* mask and cluster
+        components by centroid proximity, which preserves natural spatial gaps.
         """
         rx, ry, rw, rh = region_bbox
         sub_mask = mask[ry : ry + rh, rx : rx + rw]
         if cv2.countNonZero(sub_mask) == 0:
             return []
 
+        region_area = rw * rh
+
+        # ── Very large regions: centroid-clustering on raw connected components ──
+        if region_area > 50_000:
+            result = self._split_by_centroid_clustering(
+                sub_mask, rx, ry, min_area, padding, page_w, page_h,
+            )
+            if len(result) >= 2:
+                return result
+
+        # ── Standard path: light morphology + merge-gap ──
         short_side = max(1, min(rw, rh))
         close_size = _odd(max(3, int(round(short_side * 0.002))))
-        dilate_size = _odd(max(3, int(round(short_side * 0.004))))
+        dilate_size = _odd(max(3, int(round(short_side * 0.003))))
 
         refined = cv2.morphologyEx(
             sub_mask,
@@ -558,7 +593,8 @@ class ComicTextDetector:
         if len(boxes) < 2:
             return []
 
-        merged = _merge_nearby_boxes(boxes, gap=max(8, int(short_side * 0.04)))
+        # Use a tighter merge gap to avoid re-merging adjacent bubbles.
+        merged = _merge_nearby_boxes(boxes, gap=max(4, int(short_side * 0.02)))
         if len(merged) < 2:
             return []
 
@@ -567,9 +603,92 @@ class ComicTextDetector:
         if total_area > 0.0 and (max_area / total_area) > 0.82:
             return []
 
-        # If we found multiple disconnected clusters, split them unconditionally.
-        # No separation_threshold check — the contours being separate is enough.
         return merged
+
+    # ------------------------------------------------------------------
+    # Centroid-clustering split (for very large merged regions)
+    # ------------------------------------------------------------------
+    def _split_by_centroid_clustering(
+        self,
+        sub_mask: NDArray,
+        rx: int,
+        ry: int,
+        min_area: int,
+        padding: int,
+        page_w: int,
+        page_h: int,
+        cluster_dist: float = 50.0,
+    ) -> list[tuple[int, int, int, int]]:
+        """
+        Use connected components on the raw mask and group them by centroid
+        proximity.  Returns bounding boxes in page coordinates.
+        """
+        num_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(
+            sub_mask, connectivity=8,
+        )
+        min_sub_area = max(60, min_area // 3)
+
+        # Collect valid components ------------------------------------------------
+        comp_boxes: list[tuple[int, int, int, int]] = []  # (sx, sy, sw, sh) local
+        comp_centers: list[tuple[float, float]] = []
+        for i in range(1, num_labels):
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            sx = int(stats[i, cv2.CC_STAT_LEFT])
+            sy = int(stats[i, cv2.CC_STAT_TOP])
+            sw = int(stats[i, cv2.CC_STAT_WIDTH])
+            sh = int(stats[i, cv2.CC_STAT_HEIGHT])
+            if area < min_sub_area or sw < 8 or sh < 8:
+                continue
+            comp_boxes.append((sx, sy, sw, sh))
+            comp_centers.append((float(centroids[i][0]), float(centroids[i][1])))
+
+        if len(comp_boxes) < 2:
+            return []
+
+        # Union-find clustering by centroid distance ------------------------------
+        n = len(comp_boxes)
+        parent = list(range(n))
+
+        def _find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def _union(a: int, b: int) -> None:
+            ra, rb = _find(a), _find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = comp_centers[i][0] - comp_centers[j][0]
+                dy = comp_centers[i][1] - comp_centers[j][1]
+                if (dx * dx + dy * dy) < cluster_dist * cluster_dist:
+                    _union(i, j)
+
+        # Build cluster bounding boxes in page coordinates ------------------------
+        clusters: dict[int, list[int]] = {}
+        for i in range(n):
+            root = _find(i)
+            clusters.setdefault(root, []).append(i)
+
+        if len(clusters) < 2:
+            return []
+
+        result: list[tuple[int, int, int, int]] = []
+        for members in clusters.values():
+            xs1 = [comp_boxes[m][0] for m in members]
+            ys1 = [comp_boxes[m][1] for m in members]
+            xs2 = [comp_boxes[m][0] + comp_boxes[m][2] for m in members]
+            ys2 = [comp_boxes[m][1] + comp_boxes[m][3] for m in members]
+            x1 = max(0, rx + min(xs1) - padding)
+            y1 = max(0, ry + min(ys1) - padding)
+            x2 = min(page_w, rx + max(xs2) + padding)
+            y2 = min(page_h, ry + max(ys2) + padding)
+            result.append((x1, y1, x2, y2))
+
+        return result
 
     def _is_region_viable(self, region: TextRegion) -> bool:
         """Filter noisy tiny detections that are unlikely to be useful text regions."""
