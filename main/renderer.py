@@ -827,15 +827,7 @@ def _resolve_dialogue_box(
         max(1, w - 2 * inset),
         max(1, h - 2 * inset),
     )
-    fallback_box = _dialogue_fallback_box(
-        x=x,
-        y=y,
-        w=w,
-        h=h,
-        default_box=default_box,
-        region_mask=region_mask,
-        translated_text=translated_text,
-    )
+    fallback_box = default_box
 
     center_anchor = (w // 2, h // 2)
     mask_anchor = _mask_centroid(region_mask, w, h)
