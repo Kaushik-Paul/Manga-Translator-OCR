@@ -474,6 +474,7 @@ def _build_translation_constraint(unit: RenderTextUnit) -> TranslationConstraint
     render_region = unit.context_region or unit.region
     area = max(1, int(render_region.w * render_region.h))
     aspect = render_region.h / float(max(1, render_region.w))
+    rw = render_region.w
 
     if unit.style_hint == "sfx":
         max_chars = 12 if area < 12000 else 16
@@ -485,11 +486,20 @@ def _build_translation_constraint(unit: RenderTextUnit) -> TranslationConstraint
             max_chars=max_chars,
         )
 
+    # Very narrow regions (w < 60px) can only fit ~3-4 chars per line at min
+    # readable font size (12px). Cap aggressively to avoid tiny unreadable text.
+    if rw < 60:
+        return TranslationConstraint(style="dialogue", max_words=4, max_chars=18)
+    if rw < 80:
+        return TranslationConstraint(style="dialogue", max_words=5, max_chars=22)
+    if rw < 100:
+        return TranslationConstraint(style="dialogue", max_words=6, max_chars=26)
+
     max_words = 10
     max_chars = 48
     if aspect >= 1.75:
-        max_words = 5 if render_region.w < 120 or area < 24000 else 7
-        max_chars = 24 if render_region.w < 120 else 32
+        max_words = 5 if rw < 120 or area < 24000 else 7
+        max_chars = 24 if rw < 120 else 32
     elif aspect >= 1.35:
         max_words = 6 if area < 26000 else 8
         max_chars = 28 if area < 26000 else 36
