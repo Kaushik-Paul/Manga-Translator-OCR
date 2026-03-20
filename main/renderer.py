@@ -422,6 +422,7 @@ def render_text_on_image(
             maybe_dialogue
             or word_count >= 4
             or (word_count >= 2 and has_sentence_punct)
+            or (word_count >= 1 and has_sentence_punct and h > w * 1.2)
             or marker_like
         ):
             text_style = "dialogue"
@@ -558,6 +559,41 @@ def render_text_on_image(
         if (not bubble_used) and widest > int(avail_w * 1.12):
             return image
 
+    # Enforce minimum readable font size (12px) AND max line count (6) for dialogue.
+    # Run as a single combined loop so both constraints are satisfied together.
+    _DIALOGUE_MIN_SIZE = 12
+    _DIALOGUE_MAX_LINES = 6
+    if text_style == "dialogue" and lines:
+        current_size = getattr(font, "size", 99)
+        current_lines = len(lines)
+        needs_fix = current_size < _DIALOGUE_MIN_SIZE or current_lines > _DIALOGUE_MAX_LINES
+        if needs_fix:
+            words = text.split()
+            fixed = False
+            for max_w in range(len(words) - 1, 0, -1):
+                candidate = _compress_dialogue_for_tiny_box(text, max_words=max_w)
+                font2, lines2, spacing2 = _fit_text_to_box(
+                    draw=draw,
+                    text=candidate,
+                    max_w=avail_w,
+                    max_h=avail_h,
+                    font_path=font_file,
+                    style=text_style,
+                    min_size=_DIALOGUE_MIN_SIZE,
+                )
+                if lines2 and getattr(font2, "size", 0) >= _DIALOGUE_MIN_SIZE and len(lines2) <= _DIALOGUE_MAX_LINES:
+                    font, lines, line_spacing, text = font2, lines2, spacing2, candidate
+                    stroke_width = _stroke_width_for_font(font)
+                    logger.debug(
+                        "Dialogue constraints: truncated to %d words, size=%d lines=%d",
+                        max_w, font2.size, len(lines2),
+                    )
+                    fixed = True
+                    break
+            if not fixed:
+                # Can't satisfy both constraints — skip render entirely
+                return image
+
     # If dialogue still overflows into too many tiny lines, aggressively shorten.
     rendered_area = box_w * box_h
     if (
@@ -658,8 +694,11 @@ def render_text_on_image(
                         max_h=avail_h,
                         font_path=font_file,
                         style=text_style,
+                        min_size=_DIALOGUE_MIN_SIZE,
                     )
                     if not lines2:
+                        break
+                    if len(lines2) > _DIALOGUE_MAX_LINES or getattr(font2, "size", 0) < _DIALOGUE_MIN_SIZE:
                         break
                     font, lines, line_spacing = font2, lines2, line_spacing2
                     stroke_width = _stroke_width_for_font(font)
@@ -819,6 +858,15 @@ def _resolve_dialogue_box(
             if bubble_box is None:
                 continue
             bx, by, bw, bh = bubble_box
+            # Reject boxes that are suspiciously narrow — they indicate the estimator
+            # found only a partial bright region (e.g. Otsu cut off the bubble interior).
+            # In that case the fallback (full region) is more accurate.
+            if bw < int(w * 0.55) and bh >= int(h * 0.70):
+                logger.debug(
+                    "Rejecting narrow estimated bubble box %dx%d for region %dx%d",
+                    bw, bh, w, h,
+                )
+                continue
             bubble_mask = np.zeros((h, w), dtype=np.uint8)
             bubble_mask[by : by + bh, bx : bx + bw] = 255
             break
@@ -857,36 +905,12 @@ def _resolve_dialogue_box(
 
     # For longer dialogue, avoid overly tight boxes.
     if len(translated_text.strip()) >= 18:
-        min_long_w = max(min_w, int(w * 0.40))
+        min_long_w = max(min_w, int(w * 0.50))
         min_long_h = max(min_h, int(h * 0.38))
         if fit_w < min_long_w or fit_h < min_long_h:
             return (*fallback_box, False, None)
 
     return (x + x1, y + y1, fit_w, fit_h, True, bubble_render_mask)
-
-
-def _dialogue_fallback_box(
-    x: int,
-    y: int,
-    w: int,
-    h: int,
-    default_box: tuple[int, int, int, int],
-    region_mask: NDArray | None,
-    translated_text: str,
-) -> tuple[int, int, int, int]:
-    """
-    Fallback dialogue box when bubble detection is unreliable.
-
-    Uses a tighter mask-anchored region only if it is meaningfully smaller than
-    the merged region; otherwise keep the default region box.
-    """
-    # For dialogue, always prefer the default (full region with small inset)
-    # box.  The tight mask-anchored box from _resolve_sfx_box only covers the
-    # area around the original Japanese glyphs and is far too small for
-    # English dialogue — it produces tiny text in large bubbles.  The
-    # default_box approximates the bubble interior and lets the font-fitting
-    # algorithm choose a properly-sized font.
-    return default_box
 
 
 def _resolve_sfx_box(
@@ -1223,7 +1247,12 @@ def _estimate_bubble_box(
     region_image: NDArray,
     anchor: tuple[int, int],
 ) -> tuple[int, int, int, int] | None:
-    """Estimate speech-bubble bounds from bright connected components."""
+    """Estimate speech-bubble bounds from bright connected components.
+
+    Uses a fixed low threshold (120) instead of Otsu to avoid the common failure
+    where Otsu picks a threshold above the bubble interior brightness (~170),
+    splitting a valid bubble into a narrow partial component.
+    """
     if region_image.size == 0:
         return None
 
@@ -1233,66 +1262,71 @@ def _estimate_bubble_box(
     ax = int(np.clip(anchor[0], 0, max(0, region_w - 1)))
     ay = int(np.clip(anchor[1], 0, max(0, region_h - 1)))
 
-    _, bright = cv2.threshold(
-        blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
-
-    bright = cv2.morphologyEx(
-        bright,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
-        iterations=1,
-    )
-    bright = cv2.morphologyEx(
-        bright,
-        cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
-        iterations=1,
-    )
-
-    # Fast path: if anchor lies inside a plausible bright component, use it.
-    if bright[ay, ax] > 0:
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bright, connectivity=8)
-        label = int(labels[ay, ax])
-        if label > 0 and label < num_labels:
-            x, y, w, h, area = stats[label]
-            if (
-                area >= 600
-                and w >= 28
-                and h >= 24
-                and (w * h) < int(region_w * region_h * 0.92)
-            ):
-                return (int(x), int(y), int(w), int(h))
-
-    contours, _ = cv2.findContours(bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
+    # Use a fixed low threshold so typical bubble interiors (brightness ~150-220)
+    # are captured as bright. Otsu often picks ~180 which cuts off valid bubbles.
+    # Try multiple thresholds and pick the one whose component best covers the anchor.
     best_box: tuple[int, int, int, int] | None = None
     best_score = -1e9
 
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area < 700:
-            continue
+    for thresh in (100, 130, 160):
+        _, bright = cv2.threshold(blurred, thresh, 255, cv2.THRESH_BINARY)
 
-        x, y, w, h = cv2.boundingRect(contour)
-        if w < 26 or h < 22:
-            continue
+        bright = cv2.morphologyEx(
+            bright,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+            iterations=1,
+        )
+        bright = cv2.morphologyEx(
+            bright,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            iterations=1,
+        )
 
-        # Ignore near-full panel regions.
-        if (w * h) > int(region_w * region_h * 0.9):
-            continue
+        # Fast path: if anchor lies inside a plausible bright component, use it.
+        if bright[ay, ax] > 0:
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bright, connectivity=8)
+            label = int(labels[ay, ax])
+            if label > 0 and label < num_labels:
+                x, y, w, h, area = stats[label]
+                if (
+                    area >= 600
+                    and w >= 28
+                    and h >= 24
+                    and (w * h) < int(region_w * region_h * 0.98)
+                ):
+                    # Prefer boxes that cover more of the region width/height
+                    coverage = (w / region_w) + (h / region_h)
+                    if coverage > best_score:
+                        best_score = coverage
+                        best_box = (int(x), int(y), int(w), int(h))
+                    break  # anchor is inside — no need to try other thresholds
 
-        inside = cv2.pointPolygonTest(contour, (float(ax), float(ay)), False) >= 0
-        center_dist = abs((x + w // 2) - ax) + abs((y + h // 2) - ay)
-        score = area - center_dist * 1.6
-        if inside:
-            score += 4000
+        contours, _ = cv2.findContours(bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < 700:
+                continue
 
-        if score > best_score:
-            best_score = score
-            best_box = (x, y, w, h)
+            x, y, w, h = cv2.boundingRect(contour)
+            if w < 26 or h < 22:
+                continue
+
+            # Ignore near-full panel regions.
+            if (w * h) > int(region_w * region_h * 0.98):
+                continue
+
+            inside = cv2.pointPolygonTest(contour, (float(ax), float(ay)), False) >= 0
+            center_dist = abs((x + w // 2) - ax) + abs((y + h // 2) - ay)
+            coverage = (w / region_w) + (h / region_h)
+            score = coverage * 1000 - center_dist * 0.5
+            if inside:
+                score += 5000
+
+            if score > best_score:
+                best_score = score
+                best_box = (x, y, w, h)
 
     return best_box
 
@@ -1491,10 +1525,22 @@ def _should_skip_render_text(
 
 
 def _prefer_sfx_for_free_text(text: str, box_w: int, box_h: int) -> bool:
-    """Use SFX style for very short non-bubble snippets."""
+    """Use SFX style for very short non-bubble snippets.
+
+    Does NOT force SFX when the text has sentence punctuation (it's dialogue)
+    or when the box is tall relative to its width (vertical dialogue column).
+    """
     clean = " ".join(text.split())
     words = clean.split(" ") if clean else []
-    return len(words) <= 2
+    if len(words) > 2:
+        return False
+    # Keep as dialogue if it has sentence-ending punctuation
+    if any(c in clean for c in ".?!"):
+        return False
+    # Keep as dialogue if the box is a tall column (vertical speech bubble)
+    if box_h > box_w * 1.5:
+        return False
+    return True
 
 
 def _is_low_signal_dialogue_fragment(text: str) -> bool:
