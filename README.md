@@ -1,6 +1,6 @@
 # 🎌 Manga Translator OCR 🎌
 
-[![Hugging Face Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue)](https://huggingface.co/spaces/kaushikpaul/Manga-Translator-OCR)
+[![Hugging Face Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue)](http://projects.kaushikpaul.co.in/manga-ocr)
 [![Python Version](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![Gradio](https://img.shields.io/badge/UI-Gradio-orange)](https://gradio.app/)
 [![Modal](https://img.shields.io/badge/Acceleration-Modal-green)](https://modal.com/)
@@ -30,7 +30,7 @@ This project wouldn't be possible without the incredible work from the open-sour
 
 ## 🚀 Try It Live
 
-Don't want to install anything? **[Try the live demo on Hugging Face Spaces!](https://huggingface.co/spaces/kaushikpaul/Manga-Translator-OCR)**
+Don't want to install anything? **[Try the live demo on Hugging Face Spaces!](http://projects.kaushikpaul.co.in/manga-ocr)**
 
 ---
 
