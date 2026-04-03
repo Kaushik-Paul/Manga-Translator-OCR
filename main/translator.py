@@ -427,8 +427,7 @@ def _needs_repair_translation(
         return True
     if _is_romaji_sfx(tgt):
         return True
-    if _violates_constraint(tgt, constraint):
-        return True
+    # Constraint violations are NOT repair triggers — the renderer handles truncation.
     # Translations with geometric/replacement characters need repair
     if any(ord(c) in range(0x2500, 0x2600) or c in '□■▪▫▲△●○' for c in tgt):
         return True
