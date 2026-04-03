@@ -13,6 +13,7 @@ import logging
 import re
 from threading import BoundedSemaphore
 import time
+import uuid
 
 import httpx
 
@@ -93,6 +94,7 @@ def translate_texts(
     model: str | None = None,
     max_retries: int = 3,
     constraints: list[TranslationConstraint] | None = None,
+    session_id: str | None = None,
 ) -> list[str]:
     """
     Translate a batch of texts from Japanese/Chinese to English.
@@ -149,7 +151,7 @@ def translate_texts(
     translated_map: dict[int, str] = {}
     for attempt in range(max_retries):
         try:
-            response_text = _call_openrouter(model_name, user_message)
+            response_text = _call_openrouter(model_name, user_message, session_id=session_id)
             translated_map = _parse_numbered_response(response_text, len(indexed_texts))
             break
         except Exception as e:
@@ -209,6 +211,7 @@ def translate_texts(
                     model_name,
                     repair_message,
                     system_prompt=REPAIR_SYSTEM_PROMPT,
+                    session_id=session_id,
                 )
                 repaired_map = _parse_numbered_response(
                     repair_response, len(repair_candidates)
@@ -250,6 +253,7 @@ def _call_openrouter(
     model: str,
     user_message: str,
     system_prompt: str = SYSTEM_PROMPT,
+    session_id: str | None = None,
 ) -> str:
     """Make a single API call to OpenRouter."""
     headers = {
@@ -258,6 +262,8 @@ def _call_openrouter(
         "HTTP-Referer": "https://github.com/manga-translator-ocr",
         "X-Title": "Manga Translator OCR",
     }
+    if session_id:
+        headers["X-Session-Id"] = session_id
 
     payload = {
         "model": model,

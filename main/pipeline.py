@@ -22,6 +22,8 @@ from .ocr import get_ocr_engine
 from .renderer import detect_text_color, inpaint_text_region, render_text_on_image
 from .translator import TranslationConstraint, translate_texts
 
+import uuid
+
 logger = logging.getLogger(__name__)
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
 
@@ -47,6 +49,7 @@ def translate_page(
     image_path: str | Path,
     output_path: str | Path | None = None,
     config: Settings | None = None,
+    session_id: str | None = None,
 ) -> Path:
     """
     Translate a single manga page end-to-end.
@@ -170,6 +173,7 @@ def translate_page(
         source_lang=cfg.source_lang,
         model=cfg.translation_model,
         constraints=constraints,
+        session_id=session_id,
     )
     # Light sanitization: only block CJK leakage, let renderer handle sizing
     translated_texts = [
@@ -309,12 +313,14 @@ def translate_images(
 
     results: list[Path] = []
     tasks = list(enumerate(files, start=1))
+    job_session_id = str(uuid.uuid4())
+    logger.info("Translation job session ID: %s", job_session_id)
 
     def _translate_one(task: tuple[int, Path]) -> tuple[Path | None, Exception | None]:
         i, img_path = task
         logger.info("\n[%d/%d] Processing %s...", i, total, img_path.name)
         try:
-            out = translate_page(img_path, config=cfg)
+            out = translate_page(img_path, config=cfg, session_id=job_session_id)
             return out, None
         except Exception as e:
             return None, e
