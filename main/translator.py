@@ -107,6 +107,7 @@ def translate_texts(
         model: OpenRouter model to use. Defaults to settings.
         max_retries: Number of retries on failure.
         constraints: Optional per-line translation constraints.
+        session_id: OpenRouter session ID for grouping related requests. All API calls within a single translation job share the same session_id.
 
     Returns:
         List of translated English strings (same length as input).
@@ -255,7 +256,18 @@ def _call_openrouter(
     system_prompt: str = SYSTEM_PROMPT,
     session_id: str | None = None,
 ) -> str:
-    """Make a single API call to OpenRouter."""
+    """
+    Make a single API call to OpenRouter.
+
+    Args:
+        model: OpenRouter model identifier.
+        user_message: User prompt for the model.
+        system_prompt: System prompt for the model.
+        session_id: OpenRouter session ID sent as X-Session-Id header for request tracing.
+
+    Returns:
+        The model's response text.
+    """
     headers = {
         "Authorization": f"Bearer {settings.openrouter_api_key}",
         "Content-Type": "application/json",
