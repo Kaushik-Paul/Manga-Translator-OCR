@@ -58,6 +58,7 @@ def translate_page(
         image_path: Path to the input manga page image.
         output_path: Path to save the translated image. Auto-generated if None.
         config: Settings override. Uses global settings if None.
+        session_id: OpenRouter session ID to pass through to translation API calls.
 
     Returns:
         Path to the saved translated image.
