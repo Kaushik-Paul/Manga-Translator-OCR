@@ -417,6 +417,14 @@ def _needs_repair_translation(
     # Suspiciously short translation for long source text
     if len(src) >= 8 and len(tgt) <= 1:
         return True
+    # Generic safety net: if the translation is predominantly ASCII English
+    # (>60% ASCII letters) and has reasonable length, trust it even if other
+    # heuristics might have flagged it. This prevents false positives on
+    # valid translations that contain onomatopoeia, partial romaji, or
+    # unconventional phrasing.
+    ascii_letters = sum(1 for c in tgt if c.isascii() and c.isalpha())
+    if ascii_letters >= 3 and ascii_letters / max(len(tgt), 1) >= 0.4:
+        return False
     return False
 
 
