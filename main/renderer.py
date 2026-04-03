@@ -570,8 +570,16 @@ def render_text_on_image(
         if needs_fix:
             words = text.split()
             fixed = False
+            seen_candidates: set[str] = set()
+            best_candidate: str | None = None
+            best_font2 = None
+            best_lines2: list[str] | None = None
+            best_spacing2 = None
             for max_w in range(len(words) - 1, 0, -1):
                 candidate = _compress_dialogue_for_tiny_box(text, max_words=max_w)
+                if candidate in seen_candidates:
+                    continue
+                seen_candidates.add(candidate)
                 font2, lines2, spacing2 = _fit_text_to_box(
                     draw=draw,
                     text=candidate,
@@ -581,7 +589,19 @@ def render_text_on_image(
                     style=text_style,
                     min_size=_DIALOGUE_MIN_SIZE,
                 )
-                if lines2 and getattr(font2, "size", 0) >= _DIALOGUE_MIN_SIZE and len(lines2) <= _DIALOGUE_MAX_LINES:
+                if not lines2:
+                    continue
+                size2 = getattr(font2, "size", 0)
+                # Track the best candidate seen so far (largest font that fits line count)
+                if best_lines2 is None or (
+                    len(lines2) <= _DIALOGUE_MAX_LINES
+                    and (best_lines2 is None or size2 > getattr(best_font2, "size", 0))
+                ):
+                    best_candidate = candidate
+                    best_font2 = font2
+                    best_lines2 = lines2
+                    best_spacing2 = spacing2
+                if size2 >= _DIALOGUE_MIN_SIZE and len(lines2) <= _DIALOGUE_MAX_LINES:
                     font, lines, line_spacing, text = font2, lines2, spacing2, candidate
                     stroke_width = _stroke_width_for_font(font)
                     logger.debug(
@@ -591,8 +611,15 @@ def render_text_on_image(
                     fixed = True
                     break
             if not fixed:
-                # Can't satisfy both constraints — skip render entirely
-                return image
+                # Use the best candidate found even if it doesn't perfectly satisfy both
+                # constraints — better to render something than leave the bubble empty.
+                if best_candidate and best_lines2 and best_font2:
+                    font, lines, line_spacing, text = best_font2, best_lines2, best_spacing2, best_candidate
+                    stroke_width = _stroke_width_for_font(font)
+                    logger.debug(
+                        "Dialogue constraints: using best-effort candidate, size=%d lines=%d",
+                        getattr(font, "size", 0), len(lines),
+                    )
 
     # If dialogue still overflows into too many tiny lines, aggressively shorten.
     rendered_area = box_w * box_h
