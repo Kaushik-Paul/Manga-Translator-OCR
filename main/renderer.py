@@ -1457,9 +1457,10 @@ def _line_spacing_for_size(size: int, style: str) -> int:
 def _compress_dialogue_for_tiny_box(text: str, max_words: int) -> str:
     """Shorten long dialogue for very small render boxes.
 
-    Prefers cutting at a natural sentence boundary (., !, ?, ...) so the
-    result reads as a complete thought. Falls back to word-boundary truncation
-    only when no sentence end exists within the word budget.
+    Extends past max_words to find the next natural sentence boundary
+    (., !, ?, ...) so the result is always a complete sentence/phrase.
+    Falls back to word-boundary truncation with ellipsis only when no
+    sentence end exists in the remaining words.
     """
     clean = " ".join(text.replace("\r", " ").replace("\n", " ").split())
     if not clean:
@@ -1469,13 +1470,14 @@ def _compress_dialogue_for_tiny_box(text: str, max_words: int) -> str:
     if len(words) <= max_words:
         return clean
 
-    # Try to find the last sentence-ending word at or before max_words.
     _SENTENCE_END = re.compile(r"[.!?]$|^\.\.\.$")
-    for i in range(min(max_words, len(words)) - 1, -1, -1):
+
+    # Start from max_words and scan forward for the next sentence boundary.
+    for i in range(max_words - 1, len(words)):
         if _SENTENCE_END.search(words[i].rstrip()):
             return " ".join(words[: i + 1])
 
-    # No sentence boundary found — cut at max_words, strip trailing punctuation, add ellipsis.
+    # No sentence boundary found — cut at max_words with ellipsis.
     trimmed = " ".join(words[:max_words]).rstrip(".,;:!?")
     return f"{trimmed}..."
 
