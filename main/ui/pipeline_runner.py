@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import traceback
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -93,11 +94,13 @@ def run_translation_pipeline(
 
     translated_paths: list[Path] = []
     total = result.total
+    job_session_id = str(uuid.uuid4())
+    logger.info("Translation job session ID: %s", job_session_id)
 
     def _translate_one(idx_path: tuple[int, Path]) -> tuple[int, Path, Path | None, Exception | None]:
         i, local_path = idx_path
         try:
-            out = translate_page(local_path, config=translate_cfg)
+            out = translate_page(local_path, config=translate_cfg, session_id=job_session_id)
             return i, local_path, out, None
         except Exception as e:
             return i, local_path, None, e
@@ -139,7 +142,7 @@ def run_translation_pipeline(
             yield f"🔄 [{i}/{total}] Translating {image_name}..."
 
             try:
-                out = translate_page(local_path, config=translate_cfg)
+                out = translate_page(local_path, config=translate_cfg, session_id=job_session_id)
                 translated_paths.append(out)
                 result.succeeded += 1
                 yield (
