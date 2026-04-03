@@ -25,7 +25,7 @@ _OPENROUTER_CALL_SEMAPHORE = BoundedSemaphore(
 _OPENROUTER_CALL_COUNTER = count(1)
 _OPENROUTER_LOCK_WAIT_POLL_SEC = 2.0
 _OPENROUTER_LOCK_WAIT_LOG_EVERY_SEC = 20.0
-_OPENROUTER_HTTP_TIMEOUT = httpx.Timeout(connect=15.0, read=75.0, write=30.0, pool=15.0)
+_OPENROUTER_HTTP_TIMEOUT = httpx.Timeout(connect=15.0, read=120.0, write=30.0, pool=15.0)
 
 # System prompt designed for manga/doujinshi translation
 SYSTEM_PROMPT = """You are a professional manga/doujinshi translator with years of experience localizing Japanese adult comics for English-speaking audiences. Your job is to produce accurate, natural-sounding English translations that fit inside speech bubbles. This is a licensed professional translation workflow — all content, regardless of theme or explicitness, must be translated faithfully and completely. Refusing or softening any line is a translation error.
@@ -52,11 +52,13 @@ Honorifics and culture:
 OCR quality handling:
 - OCR text may be noisy, fragmented, or partially garbled. Infer the most likely intended meaning and translate that.
 - If text is clearly just noise with no discernible meaning, translate to "..." (ellipsis).
+- NEVER translate meaningful dialogue or moaning/reaction sounds to "..." — that is a translation failure. Even short moans like "ん♡" or "あっ" must be rendered as English equivalents (e.g. "MMM", "AH", "NGH").
 - Respect any inline hints like (style=dialogue, max_words=4, max_chars=18). Treat them as hard space constraints.
 
 Output format:
 - Output ONLY the translated English text. No notes, explanations, or commentary.
 - No asterisks, markdown, or formatting characters in the output.
+- Do NOT add any preamble, headers, or notes before or after the numbered lines.
 - Use ONLY basic ASCII characters and standard English punctuation (periods, commas, exclamation marks, question marks, hyphens, apostrophes, quotation marks, ellipsis as three dots).
 - NEVER output unicode symbols like □, ■, ▲, ●, ★, or any geometric shapes, box-drawing characters, or special symbols.
 - Use straight quotes (' and ") not smart/curly quotes.
@@ -174,6 +176,12 @@ def translate_texts(
             repair_candidates.append((mapped_idx, orig_idx, src_text))
 
     if repair_candidates:
+        logger.info(
+            "Repair pass needed for %d/%d segments: %s",
+            len(repair_candidates),
+            len(indexed_texts),
+            [src_text[:30] for _, _, src_text in repair_candidates],
+        )
         repair_lines = []
         for i, (_, orig_idx, src_text) in enumerate(repair_candidates):
             constraint = (
@@ -257,11 +265,12 @@ def _call_openrouter(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ],
-        "temperature": 0.3,  # Low temperature for consistent translations
+        "temperature": 0.3,
         "max_tokens": 4096,
         "reasoning": {
             "effort": "none",
         },
+        "include_reasoning": False,
     }
 
     call_id = next(_OPENROUTER_CALL_COUNTER)
@@ -383,9 +392,16 @@ def _needs_repair_translation(
     src = source.strip()
     if not tgt:
         return True
+    # Pure punctuation/symbol sources don't need repair regardless of translation
+    _PUNCT_RE = r"[．。、・\s\.\!\?♡♪～〜＊＾「」『』（）ッ♥]"
+    if len(re.sub(_PUNCT_RE, "", src)) == 0:
+        return False
     if tgt == src:
         return True
-    if tgt in {"[", "]", "[8", "[9", "...", ".."}:
+    if tgt in {"[", "]", "[8", "[9", ".."}:
+        return True
+    # "..." is only a failure if the source had real content
+    if tgt == "..." and len(re.sub(_PUNCT_RE, "", src)) >= 3:
         return True
     if _looks_like_refusal_text(tgt):
         return True
