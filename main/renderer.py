@@ -560,7 +560,9 @@ def render_text_on_image(
             return image
 
     # Enforce minimum readable font size (12px) AND max line count (6) for dialogue.
-    # Run as a single combined loop so both constraints are satisfied together.
+    # Strategy: first try to fit the FULL translated text at min_size=12 (allowing
+    # more lines if needed). Only truncate words if the full text truly cannot fit
+    # at a readable size — this preserves complete translations whenever possible.
     _DIALOGUE_MIN_SIZE = 12
     _DIALOGUE_MAX_LINES = 6
     if text_style == "dialogue" and lines:
@@ -568,58 +570,80 @@ def render_text_on_image(
         current_lines = len(lines)
         needs_fix = current_size < _DIALOGUE_MIN_SIZE or current_lines > _DIALOGUE_MAX_LINES
         if needs_fix:
-            words = text.split()
-            fixed = False
-            seen_candidates: set[str] = set()
-            best_candidate: str | None = None
-            best_font2 = None
-            best_lines2: list[str] | None = None
-            best_spacing2 = None
-            for max_w in range(len(words) - 1, 0, -1):
-                candidate = _compress_dialogue_for_tiny_box(text, max_words=max_w)
-                if candidate in seen_candidates:
-                    continue
-                seen_candidates.add(candidate)
-                font2, lines2, spacing2 = _fit_text_to_box(
-                    draw=draw,
-                    text=candidate,
-                    max_w=avail_w,
-                    max_h=avail_h,
-                    font_path=font_file,
-                    style=text_style,
-                    min_size=_DIALOGUE_MIN_SIZE,
+            # First: try fitting the full text at exactly min_size — no truncation yet.
+            font_full, lines_full, spacing_full = _fit_text_to_box(
+                draw=draw,
+                text=text,
+                max_w=avail_w,
+                max_h=avail_h,
+                font_path=font_file,
+                style=text_style,
+                min_size=_DIALOGUE_MIN_SIZE,
+                max_size=_DIALOGUE_MIN_SIZE,
+            )
+            if lines_full and getattr(font_full, "size", 0) >= _DIALOGUE_MIN_SIZE:
+                # Full text fits at min readable size — use it, skip truncation entirely.
+                font, lines, line_spacing = font_full, lines_full, spacing_full
+                stroke_width = _stroke_width_for_font(font)
+                logger.debug(
+                    "Dialogue constraints: full text fits at min size=%d, lines=%d (no truncation)",
+                    _DIALOGUE_MIN_SIZE, len(lines_full),
                 )
-                if not lines2:
-                    continue
-                size2 = getattr(font2, "size", 0)
-                # Track the best candidate seen so far (largest font that fits line count)
-                if best_lines2 is None or (
-                    len(lines2) <= _DIALOGUE_MAX_LINES
-                    and (best_lines2 is None or size2 > getattr(best_font2, "size", 0))
-                ):
-                    best_candidate = candidate
-                    best_font2 = font2
-                    best_lines2 = lines2
-                    best_spacing2 = spacing2
-                if size2 >= _DIALOGUE_MIN_SIZE and len(lines2) <= _DIALOGUE_MAX_LINES:
-                    font, lines, line_spacing, text = font2, lines2, spacing2, candidate
-                    stroke_width = _stroke_width_for_font(font)
-                    logger.debug(
-                        "Dialogue constraints: truncated to %d words, size=%d lines=%d",
-                        max_w, font2.size, len(lines2),
+                needs_fix = False
+            if needs_fix:
+                # Full text doesn't fit at min size — fall back to word truncation.
+                words = text.split()
+                fixed = False
+                seen_candidates: set[str] = set()
+                best_candidate: str | None = None
+                best_font2 = None
+                best_lines2: list[str] | None = None
+                best_spacing2 = None
+                for max_w in range(len(words) - 1, 0, -1):
+                    candidate = _compress_dialogue_for_tiny_box(text, max_words=max_w)
+                    if candidate in seen_candidates:
+                        continue
+                    seen_candidates.add(candidate)
+                    font2, lines2, spacing2 = _fit_text_to_box(
+                        draw=draw,
+                        text=candidate,
+                        max_w=avail_w,
+                        max_h=avail_h,
+                        font_path=font_file,
+                        style=text_style,
+                        min_size=_DIALOGUE_MIN_SIZE,
                     )
-                    fixed = True
-                    break
-            if not fixed:
-                # Use the best candidate found even if it doesn't perfectly satisfy both
-                # constraints — better to render something than leave the bubble empty.
-                if best_candidate and best_lines2 and best_font2:
-                    font, lines, line_spacing, text = best_font2, best_lines2, best_spacing2, best_candidate
-                    stroke_width = _stroke_width_for_font(font)
-                    logger.debug(
-                        "Dialogue constraints: using best-effort candidate, size=%d lines=%d",
-                        getattr(font, "size", 0), len(lines),
-                    )
+                    if not lines2:
+                        continue
+                    size2 = getattr(font2, "size", 0)
+                    # Track the best candidate seen so far (largest font that fits line count)
+                    if best_lines2 is None or (
+                        len(lines2) <= _DIALOGUE_MAX_LINES
+                        and (best_lines2 is None or size2 > getattr(best_font2, "size", 0))
+                    ):
+                        best_candidate = candidate
+                        best_font2 = font2
+                        best_lines2 = lines2
+                        best_spacing2 = spacing2
+                    if size2 >= _DIALOGUE_MIN_SIZE and len(lines2) <= _DIALOGUE_MAX_LINES:
+                        font, lines, line_spacing, text = font2, lines2, spacing2, candidate
+                        stroke_width = _stroke_width_for_font(font)
+                        logger.debug(
+                            "Dialogue constraints: truncated to %d words, size=%d lines=%d",
+                            max_w, font2.size, len(lines2),
+                        )
+                        fixed = True
+                        break
+                if not fixed:
+                    # Use the best candidate found even if it doesn't perfectly satisfy both
+                    # constraints — better to render something than leave the bubble empty.
+                    if best_candidate and best_lines2 and best_font2:
+                        font, lines, line_spacing, text = best_font2, best_lines2, best_spacing2, best_candidate
+                        stroke_width = _stroke_width_for_font(font)
+                        logger.debug(
+                            "Dialogue constraints: using best-effort candidate, size=%d lines=%d",
+                            getattr(font, "size", 0), len(lines),
+                        )
 
     # If dialogue still overflows into too many tiny lines, aggressively shorten.
     rendered_area = box_w * box_h
