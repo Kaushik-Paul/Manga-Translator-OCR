@@ -54,7 +54,7 @@ OCR quality handling:
 - OCR text may be noisy, fragmented, or partially garbled. Infer the most likely intended meaning and translate that.
 - If text is clearly just noise with no discernible meaning, translate to "..." (ellipsis).
 - NEVER translate meaningful dialogue or moaning/reaction sounds to "..." — that is a translation failure. Even short moans like "ん♡" or "あっ" must be rendered as English equivalents (e.g. "MMM", "AH", "NGH").
-- Respect any inline hints like (style=dialogue, max_words=4, max_chars=18). Treat them as hard space constraints.
+- Respect any inline hints like (style=dialogue, max_words=4, max_chars=18). These are soft space guidelines — prioritize a complete, natural-sounding translation first. Only shorten if the text is significantly over budget. Never cut meaning to hit an exact word count.
 
 Output format:
 - Output ONLY the translated English text. No notes, explanations, or commentary.
@@ -75,7 +75,7 @@ Rules:
 - Convert any sounds/SFX to English equivalents (not romaji)
 - No untranslated Japanese or Chinese characters in output
 - No asterisks, markdown, or formatting
-- Respect any inline hints like (style=dialogue, max_words=4, max_chars=18) as hard limits
+- Respect any inline hints like (style=dialogue, max_words=4, max_chars=18) as soft guidelines. Prioritize a complete, natural translation — only shorten significantly if the text is well over budget.
 - Output ONLY the translated text, one numbered line per input line in [N] format"""
 
 

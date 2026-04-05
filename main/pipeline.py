@@ -496,26 +496,28 @@ def _build_translation_constraint(unit: RenderTextUnit) -> TranslationConstraint
     # Very narrow regions (w < 60px) can only fit ~3-4 chars per line at min
     # readable font size (12px). Cap aggressively to avoid tiny unreadable text.
     if rw < 60:
-        return TranslationConstraint(style="dialogue", max_words=4, max_chars=18)
-    if rw < 80:
         return TranslationConstraint(style="dialogue", max_words=5, max_chars=22)
+    if rw < 80:
+        return TranslationConstraint(style="dialogue", max_words=7, max_chars=28)
     if rw < 100:
-        return TranslationConstraint(style="dialogue", max_words=6, max_chars=26)
+        return TranslationConstraint(style="dialogue", max_words=8, max_chars=34)
 
-    max_words = 10
-    max_chars = 48
+    # For normal-sized bubbles, use generous budgets — the renderer will handle
+    # fitting. Only constrain tightly for very tall/narrow or very small regions.
+    max_words = 14
+    max_chars = 60
     if aspect >= 1.75:
-        max_words = 5 if rw < 120 or area < 24000 else 7
-        max_chars = 24 if rw < 120 else 32
+        max_words = 8 if rw < 120 or area < 24000 else 10
+        max_chars = 32 if rw < 120 else 44
     elif aspect >= 1.35:
-        max_words = 6 if area < 26000 else 8
-        max_chars = 28 if area < 26000 else 36
+        max_words = 9 if area < 26000 else 12
+        max_chars = 38 if area < 26000 else 50
     elif area < 18000:
-        max_words = 7
-        max_chars = 32
+        max_words = 10
+        max_chars = 44
     elif area < 32000:
-        max_words = 8
-        max_chars = 40
+        max_words = 12
+        max_chars = 52
 
     return TranslationConstraint(
         style="dialogue",
