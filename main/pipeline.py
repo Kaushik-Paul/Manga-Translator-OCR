@@ -82,6 +82,7 @@ def translate_page(
     # 2. Detect text regions using ML model
     logger.info("Step 1/4: Detecting text regions (ML model)...")
     regions, text_mask = detect_text_regions(image)
+    regions = _merge_overlapping_detected_regions(regions, image, text_mask)
     logger.info("Found %d text regions.", len(regions))
 
     if not regions:
@@ -226,6 +227,17 @@ def translate_page(
     logger.info("Step 5/5: Inpainting and rendering translated text...")
     result = image.copy()
 
+    # Count how many renderable units each parent region has.
+    # If a parent has multiple renderable children (split-region case),
+    # we must NOT expand each sub-region to the full parent bubble —
+    # otherwise all sub-translations overlap in the same bubble.
+    parent_renderable_counts: dict[int, int] = {}
+    for unit, can_render in zip(units, renderable_unit_mask):
+        if can_render:
+            parent_renderable_counts[unit.parent_region_index] = (
+                parent_renderable_counts.get(unit.parent_region_index, 0) + 1
+            )
+
     # First pass: inpaint only regions that have at least one renderable translation.
     # This avoids blank bubbles/pages when translation output is empty or unusable.
     for region_idx in sorted(renderable_region_indices):
@@ -237,11 +249,17 @@ def translate_page(
     # Second pass: render translated text onto the cleaned image
     for unit, translated, can_render in zip(units, translated_texts, renderable_unit_mask):
         if can_render:
-            region = unit.context_region or unit.region
-            render_mask = _project_region_mask_into_context(
-                unit_region=unit.region,
-                context_region=region,
-            )
+            # If multiple renderable units share a parent, keep each in its own
+            # sub-region box to avoid overlapping translations in the same bubble.
+            if parent_renderable_counts.get(unit.parent_region_index, 0) > 1:
+                region = unit.region
+                render_mask = unit.region.mask
+            else:
+                region = unit.context_region or unit.region
+                render_mask = _project_region_mask_into_context(
+                    unit_region=unit.region,
+                    context_region=region,
+                )
             result = render_text_on_image(
                 result,
                 translated,
@@ -1041,3 +1059,78 @@ def _looks_like_romaji_noise(text: str) -> bool:
     if vowel_ending >= max(3, int(len(words) * 0.75)) and english_hits == 0:
         return True
     return False
+
+
+def _merge_overlapping_detected_regions(
+    regions: list[TextRegion],
+    image: np.ndarray,
+    text_mask: np.ndarray,
+) -> list[TextRegion]:
+    """Merge detected regions that overlap significantly (likely the same bubble)."""
+    if len(regions) < 2:
+        return regions
+
+    def _iou(a: TextRegion, b: TextRegion) -> float:
+        ax1, ay1, ax2, ay2 = a.x, a.y, a.x + a.w, a.y + a.h
+        bx1, by1, bx2, by2 = b.x, b.y, b.x + b.w, b.y + b.h
+        ix1, iy1, ix2, iy2 = max(ax1, bx1), max(ay1, by1), min(ax2, bx2), min(ay2, by2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+        inter = (ix2 - ix1) * (iy2 - iy1)
+        union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+        return inter / float(max(1, union))
+
+    def _contains_centroid(container: TextRegion, other: TextRegion) -> bool:
+        cx = other.x + other.w // 2
+        cy = other.y + other.h // 2
+        return (
+            container.x <= cx < container.x + container.w
+            and container.y <= cy < container.y + container.h
+        )
+
+    merged = regions.copy()
+    changed = True
+    while changed:
+        changed = False
+        next_regions: list[TextRegion] = []
+        used = [False] * len(merged)
+        for i, a in enumerate(merged):
+            if used[i]:
+                continue
+            used[i] = True
+            x1, y1, x2, y2 = a.x, a.y, a.x + a.w, a.y + a.h
+
+            for j in range(i + 1, len(merged)):
+                if used[j]:
+                    continue
+                b = merged[j]
+                iou = _iou(a, b)
+                should_merge = (
+                    iou > 0.20
+                    or (_contains_centroid(a, b) and iou > 0)
+                    or (_contains_centroid(b, a) and iou > 0)
+                )
+                if not should_merge:
+                    continue
+                x1, y1 = min(x1, b.x), min(y1, b.y)
+                x2, y2 = max(x2, b.x + b.w), max(y2, b.y + b.h)
+                used[j] = True
+                changed = True
+
+            nx, ny = max(0, x1), max(0, y1)
+            nx2 = min(image.shape[1], x2)
+            ny2 = min(image.shape[0], y2)
+            if nx2 > nx and ny2 > ny:
+                next_regions.append(
+                    TextRegion(
+                        x=nx,
+                        y=ny,
+                        w=nx2 - nx,
+                        h=ny2 - ny,
+                        cropped=image[ny:ny2, nx:nx2].copy(),
+                        mask=text_mask[ny:ny2, nx:nx2].copy(),
+                    )
+                )
+        merged = next_regions
+
+    return merged
