@@ -435,15 +435,38 @@ def render_text_on_image(
 
     region_slice = result[y : y + h, x : x + w]
 
+    # For very narrow tall regions (typical of vertical Japanese text in bubbles),
+    # expand the search area horizontally so bubble detection has a chance to find
+    # the actual bubble outline, which is usually wider than the text mask.
+    search_x, search_y, search_w, search_h = x, y, w, h
+    search_region_image = region_slice
+    search_region_mask = region_mask
+    if w < 90 and h > w * 2 and text_style == "dialogue":
+        pad_x = min(int(w * 0.7), 60)
+        sx1 = max(0, x - pad_x)
+        sx2 = min(result.shape[1], x + w + pad_x)
+        search_x, search_y = sx1, y
+        search_w, search_h = sx2 - sx1, h
+        search_region_image = result[search_y : search_y + search_h, search_x : search_x + search_w]
+        if region_mask is not None and region_mask.shape[:2] == (h, w):
+            padded_mask = np.zeros((search_h, search_w), dtype=np.uint8)
+            offset_x = x - search_x
+            padded_mask[:, offset_x : offset_x + w] = (
+                region_mask.astype(np.uint8) if region_mask.max() <= 1 else (region_mask > 0).astype(np.uint8) * 255
+            )
+            search_region_mask = padded_mask
+        else:
+            search_region_mask = None
+
     # Place text near the original glyph cluster inside the region when possible.
     # For longer dialogue, optionally expand toward the enclosing bubble shape.
     box_x, box_y, box_w, box_h, bubble_used, bubble_clip_mask_local = _resolve_text_box(
-        x=x,
-        y=y,
-        w=w,
-        h=h,
-        region_mask=region_mask,
-        region_image=region_slice,
+        x=search_x,
+        y=search_y,
+        w=search_w,
+        h=search_h,
+        region_mask=search_region_mask,
+        region_image=search_region_image,
         translated_text=text,
         text_style=text_style,
     )
@@ -489,10 +512,10 @@ def render_text_on_image(
     else:
         box_clip_mask = _crop_clip_mask_to_box(
             bubble_clip_mask_local=bubble_clip_mask_local,
-            region_x=x,
-            region_y=y,
-            region_w=w,
-            region_h=h,
+            region_x=search_x,
+            region_y=search_y,
+            region_w=search_w,
+            region_h=search_h,
             box_x=box_x,
             box_y=box_y,
             box_w=box_w,
@@ -501,10 +524,11 @@ def render_text_on_image(
     if box_clip_mask is not None:
         effective_w = _effective_mask_text_width(box_clip_mask)
         if effective_w > 14:
-            # Only narrow if the mask is meaningfully narrower than the box
+            # Only narrow if the mask is meaningfully narrower than the box.
+            # Use a relaxed threshold (0.80) so oval bubbles keep more width.
             mask_avail = max(10, effective_w - 2 * text_padding)
-            if mask_avail < avail_w * 0.92:
-                avail_w = int(max(avail_w * 0.92, mask_avail))
+            if mask_avail < avail_w * 0.80:
+                avail_w = int(max(avail_w * 0.80, mask_avail))
     if avail_w <= 10 or avail_h <= 10:
         return image
 
@@ -537,6 +561,7 @@ def render_text_on_image(
         max_h=avail_h,
         font_path=font_file,
         style=text_style,
+        min_size=10 if text_style == "sfx" else 12,
     )
     stroke_width = _stroke_width_for_font(font)
     if text_style == "sfx" and lines:
@@ -560,12 +585,15 @@ def render_text_on_image(
         if (not bubble_used) and widest > int(avail_w * 1.12):
             return image
 
-    # Enforce minimum readable font size (12px) AND max line count (6) for dialogue.
-    # Strategy: first try to fit the FULL translated text at min_size=12 (allowing
-    # more lines if needed). Only truncate words if the full text truly cannot fit
-    # at a readable size — this preserves complete translations whenever possible.
+    # Enforce minimum readable font size (12px) AND a dynamic max line count for dialogue.
+    # Tall narrow bubbles need more lines; cap based on available height.
     _DIALOGUE_MIN_SIZE = 12
-    _DIALOGUE_MAX_LINES = 6
+    if box_h > box_w * 3:
+        _DIALOGUE_MAX_LINES = 10
+    elif box_h > box_w * 2:
+        _DIALOGUE_MAX_LINES = 8
+    else:
+        _DIALOGUE_MAX_LINES = 6
     if text_style == "dialogue" and lines:
         current_size = getattr(font, "size", 99)
         current_lines = len(lines)
@@ -902,10 +930,10 @@ def _resolve_dialogue_box(
             if bubble_box is None:
                 continue
             bx, by, bw, bh = bubble_box
-            # Reject boxes that are suspiciously narrow — they indicate the estimator
-            # found only a partial bright region (e.g. Otsu cut off the bubble interior).
-            # In that case the fallback (full region) is more accurate.
-            if bw < int(w * 0.55) and bh >= int(h * 0.70):
+            # Reject boxes that are suspiciously narrow ONLY when the region is
+            # wide enough that a narrow result likely means Otsu cut off the bubble.
+            # For genuinely narrow bubbles in narrow regions, keep the estimate.
+            if bw < int(w * 0.40) and bh >= int(h * 0.70) and w >= 120:
                 logger.debug(
                     "Rejecting narrow estimated bubble box %dx%d for region %dx%d",
                     bw, bh, w, h,
@@ -1134,7 +1162,12 @@ def _extract_bubble_mask(
     comp_area = cv2.countNonZero(component)
     if comp_area < min_area:
         return None
-    if comp_area > int(h * w * 0.94):
+    # Reject near-full fills, but be less aggressive for narrow regions that
+    # are genuinely mostly bubble interior.
+    area_ratio = comp_area / float(max(1, h * w))
+    if area_ratio > 0.98:
+        return None
+    if area_ratio > 0.94 and min(h, w) < 80:
         return None
 
     # Very dark, huge fills are often panel/background leakage.
@@ -1312,7 +1345,7 @@ def _estimate_bubble_box(
     best_box: tuple[int, int, int, int] | None = None
     best_score = -1e9
 
-    for thresh in (100, 130, 160):
+    for thresh in (100, 130, 160, 190, 220):
         _, bright = cv2.threshold(blurred, thresh, 255, cv2.THRESH_BINARY)
 
         bright = cv2.morphologyEx(
@@ -1382,7 +1415,7 @@ def _fit_text_to_box(
     max_h: int,
     font_path: str | None,
     style: str = "dialogue",
-    min_size: int = 8,
+    min_size: int = 10,
     max_size: int = 200,
     max_size_cap: int | None = None,
 ) -> tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, list[str], int]:
@@ -1458,31 +1491,40 @@ def _fit_text_to_box(
         total_h = sum(heights) + (len(lines) - 1) * spacing
         return font, lines, spacing, max_line_w, total_h
 
-    # Binary search WITHOUT hyphenation — prefer smaller font over word breaks.
+    # Binary search WITHOUT hyphenation.
     lo, hi = min_size, max_size
-    best: tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, list[str], int] | None = None
+    best_no_hyphen: tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, list[str], int] | None = None
     while lo <= hi:
         mid = (lo + hi) // 2
         font, lines, spacing, used_w, used_h = _layout_at_size(mid, allow_hyphenation=False)
         if lines and used_w <= max_w and used_h <= max_h:
-            best = (font, lines, spacing)
+            best_no_hyphen = (font, lines, spacing)
             lo = mid + 1
         else:
             hi = mid - 1
 
-    if best is not None:
-        return best
-
-    # Binary search WITH hyphenation if the first pass failed.
+    # Binary search WITH hyphenation.
     lo, hi = min_size, max_size
+    best_hyphen: tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, list[str], int] | None = None
     while lo <= hi:
         mid = (lo + hi) // 2
         font, lines, spacing, used_w, used_h = _layout_at_size(mid, allow_hyphenation=True)
         if lines and used_w <= max_w and used_h <= max_h:
-            best = (font, lines, spacing)
+            best_hyphen = (font, lines, spacing)
             lo = mid + 1
         else:
             hi = mid - 1
+
+    # Prefer the result with the larger font size, even if it requires hyphenation.
+    best = best_no_hyphen
+    if best_hyphen is not None:
+        if best is None:
+            best = best_hyphen
+        else:
+            size_no_hyphen = getattr(best_no_hyphen[0], "size", 0)
+            size_hyphen = getattr(best_hyphen[0], "size", 0)
+            if size_hyphen > size_no_hyphen:
+                best = best_hyphen
 
     if best is not None:
         return best
@@ -1503,7 +1545,8 @@ def _line_spacing_for_size(size: int, style: str) -> int:
     if style == "sfx":
         return max(1, int(size * 0.08))
     # Comic fonts typically have generous built-in descent/ascent metrics.
-    return max(1, int(size * 0.08))
+    # Use slightly more spacing for dialogue to improve readability.
+    return max(1, int(size * 0.15))
 
 
 def _compress_dialogue_for_tiny_box(text: str, max_words: int) -> str:
@@ -1720,7 +1763,9 @@ def _effective_mask_text_width(mask: NDArray) -> int:
     widths = widths[widths > 0]
     if widths.size == 0:
         return 0
-    return int(np.percentile(widths, 45))
+    # Use 75th percentile instead of 45th to preserve more usable width,
+    # since text is centered and most lines sit in the wider middle of a bubble.
+    return int(np.percentile(widths, 75))
 
 
 def _mask_band_span(mask: NDArray, y: int, line_h: int, line_w: int) -> tuple[int, int, int] | None:
