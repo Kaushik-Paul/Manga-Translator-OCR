@@ -317,12 +317,16 @@ class ComicTextDetector:
         """Extract text regions from the binary mask, merging nearby text into blocks."""
         h, w = image.shape[:2]
 
-        # Merge nearby characters into dialogue-sized blocks with dynamic kernels.
-        # Fixed, very-large kernels tend to over-merge across nearby bubbles/panels.
+        # Merge nearby characters into dialogue-sized blocks.
+        # Japanese manga text in speech bubbles has characters spaced 15-40px apart
+        # (vertical columns). We need kernels large enough to bridge those gaps.
+        # Use ~2.5% of the short side for close/dilate, which gives ~50px on a
+        # typical 2000px manga page — enough to merge characters within a bubble
+        # without merging across separate bubbles (which are usually 80-120px apart).
         short_side = min(h, w)
-        close_size = _odd(max(5, int(round(short_side * 0.005))))
-        dilate_size = _odd(max(5, int(round(short_side * 0.005))))
-        close2_size = _odd(max(5, int(round(short_side * 0.005))))
+        close_size = _odd(max(25, int(round(short_side * 0.025))))
+        dilate_size = _odd(max(25, int(round(short_side * 0.025))))
+        close2_size = _odd(max(19, int(round(short_side * 0.018))))
 
         kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (close_size, close_size))
         cleaned = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
@@ -353,7 +357,9 @@ class ComicTextDetector:
                 continue
             candidate_boxes.append((rx, ry, rx + rw, ry + rh))
 
-        merge_gap = max(4, int(short_side * 0.003))
+        # Merge gap: use ~2.5% of short side so nearby bubbles/columns get merged
+        # but well-separated bubbles (80+ px apart) stay separate.
+        merge_gap = max(30, int(short_side * 0.025))
         merged_boxes = _merge_nearby_boxes(candidate_boxes, gap=merge_gap)
 
         regions: list[TextRegion] = []
@@ -367,7 +373,14 @@ class ComicTextDetector:
             rw = x2 - x1
             rh = y2 - y1
 
-            if (rw * rh) > 3000:
+            # Only attempt to split regions that are large enough to plausibly
+            # contain multiple distinct speech bubbles. The threshold is set high
+            # enough that a single tall vertical-text bubble (e.g. 100x600px =
+            # 60 000px²) is NOT split, while a region spanning two separate bubbles
+            # (typically 200 000px²+) will be examined.
+            # The old threshold of 3000 was far too low — it caused individual
+            # characters within a single bubble to be re-fragmented.
+            if (rw * rh) > 80_000:
                 disconnected_boxes = self._split_disconnected_region(
                     mask=mask,
                     region_bbox=(rx, ry, rw, rh),
@@ -617,7 +630,7 @@ class ComicTextDetector:
         padding: int,
         page_w: int,
         page_h: int,
-        cluster_dist: float = 50.0,
+        cluster_dist: float = 180.0,
     ) -> list[tuple[int, int, int, int]]:
         """
         Use connected components on the raw mask and group them by centroid
