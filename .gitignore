@@ -711,7 +711,5 @@ pyrightconfig.json
 # End of https://www.toptal.com/developers/gitignore/api/pycharm+all,linux,python,node,macos,visualstudiocode
 
 # Local AI briefing files (ignored from git)
-CLAUDE.md
-AGENTS.md
 /gradio_sdk.txt
 /.kiro/
