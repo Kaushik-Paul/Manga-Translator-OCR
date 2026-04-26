@@ -783,13 +783,17 @@ def _infer_unit_style(source_text: str, w: int, h: int) -> str:
     has_dialogue_marker = any(marker in clean for marker in dialogue_markers)
 
     # Short text without sentence punctuation is likely SFX
-    if char_count <= 3:
+    if char_count <= 2:
         return "sfx"
     if has_dialogue_marker and char_count >= 4:
         return "dialogue"
     if kanji_count >= 1 and kana_count >= 2 and char_count >= 4:
         return "dialogue"
-    if char_count <= 6 and not has_sentence_punct and kanji_count <= 1:
+    # Be more generous: if the region is tall (vertical text column) or has
+    # multiple kanji/kana, treat as dialogue even if short.
+    if char_count >= 3 and (kanji_count >= 1 or kana_count >= 2):
+        return "dialogue"
+    if char_count <= 5 and not has_sentence_punct and kanji_count <= 1 and kana_count <= 1:
         return "sfx"
     return "dialogue"
 

@@ -334,15 +334,16 @@ def inpaint_text_region(
                 gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
             )
 
-    # Dilate mask to cover text edges and anti-aliasing
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask = cv2.dilate(mask, kernel, iterations=2)
+    # Dilate mask to cover text edges, anti-aliasing, and surrounding halo
+    # Japanese text often has ink bleed that needs a larger dilation radius
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.dilate(mask, kernel, iterations=3)
 
     # Ensure mask is uint8
     mask = mask.astype(np.uint8)
 
     # Inpaint using Telea algorithm (better for text removal)
-    inpainted = cv2.inpaint(region, mask, inpaintRadius=7, flags=cv2.INPAINT_TELEA)
+    inpainted = cv2.inpaint(region, mask, inpaintRadius=10, flags=cv2.INPAINT_TELEA)
     result[y : y + h, x : x + w] = inpainted
 
     return result
