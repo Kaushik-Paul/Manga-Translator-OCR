@@ -438,11 +438,13 @@ def render_text_on_image(
     # For very narrow tall regions (typical of vertical Japanese text in bubbles),
     # expand the search area horizontally so bubble detection has a chance to find
     # the actual bubble outline, which is usually wider than the text mask.
+    # Keep the expansion conservative so nearby regions don't collide into the
+    # same bubble and produce overlapping translations.
     search_x, search_y, search_w, search_h = x, y, w, h
     search_region_image = region_slice
     search_region_mask = region_mask
-    if w < 90 and h > w * 2 and text_style == "dialogue":
-        pad_x = min(int(w * 0.7), 60)
+    if w < 70 and h > w * 2.5 and text_style == "dialogue":
+        pad_x = min(int(w * 0.4), 30)
         sx1 = max(0, x - pad_x)
         sx2 = min(result.shape[1], x + w + pad_x)
         search_x, search_y = sx1, y
