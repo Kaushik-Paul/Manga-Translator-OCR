@@ -1,5 +1,4 @@
 import os
-import shutil
 from huggingface_hub import HfApi
 
 # Configuration
@@ -13,28 +12,34 @@ GITIGNORE_PATH = os.path.join(PROJECT_ROOT, ".gitignore")
 
 FOLDERS_TO_UPLOAD = ["weights", "fonts"]
 
+
+def _read_gitignore() -> str | None:
+    if not os.path.exists(GITIGNORE_PATH):
+        return None
+
+    with open(GITIGNORE_PATH, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _gitignore_without_asset_rules(content: str) -> str:
+    lines = content.splitlines(keepends=True)
+    return "".join(
+        line
+        for line in lines
+        if "main/weights" not in line and "main/fonts" not in line
+    )
+
+
 def upload():
     api = HfApi()
-    
-    backup_path = GITIGNORE_PATH + ".bak"
-    if os.path.exists(GITIGNORE_PATH):
-        # 1. Backup local .gitignore
-        shutil.copy(GITIGNORE_PATH, backup_path)
-        
-        # 2. Modify local .gitignore to remove weights/fonts ignores
-        with open(GITIGNORE_PATH, "r") as f:
-            lines = f.readlines()
-            
-        with open(GITIGNORE_PATH, "w") as f:
-            for line in lines:
-                if "main/weights" in line or "main/fonts" in line:
-                    continue
-                f.write(line)
-        
-        # 3. Upload the permissive .gitignore to HF Space first
+
+    strict_gitignore = _read_gitignore()
+    if strict_gitignore is not None:
+        # 1. Upload a permissive remote .gitignore so asset uploads are allowed.
+        permissive_gitignore = _gitignore_without_asset_rules(strict_gitignore)
         print("🔓 Briefly updating .gitignore on Hugging Face to permit large files...")
         api.upload_file(
-            path_or_fileobj=GITIGNORE_PATH,
+            path_or_fileobj=permissive_gitignore.encode("utf-8"),
             path_in_repo=".gitignore",
             repo_id=REPO_ID,
             repo_type=REPO_TYPE,
@@ -90,10 +95,19 @@ def upload():
     except Exception as e:
         print(f"❌ Upload failed: {e}")
     finally:
-        # 5. Restore the strict .gitignore locally so git stays clean
-        if os.path.exists(backup_path):
-            shutil.move(backup_path, GITIGNORE_PATH)
-            print("🔒 Restored local .gitignore to protect your Git repository.")
+        # Restore the strict remote .gitignore so normal deploys stay lightweight.
+        if strict_gitignore is not None:
+            try:
+                print("🔒 Restoring remote .gitignore to protect normal deploys...")
+                api.upload_file(
+                    path_or_fileobj=strict_gitignore.encode("utf-8"),
+                    path_in_repo=".gitignore",
+                    repo_id=REPO_ID,
+                    repo_type=REPO_TYPE,
+                    commit_message="Restore asset ignore rules"
+                )
+            except Exception as e:
+                print(f"⚠️ Could not restore remote .gitignore: {e}")
             
     print(f"\n✨ View files at: https://huggingface.co/spaces/{REPO_ID}/tree/main")
 

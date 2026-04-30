@@ -172,6 +172,9 @@ Thumbs.db
 
 # Project specific
 .abstra/
+.codex
+.codex/
+.kilo/
 
 # Node.js
 node_modules/
@@ -258,6 +261,9 @@ temp_repo/**
 
 main/weights/**
 !main/weights/.gitkeep
+
+main/fonts/**
+!main/fonts/.gitkeep
 
 
 .DS_Store
