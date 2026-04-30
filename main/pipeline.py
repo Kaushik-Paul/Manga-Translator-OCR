@@ -270,6 +270,9 @@ def translate_page(
                 region_mask=render_mask,
                 style_hint=unit.style_hint,
                 text_color=unit.text_color,
+                allow_bubble_expansion=(
+                    parent_renderable_counts.get(unit.parent_region_index, 0) <= 1
+                ),
             )
 
     # 6. Save output
@@ -584,6 +587,10 @@ def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:
         return [region]
 
     merge_gap = max(8, int(min(region.w, region.h) * 0.06))
+    if region.h > region.w * 2.5:
+        # Tall regions often contain multiple vertical text columns in one bubble.
+        # Use a more generous merge gap so adjacent columns stay as one OCR unit.
+        merge_gap = max(merge_gap, int(max(region.w, region.h) * 0.05))
     merged_boxes = _merge_nearby_boxes(boxes, gap=merge_gap)
     merged_boxes = _merge_aligned_ocr_boxes(
         merged_boxes,
@@ -1088,6 +1095,22 @@ def _merge_overlapping_detected_regions(
             and container.y <= cy < container.y + container.h
         )
 
+    def _is_vertical_column(r: TextRegion) -> bool:
+        return r.h > r.w * 2.0 or (r.h > r.w * 1.5 and r.w < 200)
+
+    def _are_adjacent_columns(a: TextRegion, b: TextRegion) -> bool:
+        if not (_is_vertical_column(a) or _is_vertical_column(b)):
+            return False
+        h_gap = max(0, max(a.x, b.x) - min(a.x + a.w, b.x + b.w))
+        max_h_gap = max(12, int(min(a.w, b.w) * 0.50))
+        if h_gap > max_h_gap:
+            return False
+        y_overlap = max(0, min(a.y + a.h, b.y + b.h) - max(a.y, b.y))
+        min_h = min(a.h, b.h)
+        if y_overlap < int(min_h * 0.25):
+            return False
+        return True
+
     merged = regions.copy()
     changed = True
     while changed:
@@ -1109,6 +1132,7 @@ def _merge_overlapping_detected_regions(
                     iou > 0.20
                     or (_contains_centroid(a, b) and iou > 0)
                     or (_contains_centroid(b, a) and iou > 0)
+                    or _are_adjacent_columns(a, b)
                 )
                 if not should_merge:
                     continue

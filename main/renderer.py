@@ -361,6 +361,7 @@ def render_text_on_image(
     style_hint: str | None = None,
     padding: int = 4,
     text_color: tuple[int, int, int] | None = None,
+    allow_bubble_expansion: bool = True,
 ) -> NDArray:
     """
     Render translated text within a bounding box on the image.
@@ -443,7 +444,7 @@ def render_text_on_image(
     search_x, search_y, search_w, search_h = x, y, w, h
     search_region_image = region_slice
     search_region_mask = region_mask
-    if w < 70 and h > w * 2.5 and text_style == "dialogue":
+    if allow_bubble_expansion and w < 70 and h > w * 2.5 and text_style == "dialogue":
         pad_x = min(int(w * 0.4), 30)
         sx1 = max(0, x - pad_x)
         sx2 = min(result.shape[1], x + w + pad_x)
@@ -1545,10 +1546,10 @@ def _stroke_width_for_font(font: ImageFont.FreeTypeFont | ImageFont.ImageFont) -
 def _line_spacing_for_size(size: int, style: str) -> int:
     """Compute line spacing as a function of font size and text style."""
     if style == "sfx":
-        return max(1, int(size * 0.08))
-    # Comic fonts typically have generous built-in descent/ascent metrics.
-    # Use slightly more spacing for dialogue to improve readability.
-    return max(1, int(size * 0.15))
+        return max(2, int(size * 0.12))
+    # Comic fonts have generous ascenders/descenders and strokes can bleed
+    # 1-2px beyond textbbox. Use spacing that guarantees no overlap.
+    return max(4, int(size * 0.25))
 
 
 def _compress_dialogue_for_tiny_box(text: str, max_words: int) -> str:
