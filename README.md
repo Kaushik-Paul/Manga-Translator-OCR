@@ -1,3 +1,10 @@
+---
+title: Manga-Translator-OCR_Copy
+app_file: main/app.py
+sdk: gradio
+sdk_version: 6.6.0
+---
+
 # 🎌 Manga Translator OCR 🎌
 
 [![Hugging Face Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue)](http://projects.kaushikpaul.co.in/manga-ocr)
@@ -124,20 +131,24 @@ If you want to speed up inference by offloading the heavy OCR and Detection work
 
 ### Deploying to Hugging Face (Gradio Spaces)
 
-To host the app completely on Hugging Face Spaces, we use the `gradio deploy` command:
+To host the app completely on Hugging Face Spaces, use the bundled deploy helper instead of `gradio deploy`. It uses the Hugging Face API directly and respects Git's ignore rules, so local folders like `.venv/`, `output/`, `manga_testing/`, `temp_repo/`, `main/weights/`, and `main/fonts/` are not uploaded accidentally.
 
-1. **Deploy using Gradio CLI**:
+1. **Deploy using the safe project command**:
    Ensure your Hugging Face CLI is authenticated and run:
 
    ```bash
-   uv run gradio deploy
+   uv run python -m main.scripts.deploy_space --repo-id kaushikpaul/Manga-Translator-OCR
    ```
 
-   Follow the interactive prompts to automatically create and deploy your application to a new or existing Hugging Face Space.
+   You can preview the exact upload set first:
+
+   ```bash
+   uv run python -m main.scripts.deploy_space --dry-run
+   ```
 
 2. **Configure Secrets**: In your new HF Space's settings tab, specify your environment variables (like `OPENROUTER_API_KEY`, etc.).
 
-3. **Upload Heavy Assets**: Since `weights` and `fonts` are in `.gitignore`, `gradio deploy` will not push them. Once your Space is live, use our bundled upload script to sync these heavy assets automatically up to HF without straining your Git history.
+3. **Upload Heavy Assets**: Since `weights` and `fonts` are intentionally skipped by the safe deploy command, use our bundled upload script to sync these heavy assets automatically up to HF without straining your Git history.
 
    Ensure your Hugging Face CLI is authenticated, edit `main/scripts/upload_assets.py` to match your Space's `REPO_ID`, and then run:
 
