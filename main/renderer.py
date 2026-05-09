@@ -44,8 +44,8 @@ _SFX_FONT_SEARCH_PATHS = _font_paths(
 )
 
 _NARROW_DIALOGUE_FONT_SEARCH_PATHS = _font_paths(
-    "animeace2.otf",
     "CCWildWordsRoman.ttf",
+    "animeace2.otf",
 )
 
 _CJK_DIALOGUE_FONT_SEARCH_PATHS = _font_paths(
@@ -444,8 +444,8 @@ def render_text_on_image(
     search_x, search_y, search_w, search_h = x, y, w, h
     search_region_image = region_slice
     search_region_mask = region_mask
-    if allow_bubble_expansion and w < 70 and h > w * 2.5 and text_style == "dialogue":
-        pad_x = min(int(w * 0.4), 30)
+    if allow_bubble_expansion and w < 80 and h > w * 1.5 and text_style == "dialogue":
+        pad_x = min(max(int(w * 0.55), 20), 40)
         sx1 = max(0, x - pad_x)
         sx2 = min(result.shape[1], x + w + pad_x)
         search_x, search_y = sx1, y
@@ -980,7 +980,8 @@ def _resolve_dialogue_box(
 
     # For longer dialogue, avoid overly tight boxes.
     if len(translated_text.strip()) >= 18:
-        min_long_w = max(min_w, int(w * 0.50))
+        min_long_w_ratio = 0.70 if w < 120 else 0.50
+        min_long_w = max(min_w, int(w * min_long_w_ratio))
         min_long_h = max(min_h, int(h * 0.38))
         if fit_w < min_long_w or fit_h < min_long_h:
             return (*fallback_box, False, None)
@@ -1455,6 +1456,8 @@ def _fit_text_to_box(
     def _layout_at_size(
         size: int,
         allow_hyphenation: bool = False,
+        allow_char_wrap: bool = False,
+        width_slack: int = 0,
     ) -> tuple[
         ImageFont.FreeTypeFont | ImageFont.ImageFont,
         list[str],
@@ -1464,12 +1467,13 @@ def _fit_text_to_box(
     ]:
         stroke_width = max(1, size // 12)
         font = _load_font(size)
+        wrap_w = max_w + max(0, int(width_slack))
         lines = _wrap_text(
             draw,
             text,
             font,
-            max_w,
-            allow_char_wrap=False,
+            wrap_w,
+            allow_char_wrap=allow_char_wrap,
             allow_hyphenation=allow_hyphenation,
             stroke_width=stroke_width,
         )
@@ -1494,13 +1498,19 @@ def _fit_text_to_box(
         total_h = sum(heights) + (len(lines) - 1) * spacing
         return font, lines, spacing, max_line_w, total_h
 
-    # Binary search WITHOUT hyphenation.
+    # Binary search WITHOUT hyphenation. Dialogue gets a tiny slack allowance
+    # so one slightly wide word does not become an ugly hyphenated split.
+    no_hyphen_width_slack = max(2, int(max_w * 0.05)) if style == "dialogue" else 0
     lo, hi = min_size, max_size
     best_no_hyphen: tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, list[str], int] | None = None
     while lo <= hi:
         mid = (lo + hi) // 2
-        font, lines, spacing, used_w, used_h = _layout_at_size(mid, allow_hyphenation=False)
-        if lines and used_w <= max_w and used_h <= max_h:
+        font, lines, spacing, used_w, used_h = _layout_at_size(
+            mid,
+            allow_hyphenation=False,
+            width_slack=no_hyphen_width_slack,
+        )
+        if lines and used_w <= max_w + no_hyphen_width_slack and used_h <= max_h:
             best_no_hyphen = (font, lines, spacing)
             lo = mid + 1
         else:
@@ -1518,7 +1528,9 @@ def _fit_text_to_box(
         else:
             hi = mid - 1
 
-    # Prefer the result with the larger font size, even if it requires hyphenation.
+    # Prefer natural word-boundary wrapping. Hyphenation is useful as a rescue
+    # path for genuinely tight boxes, but choosing it for every small font-size
+    # gain makes dialogue choppy and hard to read.
     best = best_no_hyphen
     if best_hyphen is not None:
         if best is None:
@@ -1526,15 +1538,76 @@ def _fit_text_to_box(
         else:
             size_no_hyphen = getattr(best_no_hyphen[0], "size", 0)
             size_hyphen = getattr(best_hyphen[0], "size", 0)
-            if size_hyphen > size_no_hyphen:
+            if _should_prefer_hyphenated_layout(
+                style=style,
+                no_hyphen_size=size_no_hyphen,
+                no_hyphen_lines=best_no_hyphen[1],
+                hyphen_size=size_hyphen,
+                hyphen_lines=best_hyphen[1],
+            ):
                 best = best_hyphen
 
     if best is not None:
         return best
 
-    # Fallback to minimum size WITH hyphenation as last resort.
-    font, lines, spacing, _, _ = _layout_at_size(min_size, allow_hyphenation=True)
+    # Fallback to minimum size with character wrapping but without inserted
+    # hyphens. This keeps impossible tiny boxes from going blank while avoiding
+    # the most distracting visual artifact.
+    font, lines, spacing, _, _ = _layout_at_size(
+        min_size,
+        allow_hyphenation=False,
+        allow_char_wrap=True,
+        width_slack=no_hyphen_width_slack,
+    )
+    if lines:
+        return font, lines, spacing
+
+    # Absolute last resort: allow both hyphenation and character wrapping.
+    font, lines, spacing, _, _ = _layout_at_size(
+        min_size,
+        allow_hyphenation=True,
+        allow_char_wrap=True,
+    )
     return font, lines, spacing
+
+
+def _should_prefer_hyphenated_layout(
+    *,
+    style: str,
+    no_hyphen_size: int,
+    no_hyphen_lines: list[str],
+    hyphen_size: int,
+    hyphen_lines: list[str],
+) -> bool:
+    """Return True when hyphenation buys enough readability to be worth it."""
+    if hyphen_size <= no_hyphen_size:
+        return False
+
+    inserted_breaks = _hyphenated_line_break_count(hyphen_lines)
+    if inserted_breaks == 0:
+        return True
+
+    if style != "dialogue":
+        return inserted_breaks <= 1 and hyphen_size >= no_hyphen_size + 4
+
+    size_gain = hyphen_size - no_hyphen_size
+    large_gain = size_gain >= max(6, int(no_hyphen_size * 0.45))
+    line_gain = len(hyphen_lines) < len(no_hyphen_lines)
+
+    return inserted_breaks <= 1 and large_gain and line_gain
+
+
+def _hyphenated_line_break_count(lines: list[str]) -> int:
+    """Count likely renderer-inserted word breaks across adjacent lines."""
+    count = 0
+    for current, following in zip(lines, lines[1:]):
+        left = current.rstrip()
+        right = following.lstrip()
+        if not left.endswith("-") or not right:
+            continue
+        if re.search(r"[A-Za-z]-$", left) and right[0].isalpha():
+            count += 1
+    return count
 
 
 def _stroke_width_for_font(font: ImageFont.FreeTypeFont | ImageFont.ImageFont) -> int:
@@ -2075,7 +2148,7 @@ def _hyphenate_word(word: str) -> list[str]:
     """
     clean = word.rstrip(".,;:!?-_'\"")
     suffix = word[len(clean):]
-    if len(clean) < 4:
+    if len(clean) < 8:
         return [word]
 
     # Common English break patterns (ordered by preference — try longest
