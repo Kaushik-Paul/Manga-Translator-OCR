@@ -163,6 +163,13 @@ def translate_page(
         _save_image(out, image)
         return out
 
+    _assign_render_context_regions(
+        units=units,
+        parent_regions=regions,
+        image=image,
+        text_mask=text_mask,
+    )
+
     # 4. Translate
     logger.info("Step 3/4: Translating %d text segments...", len(units))
     source_texts = [unit.source_text for unit in units]
@@ -238,10 +245,57 @@ def translate_page(
                 parent_renderable_counts.get(unit.parent_region_index, 0) + 1
             )
 
-    # First pass: inpaint only regions that have at least one renderable translation.
-    # This avoids blank bubbles/pages when translation output is empty or unusable.
+    # First pass: inpaint only text that has a renderable replacement.
+    # For split parents, do not erase skipped siblings (usually SFX/noise).
     for region_idx in sorted(renderable_region_indices):
         region = regions[region_idx]
+        if parent_renderable_counts.get(region_idx, 0) > 1:
+            combined_mask = np.zeros((region.h, region.w), dtype=np.uint8)
+            for unit, can_render in zip(units, renderable_unit_mask):
+                if unit.parent_region_index != region_idx:
+                    continue
+                should_inpaint = can_render or (
+                    _context_region_has_bright_bubble(unit.context_region or unit.region)
+                )
+                if not should_inpaint:
+                    continue
+                if unit.region.mask is None:
+                    continue
+                if unit.region.mask.shape[:2] != (unit.region.h, unit.region.w):
+                    continue
+                offset_x = unit.region.x - region.x
+                offset_y = unit.region.y - region.y
+                if offset_x < 0 or offset_y < 0:
+                    continue
+                if offset_x + unit.region.w > region.w:
+                    continue
+                if offset_y + unit.region.h > region.h:
+                    continue
+                mask = unit.region.mask.astype(np.uint8)
+                if mask.max() <= 1:
+                    mask = (mask > 0).astype(np.uint8) * 255
+                combined_mask[
+                    offset_y : offset_y + unit.region.h,
+                    offset_x : offset_x + unit.region.w,
+                ] = np.maximum(
+                    combined_mask[
+                        offset_y : offset_y + unit.region.h,
+                        offset_x : offset_x + unit.region.w,
+                    ],
+                    mask,
+                )
+            if cv2.countNonZero(combined_mask) == 0:
+                continue
+            result = inpaint_text_region(
+                result,
+                region.x,
+                region.y,
+                region.w,
+                region.h,
+                combined_mask,
+            )
+            continue
+
         result = inpaint_text_region(
             result, region.x, region.y, region.w, region.h, region.mask
         )
@@ -250,10 +304,15 @@ def translate_page(
     for unit, translated, can_render in zip(units, translated_texts, renderable_unit_mask):
         if can_render:
             # If multiple renderable units share a parent, keep each in its own
-            # sub-region box to avoid overlapping translations in the same bubble.
+            # local render context to avoid overlapping translations in adjacent
+            # bubbles/SFX while still giving the renderer enough surrounding
+            # pixels to find the bubble outline.
             if parent_renderable_counts.get(unit.parent_region_index, 0) > 1:
-                region = unit.region
-                render_mask = unit.region.mask
+                region = unit.context_region or unit.region
+                render_mask = _project_region_mask_into_context(
+                    unit_region=unit.region,
+                    context_region=region,
+                )
             else:
                 region = unit.context_region or unit.region
                 render_mask = _project_region_mask_into_context(
@@ -270,9 +329,7 @@ def translate_page(
                 region_mask=render_mask,
                 style_hint=unit.style_hint,
                 text_color=unit.text_color,
-                allow_bubble_expansion=(
-                    parent_renderable_counts.get(unit.parent_region_index, 0) <= 1
-                ),
+                allow_bubble_expansion=True,
             )
 
     # 6. Save output
@@ -497,6 +554,173 @@ def _project_region_mask_into_context(
     return projected
 
 
+def _assign_render_context_regions(
+    units: list[RenderTextUnit],
+    parent_regions: list[TextRegion],
+    image: np.ndarray,
+    text_mask: np.ndarray,
+) -> None:
+    """Assign bubble-sized render contexts without sharing one huge parent box."""
+    if not units:
+        return
+
+    units_by_parent: dict[int, list[RenderTextUnit]] = {}
+    for unit in units:
+        units_by_parent.setdefault(unit.parent_region_index, []).append(unit)
+
+    for parent_idx, sibling_units in units_by_parent.items():
+        if parent_idx < 0 or parent_idx >= len(parent_regions):
+            continue
+        parent_region = parent_regions[parent_idx]
+
+        if len(sibling_units) <= 1:
+            unit = sibling_units[0]
+            selected = _select_render_context_region(
+                unit_region=unit.region,
+                parent_region=parent_region,
+                style_hint=unit.style_hint,
+            )
+            if unit.style_hint == "dialogue":
+                selected = _expand_single_dialogue_context_region(
+                    selected,
+                    image=image,
+                    text_mask=text_mask,
+                )
+            unit.context_region = selected
+            continue
+
+        sibling_regions = [unit.region for unit in sibling_units]
+        for unit in sibling_units:
+            unit.context_region = _build_local_render_context_region(
+                unit_region=unit.region,
+                parent_region=parent_region,
+                sibling_regions=sibling_regions,
+                image=image,
+                text_mask=text_mask,
+            )
+
+
+def _expand_single_dialogue_context_region(
+    region: TextRegion,
+    image: np.ndarray,
+    text_mask: np.ndarray,
+) -> TextRegion:
+    """Give isolated dialogue enough surrounding pixels to find its balloon."""
+    img_h, img_w = image.shape[:2]
+    pad_x = min(120, max(22, int(region.w * 0.85), int(region.h * 0.28)))
+    pad_y = min(110, max(20, int(region.h * 0.34), int(region.w * 0.22)))
+    x1 = max(0, region.x - pad_x)
+    y1 = max(0, region.y - pad_y)
+    x2 = min(img_w, region.x + region.w + pad_x)
+    y2 = min(img_h, region.y + region.h + pad_y)
+    if x1 == region.x and y1 == region.y and x2 == region.x + region.w and y2 == region.y + region.h:
+        return region
+
+    return TextRegion(
+        x=x1,
+        y=y1,
+        w=x2 - x1,
+        h=y2 - y1,
+        cropped=image[y1:y2, x1:x2].copy(),
+        mask=text_mask[y1:y2, x1:x2].copy(),
+    )
+
+
+def _build_local_render_context_region(
+    unit_region: TextRegion,
+    parent_region: TextRegion,
+    sibling_regions: list[TextRegion],
+    image: np.ndarray,
+    text_mask: np.ndarray,
+) -> TextRegion:
+    """Expand a split OCR unit into a local, sibling-aware render context."""
+    img_h, img_w = image.shape[:2]
+    parent_x1 = max(0, parent_region.x)
+    parent_y1 = max(0, parent_region.y)
+    parent_x2 = min(img_w, parent_region.x + parent_region.w)
+    parent_y2 = min(img_h, parent_region.y + parent_region.h)
+
+    ux1 = unit_region.x
+    uy1 = unit_region.y
+    ux2 = unit_region.x + unit_region.w
+    uy2 = unit_region.y + unit_region.h
+    ucx = (ux1 + ux2) * 0.5
+    ucy = (uy1 + uy2) * 0.5
+
+    expand_x = max(14, int(unit_region.w * 0.85), int(parent_region.w * 0.04))
+    expand_y = max(14, int(unit_region.h * 0.55), int(parent_region.h * 0.04))
+    if unit_region.h > unit_region.w * 1.45:
+        expand_x = max(expand_x, min(90, int(unit_region.h * 0.20)))
+    if unit_region.w > unit_region.h * 1.8:
+        expand_y = max(expand_y, min(70, int(unit_region.w * 0.16)))
+
+    x1 = max(parent_x1, ux1 - expand_x)
+    y1 = max(parent_y1, uy1 - expand_y)
+    x2 = min(parent_x2, ux2 + expand_x)
+    y2 = min(parent_y2, uy2 + expand_y)
+
+    left_limit = parent_x1
+    right_limit = parent_x2
+    top_limit = parent_y1
+    bottom_limit = parent_y2
+    for sibling in sibling_regions:
+        if sibling is unit_region:
+            continue
+
+        sx1 = sibling.x
+        sy1 = sibling.y
+        sx2 = sibling.x + sibling.w
+        sy2 = sibling.y + sibling.h
+        scx = (sx1 + sx2) * 0.5
+        scy = (sy1 + sy2) * 0.5
+
+        y_overlap = max(0, min(uy2, sy2) - max(uy1, sy1))
+        x_overlap = max(0, min(ux2, sx2) - max(ux1, sx1))
+        if y_overlap >= max(8, int(min(unit_region.h, sibling.h) * 0.18)):
+            boundary = int(round((ucx + scx) * 0.5))
+            if scx < ucx:
+                left_limit = max(left_limit, boundary)
+            elif scx > ucx:
+                right_limit = min(right_limit, boundary)
+
+        if x_overlap >= max(8, int(min(unit_region.w, sibling.w) * 0.18)):
+            boundary = int(round((ucy + scy) * 0.5))
+            if scy < ucy:
+                top_limit = max(top_limit, boundary)
+            elif scy > ucy:
+                bottom_limit = min(bottom_limit, boundary)
+
+    x1 = max(x1, left_limit)
+    x2 = min(x2, right_limit)
+    y1 = max(y1, top_limit)
+    y2 = min(y2, bottom_limit)
+
+    min_w = min(parent_region.w, max(unit_region.w + 8, 28))
+    min_h = min(parent_region.h, max(unit_region.h + 8, 24))
+    if (x2 - x1) < min_w:
+        half = min_w // 2
+        x1 = max(parent_x1, int(round(ucx)) - half)
+        x2 = min(parent_x2, x1 + min_w)
+        x1 = max(parent_x1, x2 - min_w)
+    if (y2 - y1) < min_h:
+        half = min_h // 2
+        y1 = max(parent_y1, int(round(ucy)) - half)
+        y2 = min(parent_y2, y1 + min_h)
+        y1 = max(parent_y1, y2 - min_h)
+
+    if x2 <= x1 or y2 <= y1:
+        return unit_region
+
+    return TextRegion(
+        x=int(x1),
+        y=int(y1),
+        w=int(x2 - x1),
+        h=int(y2 - y1),
+        cropped=image[int(y1) : int(y2), int(x1) : int(x2)].copy(),
+        mask=text_mask[int(y1) : int(y2), int(x1) : int(x2)].copy(),
+    )
+
+
 def _build_translation_constraint(unit: RenderTextUnit) -> TranslationConstraint:
     """Derive concise translation budgets from the region most likely to be rendered."""
     render_region = unit.context_region or unit.region
@@ -586,17 +810,44 @@ def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:
     if len(boxes) < 2:
         return [region]
 
-    merge_gap = max(8, int(min(region.w, region.h) * 0.06))
-    if region.h > region.w * 2.5:
+    region_area = region.w * region.h
+    large_mixed_region = region_area >= 120_000 and len(boxes) >= 10
+
+    if not large_mixed_region and _context_region_has_bright_bubble(region):
+        # A detector region lying on balloon paper is already one semantic
+        # dialogue unit. Splitting its vertical glyph columns produces
+        # one-character translations and leaves most of the balloon blank.
+        return [region]
+
+    if large_mixed_region:
+        # Panel-sized detections often contain several speech bubbles plus SFX.
+        # The regular phrase-merging pass can chain those scattered components
+        # into one giant OCR unit, which later renders as one enormous paragraph.
+        merge_gap = max(8, int(min(region.w, region.h) * 0.025))
+    else:
+        merge_gap = max(8, int(min(region.w, region.h) * 0.06))
+
+    if not large_mixed_region and region.h > region.w * 2.5:
         # Tall regions often contain multiple vertical text columns in one bubble.
         # Use a more generous merge gap so adjacent columns stay as one OCR unit.
         merge_gap = max(merge_gap, int(max(region.w, region.h) * 0.05))
-    merged_boxes = _merge_nearby_boxes(boxes, gap=merge_gap)
-    merged_boxes = _merge_aligned_ocr_boxes(
-        merged_boxes,
-        region_w=region.w,
-        region_h=region.h,
-    )
+
+    if large_mixed_region:
+        bubble_text_boxes, remaining_boxes = _split_bright_bubble_text_groups(
+            region=region,
+            boxes=boxes,
+        )
+        sfx_boxes = _merge_nearby_boxes(remaining_boxes, gap=merge_gap)
+        merged_boxes = bubble_text_boxes + sfx_boxes
+    else:
+        merged_boxes = _merge_nearby_boxes(boxes, gap=merge_gap)
+
+    if not large_mixed_region:
+        merged_boxes = _merge_aligned_ocr_boxes(
+            merged_boxes,
+            region_w=region.w,
+            region_h=region.h,
+        )
     merged_boxes = [
         b
         for b in merged_boxes
@@ -607,12 +858,22 @@ def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:
 
     if len(merged_boxes) < 2:
         return [region]
-    if len(merged_boxes) > 8:
+    max_split_count = 18 if large_mixed_region else 8
+    if len(merged_boxes) > max_split_count:
         merged_boxes = _merge_nearby_boxes(
             merged_boxes,
-            gap=max(12, int(min(region.w, region.h) * 0.20)),
+            gap=max(12, int(min(region.w, region.h) * (0.045 if large_mixed_region else 0.20))),
         )
-    if len(merged_boxes) < 2 or len(merged_boxes) > 8:
+    if len(merged_boxes) > max_split_count and large_mixed_region:
+        for factor in (0.07, 0.10, 0.14):
+            candidate = _merge_nearby_boxes(
+                merged_boxes,
+                gap=max(14, int(min(region.w, region.h) * factor)),
+            )
+            if 2 <= len(candidate) <= max_split_count:
+                merged_boxes = candidate
+                break
+    if len(merged_boxes) < 2 or len(merged_boxes) > max_split_count:
         return [region]
 
     pad = max(2, int(min(region.w, region.h) * 0.03))
@@ -642,6 +903,106 @@ def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:
         )
 
     return units if len(units) >= 2 else [region]
+
+
+def _split_bright_bubble_text_groups(
+    region: TextRegion,
+    boxes: list[tuple[int, int, int, int]],
+) -> tuple[list[tuple[int, int, int, int]], list[tuple[int, int, int, int]]]:
+    """Separate text inside bright speech bubbles from nearby outlined SFX."""
+    if not boxes or region.cropped is None or region.cropped.size == 0:
+        return [], boxes
+
+    gray = cv2.cvtColor(region.cropped, cv2.COLOR_BGR2GRAY)
+    if gray.size == 0:
+        return [], boxes
+
+    bright_threshold = int(np.clip(np.percentile(gray, 82), 205, 235))
+    _, bright = cv2.threshold(gray, bright_threshold, 255, cv2.THRESH_BINARY)
+    bright = cv2.morphologyEx(
+        bright,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+        iterations=2,
+    )
+    bright = cv2.morphologyEx(
+        bright,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        bright,
+        connectivity=8,
+    )
+    region_area = max(1, region.w * region.h)
+    candidates: list[tuple[int, int, int, int, int]] = []
+    for label in range(1, num_labels):
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        bbox_area = max(1, w * h)
+        fill_ratio = area / float(bbox_area)
+        edge_touches = int(x <= 1) + int(y <= 1)
+        edge_touches += int((x + w) >= region.w - 1)
+        edge_touches += int((y + h) >= region.h - 1)
+
+        if area < max(900, int(region_area * 0.004)):
+            continue
+        if w < 42 or h < 42:
+            continue
+        if bbox_area > int(region_area * 0.70):
+            continue
+        if edge_touches >= 2 and bbox_area > int(region_area * 0.18):
+            continue
+        if fill_ratio < 0.34:
+            continue
+        candidates.append((x, y, x + w, y + h, area))
+
+    if not candidates:
+        return [], boxes
+
+    candidates.sort(key=lambda item: item[4], reverse=True)
+    used: set[int] = set()
+    bubble_groups: list[tuple[int, int, int, int]] = []
+    for cx1, cy1, cx2, cy2, area in candidates:
+        members: list[tuple[int, int, int, int]] = []
+        for idx, box in enumerate(boxes):
+            if idx in used:
+                continue
+            bx1, by1, bx2, by2 = box
+            bcx = (bx1 + bx2) * 0.5
+            bcy = (by1 + by2) * 0.5
+            ix1, iy1 = max(cx1, bx1), max(cy1, by1)
+            ix2, iy2 = min(cx2, bx2), min(cy2, by2)
+            overlap = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            box_area = max(1, (bx2 - bx1) * (by2 - by1))
+            center_inside = cx1 - 3 <= bcx <= cx2 + 3 and cy1 - 3 <= bcy <= cy2 + 3
+            if center_inside or overlap >= int(box_area * 0.30):
+                members.append(box)
+
+        if not members:
+            continue
+        if len(members) < 2 and area < 6000:
+            continue
+
+        gx1 = min(item[0] for item in members)
+        gy1 = min(item[1] for item in members)
+        gx2 = max(item[2] for item in members)
+        gy2 = max(item[3] for item in members)
+        if (gx2 - gx1) < 12 or (gy2 - gy1) < 12:
+            continue
+
+        bubble_groups.append((gx1, gy1, gx2, gy2))
+        for idx, box in enumerate(boxes):
+            if box in members:
+                used.add(idx)
+
+    remaining = [box for idx, box in enumerate(boxes) if idx not in used]
+    return bubble_groups, remaining
 
 
 def _merge_aligned_ocr_boxes(
@@ -929,7 +1290,131 @@ def _is_renderable_unit(unit: RenderTextUnit, text: str) -> bool:
         if re.fullmatch(r'[\d\s/.:;,!?\-()]+', cleaned):
             return False
 
+    if unit.style_hint == "dialogue" and _is_short_nonbubble_dialogue_noise(unit, cleaned):
+        return False
+
     return True
+
+
+def _is_short_nonbubble_dialogue_noise(unit: RenderTextUnit, translated: str) -> bool:
+    """Suppress short dialogue-looking OCR fragments from large SFX/art regions."""
+
+    src_clean = "".join(unit.source_text.split())
+    if not src_clean:
+        return True
+
+    script_total, kana_count, kanji_count, _ = _script_profile(src_clean)
+    alpha_words = re.findall(r"[A-Za-z']+", translated)
+    word_count = len(alpha_words)
+    translated_len = len(translated.strip())
+    region_area = max(1, unit.region.w * unit.region.h)
+    context = unit.context_region or unit.region
+
+    short_source = (
+        script_total <= 4
+        or (kana_count <= 4 and kanji_count == 0)
+        or (script_total <= 8 and kanji_count == 0)
+    )
+    short_translation = translated_len <= 16 or word_count <= 3
+    large_source_region = region_area >= 12_000 or (
+        context.w * context.h >= 35_000 and region_area >= 5_000
+    )
+    common_fragment = {
+        "so",
+        "no",
+        "yes",
+        "i",
+        "i'm",
+        "im",
+        "well",
+        "then",
+        "however",
+        "event",
+        "good",
+        "nice",
+        "already",
+        "that's",
+        "it's",
+        "that",
+        "this",
+        "fine",
+    }
+    normalized_words = [w.lower().strip("'") for w in alpha_words]
+    if not normalized_words:
+        return True
+
+    # Preserve short, ordinary dialogue when OCR found it inside a speech
+    # balloon. The generic-fragment rules below are only meant for free text
+    # picked up from artwork or SFX.
+    if _context_region_has_bright_bubble(context):
+        return False
+
+    if (
+        kanji_count == 0
+        and word_count <= 3
+        and all(word in common_fragment for word in normalized_words)
+    ):
+        return True
+    if (
+        kanji_count == 0
+        and word_count <= 3
+        and translated_len <= 18
+        and region_area >= 30_000
+    ):
+        return True
+
+    if not (short_source and short_translation and large_source_region):
+        return False
+
+    if all(word in common_fragment for word in normalized_words):
+        return True
+    if translated_len <= 10 and word_count <= 2:
+        return True
+    return False
+
+
+def _context_region_has_bright_bubble(region: TextRegion) -> bool:
+    """Return True when the local context contains a filled bright bubble area."""
+    if region.cropped is None or region.cropped.size == 0:
+        return False
+    if region.w < 24 or region.h < 24:
+        return False
+
+    gray = cv2.cvtColor(region.cropped, cv2.COLOR_BGR2GRAY)
+    if gray.size == 0:
+        return False
+    threshold = int(np.clip(np.percentile(gray, 82), 205, 235))
+    _, bright = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
+    bright = cv2.morphologyEx(
+        bright,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+        iterations=1,
+    )
+    num_labels, _labels, stats, _ = cv2.connectedComponentsWithStats(
+        bright,
+        connectivity=8,
+    )
+    hsv = cv2.cvtColor(region.cropped, cv2.COLOR_BGR2HSV)
+
+    context_area = max(1, region.w * region.h)
+    for label in range(1, num_labels):
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        bbox_area = max(1, w * h)
+        fill_ratio = area / float(bbox_area)
+        if area < max(500, int(context_area * 0.12)):
+            continue
+        if bbox_area < int(context_area * 0.10):
+            continue
+        component_mask = _labels == label
+        mean_sat = float(np.mean(hsv[:, :, 1][component_mask]))
+        if mean_sat > 55:
+            continue
+        if fill_ratio >= 0.50:
+            return True
+    return False
 
 
 def _is_renderable_translation(text: str) -> bool:
