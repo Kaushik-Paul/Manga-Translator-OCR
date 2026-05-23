@@ -910,7 +910,14 @@ def _resolve_dialogue_box(
         max(1, w - 2 * inset),
         max(1, h - 2 * inset),
     )
-    fallback_box = default_box
+    fallback_box = _dialogue_fallback_box_from_mask(
+        x=x,
+        y=y,
+        w=w,
+        h=h,
+        region_mask=region_mask,
+        default_box=default_box,
+    )
 
     center_anchor = (w // 2, h // 2)
     mask_anchor = _mask_centroid(region_mask, w, h)
@@ -987,6 +994,62 @@ def _resolve_dialogue_box(
             return (*fallback_box, False, None)
 
     return (x + x1, y + y1, fit_w, fit_h, True, bubble_render_mask)
+
+
+def _dialogue_fallback_box_from_mask(
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    region_mask: NDArray | None,
+    default_box: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """Use a local glyph cluster fallback instead of a whole panel-sized box."""
+    if region_mask is None or region_mask.shape[:2] != (h, w):
+        return default_box
+
+    if region_mask.max() > 1:
+        _, binary = cv2.threshold(region_mask, 127, 255, cv2.THRESH_BINARY)
+    else:
+        binary = (region_mask > 0).astype(np.uint8) * 255
+
+    if cv2.countNonZero(binary) < 20:
+        return default_box
+
+    bbox = _mask_bbox(binary)
+    if bbox is None:
+        return default_box
+
+    bx1, by1, bx2, by2 = bbox
+    bw = bx2 - bx1
+    bh = by2 - by1
+    region_area = max(1, w * h)
+    bbox_area = max(1, bw * bh)
+
+    # If the glyph mask already occupies nearly the whole context, keep the
+    # context. Otherwise stay close to the original glyph cluster; this prevents
+    # missed bubble extraction from using an over-large lettering box.
+    if bbox_area > int(region_area * 0.75):
+        return default_box
+
+    expand_x = max(8, int(bw * 0.75), int(min(w, h) * 0.04))
+    expand_y = max(8, int(bh * 0.55), int(min(w, h) * 0.04))
+    if bh > bw * 1.35:
+        expand_x = max(expand_x, min(90, int(bh * 0.20)))
+    if bw > bh * 1.8:
+        expand_y = max(expand_y, min(80, int(bw * 0.16)))
+
+    lx1 = max(0, bx1 - expand_x)
+    ly1 = max(0, by1 - expand_y)
+    lx2 = min(w, bx2 + expand_x)
+    ly2 = min(h, by2 + expand_y)
+
+    fw = lx2 - lx1
+    fh = ly2 - ly1
+    if fw < 18 or fh < 18:
+        return default_box
+
+    return (x + lx1, y + ly1, fw, fh)
 
 
 def _resolve_sfx_box(
@@ -1436,6 +1499,12 @@ def _fit_text_to_box(
             dynamic_max = min(200, max(max_h, int(max_w * 1.4)))
         else:
             dynamic_max = min(200, max(24, int(min(max_h, max_w) * 1.5)))
+        if word_count >= 9:
+            dynamic_max = min(dynamic_max, max(20, min(28, int(max_w * 0.20))))
+        elif word_count >= 6:
+            dynamic_max = min(dynamic_max, max(20, min(30, int(max_w * 0.22))))
+        elif word_count >= 4:
+            dynamic_max = min(dynamic_max, max(20, min(34, int(max_w * 0.28))))
         max_size = min(max_size, dynamic_max)
     else:
         # SFX: can go large, scale with box dimensions
@@ -1516,17 +1585,22 @@ def _fit_text_to_box(
         else:
             hi = mid - 1
 
-    # Binary search WITH hyphenation.
-    lo, hi = min_size, max_size
     best_hyphen: tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, list[str], int] | None = None
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        font, lines, spacing, used_w, used_h = _layout_at_size(mid, allow_hyphenation=True)
-        if lines and used_w <= max_w and used_h <= max_h:
-            best_hyphen = (font, lines, spacing)
-            lo = mid + 1
-        else:
-            hi = mid - 1
+    if style != "dialogue":
+        # Binary search WITH hyphenation. Dialogue deliberately avoids inserted
+        # hyphen line breaks; those are visually noisy in manga bubbles.
+        lo, hi = min_size, max_size
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            font, lines, spacing, used_w, used_h = _layout_at_size(
+                mid,
+                allow_hyphenation=True,
+            )
+            if lines and used_w <= max_w and used_h <= max_h:
+                best_hyphen = (font, lines, spacing)
+                lo = mid + 1
+            else:
+                hi = mid - 1
 
     # Prefer natural word-boundary wrapping. Hyphenation is useful as a rescue
     # path for genuinely tight boxes, but choosing it for every small font-size
@@ -1562,10 +1636,11 @@ def _fit_text_to_box(
     if lines:
         return font, lines, spacing
 
-    # Absolute last resort: allow both hyphenation and character wrapping.
+    # Absolute last resort: allow both hyphenation and character wrapping for
+    # non-dialogue only. Dialogue keeps word breaks hyphen-free.
     font, lines, spacing, _, _ = _layout_at_size(
         min_size,
-        allow_hyphenation=True,
+        allow_hyphenation=(style != "dialogue"),
         allow_char_wrap=True,
     )
     return font, lines, spacing
