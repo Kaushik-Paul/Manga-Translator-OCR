@@ -1642,9 +1642,7 @@ def _fit_text_to_box(
             size_no_hyphen = getattr(best_no_hyphen[0], "size", 0)
             size_hyphen = getattr(best_hyphen[0], "size", 0)
             if _should_prefer_hyphenated_layout(
-                style=style,
                 no_hyphen_size=size_no_hyphen,
-                no_hyphen_lines=best_no_hyphen[1],
                 hyphen_size=size_hyphen,
                 hyphen_lines=best_hyphen[1],
             ):
@@ -1653,23 +1651,33 @@ def _fit_text_to_box(
     if best is not None:
         return best
 
-    # Fallback to minimum size with character wrapping but without inserted
-    # hyphens. This keeps impossible tiny boxes from going blank while avoiding
-    # the most distracting visual artifact.
-    font, lines, spacing, _, _ = _layout_at_size(
-        min_size,
-        allow_hyphenation=False,
-        allow_char_wrap=True,
-        width_slack=no_hyphen_width_slack,
-    )
-    if lines:
+    # Fallback to minimum size with character wrapping for non-dialogue only.
+    # Dialogue should either fit at word boundaries or let the caller shrink,
+    # truncate, or skip it; splitting English words is too distracting in bubbles.
+    if style != "dialogue":
+        font, lines, spacing, _, _ = _layout_at_size(
+            min_size,
+            allow_hyphenation=False,
+            allow_char_wrap=True,
+            width_slack=no_hyphen_width_slack,
+        )
+        if lines:
+            return font, lines, spacing
+
+    if style == "dialogue":
+        font, lines, spacing, _, _ = _layout_at_size(
+            min_size,
+            allow_hyphenation=False,
+            allow_char_wrap=False,
+            width_slack=no_hyphen_width_slack,
+        )
         return font, lines, spacing
 
     # Absolute last resort: allow both hyphenation and character wrapping for
-    # non-dialogue only. Dialogue keeps word breaks hyphen-free.
+    # non-dialogue only.
     font, lines, spacing, _, _ = _layout_at_size(
         min_size,
-        allow_hyphenation=(style != "dialogue"),
+        allow_hyphenation=True,
         allow_char_wrap=True,
     )
     return font, lines, spacing
@@ -1677,9 +1685,7 @@ def _fit_text_to_box(
 
 def _should_prefer_hyphenated_layout(
     *,
-    style: str,
     no_hyphen_size: int,
-    no_hyphen_lines: list[str],
     hyphen_size: int,
     hyphen_lines: list[str],
 ) -> bool:
@@ -1691,14 +1697,7 @@ def _should_prefer_hyphenated_layout(
     if inserted_breaks == 0:
         return True
 
-    if style != "dialogue":
-        return inserted_breaks <= 1 and hyphen_size >= no_hyphen_size + 4
-
-    size_gain = hyphen_size - no_hyphen_size
-    large_gain = size_gain >= max(6, int(no_hyphen_size * 0.45))
-    line_gain = len(hyphen_lines) < len(no_hyphen_lines)
-
-    return inserted_breaks <= 1 and large_gain and line_gain
+    return inserted_breaks <= 1 and hyphen_size >= no_hyphen_size + 4
 
 
 def _hyphenated_line_break_count(lines: list[str]) -> int:

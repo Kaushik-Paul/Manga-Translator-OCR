@@ -857,6 +857,12 @@ def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:
         )
         sfx_boxes = _merge_nearby_boxes(remaining_boxes, gap=merge_gap)
         merged_boxes = bubble_text_boxes + sfx_boxes
+        merged_boxes = _refine_oversized_ocr_groups(
+            merged_boxes=merged_boxes,
+            component_boxes=boxes,
+            region_w=region.w,
+            region_h=region.h,
+        )
     else:
         merged_boxes = _merge_nearby_boxes(boxes, gap=merge_gap)
 
@@ -1021,6 +1027,67 @@ def _split_bright_bubble_text_groups(
 
     remaining = [box for idx, box in enumerate(boxes) if idx not in used]
     return bubble_groups, remaining
+
+
+def _refine_oversized_ocr_groups(
+    merged_boxes: list[tuple[int, int, int, int]],
+    component_boxes: list[tuple[int, int, int, int]],
+    region_w: int,
+    region_h: int,
+) -> list[tuple[int, int, int, int]]:
+    """Split oversized OCR groups that still span several speech bubbles."""
+    if not merged_boxes or not component_boxes:
+        return merged_boxes
+
+    refined: list[tuple[int, int, int, int]] = []
+    region_area = max(1, region_w * region_h)
+    for group in merged_boxes:
+        gx1, gy1, gx2, gy2 = group
+        gw = gx2 - gx1
+        gh = gy2 - gy1
+        group_area = max(1, gw * gh)
+
+        if (
+            group_area < max(95_000, int(region_area * 0.22))
+            or gw < 260
+            or gh < 180
+        ):
+            refined.append(group)
+            continue
+
+        members: list[tuple[int, int, int, int]] = []
+        for box in component_boxes:
+            bx1, by1, bx2, by2 = box
+            bcx = (bx1 + bx2) * 0.5
+            bcy = (by1 + by2) * 0.5
+            ix1, iy1 = max(gx1, bx1), max(gy1, by1)
+            ix2, iy2 = min(gx2, bx2), min(gy2, by2)
+            overlap = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            box_area = max(1, (bx2 - bx1) * (by2 - by1))
+            center_inside = gx1 <= bcx <= gx2 and gy1 <= bcy <= gy2
+            if center_inside or overlap >= int(box_area * 0.50):
+                members.append(box)
+
+        if len(members) < 4:
+            refined.append(group)
+            continue
+
+        tight_gap = max(8, int(min(region_w, region_h) * 0.018))
+        split = _merge_nearby_boxes(members, gap=tight_gap)
+        split = [
+            b
+            for b in split
+            if (b[2] - b[0]) >= 12
+            and (b[3] - b[1]) >= 12
+            and ((b[2] - b[0]) * (b[3] - b[1])) >= 140
+        ]
+
+        if 2 <= len(split) <= 10:
+            refined.extend(split)
+        else:
+            refined.append(group)
+
+    return refined
 
 
 def _merge_aligned_ocr_boxes(
@@ -1295,13 +1362,23 @@ def _is_renderable_unit(unit: RenderTextUnit, text: str) -> bool:
     area = max(1, region.w * region.h)
 
     if unit.style_hint == "sfx":
+        src_clean = unit.source_text.strip()
+        src_compact = "".join(src_clean.split())
+        script_total, kana_count, kanji_count, _ = _script_profile(src_compact)
+        meaningful_chars = len(src_compact)
+        if script_total == 0:
+            return False
+        if meaningful_chars >= 3 and (script_total / float(meaningful_chars)) < 0.50:
+            return False
+        if (kana_count + kanji_count) < 2 and re.search(r"[A-Za-z0-9]", src_compact):
+            return False
+
         # Skip very short SFX translations in small regions (fragment noise).
         if len(cleaned) <= 2 and area < 4000:
             return False
         # Skip single-character source text in small SFX regions — these are
         # individual Japanese characters (e.g. 'お', 'ん') that shouldn't be
         # rendered as separate tiny SFX.
-        src_clean = unit.source_text.strip()
         if len(src_clean) <= 1 and area < 8000:
             return False
         # Skip numeric/symbol-only SFX (e.g. "13", "1/", "1:")
