@@ -829,7 +829,44 @@ def render_text_on_image(
                         0, (avail_h - total_text_height) // 2
                     )
 
+        if not _layout_fits_bubble_mask(
+            mask=box_clip_mask,
+            start_y=int(start_y - box_y),
+            line_metrics=line_metrics,
+            line_spacing=line_spacing,
+            margin=3,
+        ):
+            shortened_layout = _fit_shortened_dialogue_to_bubble_mask(
+                draw=draw,
+                text=text,
+                font_path=font_file,
+                avail_w=avail_w,
+                avail_h=avail_h,
+                mask=box_clip_mask,
+                text_padding=text_padding,
+                min_size=_DIALOGUE_MIN_SIZE,
+                max_size=getattr(font, "size", _DIALOGUE_MIN_SIZE),
+                max_lines=_DIALOGUE_MAX_LINES,
+            )
+            if shortened_layout is None:
+                return image
+            font, lines, line_spacing, line_metrics, local_start_y, text = shortened_layout
+            stroke_width = _stroke_width_for_font(font)
+            start_y = box_y + local_start_y
+
     # Draw each line centered horizontally
+    clip_dialogue_to_mask = box_clip_mask is not None and text_style == "dialogue"
+    if clip_dialogue_to_mask:
+        text_layer = Image.new("RGBA", pil_image.size, (0, 0, 0, 0))
+        target_draw = ImageDraw.Draw(text_layer)
+        fill_color = (*render_color, 255)
+        stroke_color = (*outline_color, 255)
+    else:
+        text_layer = None
+        target_draw = draw
+        fill_color = render_color
+        stroke_color = outline_color
+
     current_y = start_y
     for i, line in enumerate(lines):
         lw, lh, left, top = line_metrics[i]
@@ -848,17 +885,27 @@ def render_text_on_image(
                 line_x = box_x + masked_rel_x
 
         # Draw outline for readability (stroke)
-        draw.text(
+        target_draw.text(
             (int(line_x - left), int(current_y - top)),
             line,
             font=font,
             anchor="lt",
-            fill=render_color,
+            fill=fill_color,
             stroke_width=stroke_width,
-            stroke_fill=outline_color,
+            stroke_fill=stroke_color,
         )
 
         current_y += lh + line_spacing
+
+    if clip_dialogue_to_mask and text_layer is not None:
+        alpha = np.array(text_layer.getchannel("A"), dtype=np.uint8)
+        clip = np.zeros_like(alpha)
+        clip[box_y : box_y + box_h, box_x : box_x + box_w] = (
+            (box_clip_mask > 0).astype(np.uint8) * 255
+        )
+        alpha = np.minimum(alpha, clip)
+        text_layer.putalpha(Image.fromarray(alpha))
+        pil_image = Image.alpha_composite(pil_image.convert("RGBA"), text_layer).convert("RGB")
 
     # Convert back to BGR
     rendered = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
@@ -1970,14 +2017,18 @@ def _mask_band_span(mask: NDArray, y: int, line_h: int, line_w: int) -> tuple[in
     if not row_left:
         return None
 
-    left = int(np.percentile(np.array(row_left), 25))
-    right = int(np.percentile(np.array(row_right), 75))
+    left_values = np.array(row_left)
+    right_values = np.array(row_right)
+
+    # Use an inner span instead of the widest visible row.  Manga balloons often
+    # curve sharply near the top/bottom; the previous 25/75 percentile span let
+    # a line pass if only a few rows were wide enough, which caused edge spills.
+    left = int(np.percentile(left_values, 55))
+    right = int(np.percentile(right_values, 45))
     avail = right - left + 1
-    if avail < max(8, int(line_w * 0.55)):
-        # Fall back to widest visible span in this band.
-        best_idx = int(np.argmax(np.array(row_right) - np.array(row_left)))
-        left = row_left[best_idx]
-        right = row_right[best_idx]
+    if avail < max(8, int(line_w * 0.60)):
+        left = int(np.percentile(left_values, 40))
+        right = int(np.percentile(right_values, 60))
         avail = right - left + 1
 
     if avail <= 6:
@@ -2087,6 +2138,61 @@ def _fit_dialogue_to_bubble_mask(
                     margin=3,
                 ):
                     return font, lines, line_spacing, metrics, local_start_y
+
+    return None
+
+
+def _fit_shortened_dialogue_to_bubble_mask(
+    *,
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font_path: str | None,
+    avail_w: int,
+    avail_h: int,
+    mask: NDArray,
+    text_padding: int,
+    min_size: int,
+    max_size: int,
+    max_lines: int,
+) -> tuple[
+    ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    list[str],
+    int,
+    list[tuple[int, int, int, int]],
+    int,
+    str,
+] | None:
+    """Find a mask-safe dialogue layout, shortening only at word boundaries."""
+    clean = " ".join(text.replace("\r", " ").replace("\n", " ").split())
+    if not clean:
+        return None
+
+    words = clean.split()
+    candidates: list[str] = [clean]
+    seen = {clean}
+    for max_words in range(min(len(words) - 1, 12), 1, -1):
+        candidate = _compress_dialogue_for_tiny_box(clean, max_words=max_words)
+        if candidate and candidate not in seen:
+            candidates.append(candidate)
+            seen.add(candidate)
+
+    for candidate in candidates:
+        layout = _fit_dialogue_to_bubble_mask(
+            draw=draw,
+            text=candidate,
+            font_path=font_path,
+            avail_w=avail_w,
+            avail_h=avail_h,
+            mask=mask,
+            text_padding=text_padding,
+            min_size=min_size,
+            max_size=max_size,
+            max_lines=max_lines,
+        )
+        if layout is None:
+            continue
+        font, lines, line_spacing, metrics, local_start_y = layout
+        return font, lines, line_spacing, metrics, local_start_y, candidate
 
     return None
 
