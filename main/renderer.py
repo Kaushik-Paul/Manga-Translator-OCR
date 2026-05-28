@@ -738,10 +738,31 @@ def render_text_on_image(
     start_y = box_y + text_padding + max(0, (avail_h - total_text_height) // 2)
     x_anchor = box_x + text_padding
 
-    # Bubble masks can be narrower near the top/bottom. If a centered layout would
-    # spill outside the mask, try shifting vertically within the slack, then
-    # retry with a slightly narrower wrap width to keep text inside the bubble.
+    # Bubble masks can be narrower near the top/bottom. Prefer a layout that is
+    # proven to fit every line into the usable mask band instead of only fitting
+    # the rectangular bounding box.
     if box_clip_mask is not None and text_style == "dialogue":
+        mask_safe_layout = _fit_dialogue_to_bubble_mask(
+            draw=draw,
+            text=text,
+            font_path=font_file,
+            avail_w=avail_w,
+            avail_h=avail_h,
+            mask=box_clip_mask,
+            text_padding=text_padding,
+            min_size=_DIALOGUE_MIN_SIZE,
+            max_size=getattr(font, "size", _DIALOGUE_MIN_SIZE),
+            max_lines=_DIALOGUE_MAX_LINES,
+        )
+        if mask_safe_layout is not None:
+            font, lines, line_spacing, line_metrics, local_start_y = mask_safe_layout
+            stroke_width = _stroke_width_for_font(font)
+            total_text_height = (
+                sum(lh for _, lh, _, _ in line_metrics)
+                + (len(lines) - 1) * line_spacing
+            )
+            start_y = box_y + local_start_y
+
         base_local_start = int(start_y - box_y)
         if not _layout_fits_bubble_mask(
             mask=box_clip_mask,
@@ -1032,17 +1053,25 @@ def _dialogue_fallback_box_from_mask(
     if bbox_area > int(region_area * 0.75):
         return default_box
 
-    expand_x = max(8, int(bw * 0.75), int(min(w, h) * 0.04))
-    expand_y = max(8, int(bh * 0.55), int(min(w, h) * 0.04))
+    # Keep missed-bubble fallback close to the original glyph cluster.  The
+    # previous expansion could turn a narrow vertical Japanese column into a
+    # panel-wide English text lane when balloon extraction failed.
+    expand_x = max(8, int(bw * 0.38), int(min(w, h) * 0.03))
+    expand_y = max(8, int(bh * 0.36), int(min(w, h) * 0.03))
     if bh > bw * 1.35:
-        expand_x = max(expand_x, min(90, int(bh * 0.20)))
+        expand_x = max(expand_x, min(58, int(bh * 0.14)))
     if bw > bh * 1.8:
-        expand_y = max(expand_y, min(80, int(bw * 0.16)))
+        expand_y = max(expand_y, min(52, int(bw * 0.12)))
 
     lx1 = max(0, bx1 - expand_x)
     ly1 = max(0, by1 - expand_y)
     lx2 = min(w, bx2 + expand_x)
     ly2 = min(h, by2 + expand_y)
+
+    max_fallback_w = max(48, int(bw * (1.42 if bh > bw * 1.20 else 1.70)))
+    max_fallback_h = max(42, int(bh * (1.38 if bh > bw * 1.20 else 1.62)))
+    lx1, lx2 = _cap_span_around_center(lx1, lx2, max_fallback_w, 0, w)
+    ly1, ly2 = _cap_span_around_center(ly1, ly2, max_fallback_h, 0, h)
 
     fw = lx2 - lx1
     fh = ly2 - ly1
@@ -1569,7 +1598,7 @@ def _fit_text_to_box(
 
     # Binary search WITHOUT hyphenation. Dialogue gets a tiny slack allowance
     # so one slightly wide word does not become an ugly hyphenated split.
-    no_hyphen_width_slack = max(2, int(max_w * 0.05)) if style == "dialogue" else 0
+    no_hyphen_width_slack = 1 if style == "dialogue" else 0
     lo, hi = min_size, max_size
     best_no_hyphen: tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, list[str], int] | None = None
     while lo <= hi:
@@ -1980,6 +2009,107 @@ def _fit_line_x_to_mask(
     return int(np.clip(x, 0, max_x))
 
 
+def _fit_dialogue_to_bubble_mask(
+    *,
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font_path: str | None,
+    avail_w: int,
+    avail_h: int,
+    mask: NDArray,
+    text_padding: int,
+    min_size: int,
+    max_size: int,
+    max_lines: int,
+) -> tuple[
+    ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    list[str],
+    int,
+    list[tuple[int, int, int, int]],
+    int,
+] | None:
+    """Find the largest dialogue layout that fits the speech-bubble mask."""
+    if mask.size == 0 or avail_w <= 0 or avail_h <= 0:
+        return None
+
+    hi = max(min_size, int(max_size))
+    for size in range(hi, min_size - 1, -1):
+        for width_ratio in (1.0, 0.94, 0.88, 0.82, 0.76, 0.70):
+            wrap_w = max(10, int(avail_w * width_ratio))
+            font, lines, line_spacing = _fit_text_to_box(
+                draw=draw,
+                text=text,
+                max_w=wrap_w,
+                max_h=avail_h,
+                font_path=font_path,
+                style="dialogue",
+                min_size=size,
+                max_size=size,
+            )
+            if not lines or len(lines) > max_lines:
+                continue
+            if getattr(font, "size", size) < size:
+                continue
+
+            stroke_width = _stroke_width_for_font(font)
+            metrics: list[tuple[int, int, int, int]] = []
+            for line in lines:
+                left, top, right, bottom = draw.textbbox(
+                    (0, 0),
+                    line,
+                    font=font,
+                    anchor="lt",
+                    stroke_width=stroke_width,
+                )
+                metrics.append(
+                    (
+                        max(0, int(right - left)),
+                        max(0, int(bottom - top)),
+                        int(left),
+                        int(top),
+                    )
+                )
+
+            total_h = sum(lh for _, lh, _, _ in metrics) + (
+                len(metrics) - 1
+            ) * line_spacing
+            if total_h > avail_h:
+                continue
+
+            slack = max(0, int(avail_h - total_h))
+            centered = int(text_padding + slack // 2)
+            candidates = _candidate_mask_start_ys(centered, text_padding, slack)
+            for local_start_y in candidates:
+                if _layout_fits_bubble_mask(
+                    mask=mask,
+                    start_y=local_start_y,
+                    line_metrics=metrics,
+                    line_spacing=line_spacing,
+                    margin=3,
+                ):
+                    return font, lines, line_spacing, metrics, local_start_y
+
+    return None
+
+
+def _candidate_mask_start_ys(centered: int, padding: int, slack: int) -> list[int]:
+    """Return centered-first vertical starts within the available text slack."""
+    low = int(padding)
+    high = int(padding + max(0, slack))
+    centered = int(np.clip(centered, low, high))
+    values = [centered]
+    for delta in (4, -4, 8, -8, 12, -12, 18, -18, 24, -24):
+        if abs(delta) > slack + 1:
+            continue
+        cand = int(np.clip(centered + delta, low, high))
+        if cand not in values:
+            values.append(cand)
+    for cand in (low, high):
+        if cand not in values:
+            values.append(cand)
+    return values
+
+
 def _layout_fits_bubble_mask(
     mask: NDArray,
     start_y: int,
@@ -2002,6 +2132,34 @@ def _layout_fits_bubble_mask(
         current_y += int(line_h + line_spacing)
 
     return True
+
+
+def _cap_span_around_center(
+    start: int,
+    end: int,
+    max_len: int,
+    lower: int,
+    upper: int,
+) -> tuple[int, int]:
+    """Cap a 1D span around its center while staying inside bounds."""
+    span = int(end - start)
+    if span <= max_len:
+        return start, end
+    center = (start + end) * 0.5
+    half = max_len * 0.5
+    new_start = int(round(center - half))
+    new_end = int(round(center + half))
+    if new_start < lower:
+        new_end += lower - new_start
+        new_start = lower
+    if new_end > upper:
+        new_start -= new_end - upper
+        new_end = upper
+    new_start = max(lower, new_start)
+    new_end = min(upper, new_end)
+    if new_end <= new_start:
+        return start, end
+    return new_start, new_end
 
 
 def _is_ellipsis_like(text: str) -> bool:
