@@ -724,13 +724,31 @@ def _build_local_render_context_region(
 def _build_translation_constraint(unit: RenderTextUnit) -> TranslationConstraint:
     """Derive concise translation budgets from the region most likely to be rendered."""
     render_region = unit.context_region or unit.region
-    area = max(1, int(render_region.w * render_region.h))
-    aspect = render_region.h / float(max(1, render_region.w))
     rw = render_region.w
+    rh = render_region.h
+
+    # Context expansion gives the renderer surrounding pixels for balloon
+    # detection, but it should not make the translation budget panel-wide when
+    # the original Japanese glyphs were a narrow vertical column.
+    if unit.style_hint == "dialogue" and render_region is not unit.region:
+        source_aspect = unit.region.h / float(max(1, unit.region.w))
+        if source_aspect >= 1.20 and unit.region.w < 220:
+            rw = min(
+                rw,
+                max(
+                    56,
+                    int(unit.region.w * 1.45),
+                    unit.region.w + min(64, int(unit.region.h * 0.16)),
+                ),
+            )
+            rh = min(rh, max(48, int(unit.region.h * 1.40)))
+
+    area = max(1, int(rw * rh))
+    aspect = rh / float(max(1, rw))
 
     if unit.style_hint == "sfx":
         max_chars = 12 if area < 12000 else 16
-        if render_region.w >= 160 or render_region.h >= 220:
+        if rw >= 160 or rh >= 220:
             max_chars = min(18, max_chars + 2)
         return TranslationConstraint(
             style="sfx",
