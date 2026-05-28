@@ -1235,39 +1235,34 @@ def _infer_unit_style(source_text: str, w: int, h: int) -> str:
     script_total, kana_count, kanji_count, punct_count = _script_profile(clean)
     char_count = len(clean)
     has_sentence_punct = any(c in clean for c in "。！？?!")
-    dialogue_markers = (
-        "して",
-        "ない",
-        "れる",
-        "られる",
-        "です",
-        "ます",
-        "たい",
-        "という",
-        "かも",
-        "から",
-        "まで",
-        "よう",
-        "する",
-        "した",
-    )
-    has_dialogue_marker = any(marker in clean for marker in dialogue_markers)
 
-    # Short text without sentence punctuation is likely SFX
-    if char_count <= 2:
-        return "sfx"
-    if has_dialogue_marker and char_count >= 4:
+    if has_sentence_punct or kanji_count > 0 or kana_count >= 2:
+        if has_sentence_punct and kana_count >= 4:
+            return "dialogue"
+        if _is_effect_like_source(clean, kana_count=kana_count, kanji_count=kanji_count):
+            return "sfx"
         return "dialogue"
-    if kanji_count >= 1 and kana_count >= 2 and char_count >= 4:
-        return "dialogue"
-    # Be more generous: if the region is tall (vertical text column) or has
-    # multiple kanji/kana, treat as dialogue even if short.
-    if char_count >= 3 and (kanji_count >= 1 or kana_count >= 2):
-        return "dialogue"
-    if char_count <= 5 and not has_sentence_punct and kanji_count <= 1 and kana_count <= 1:
+    if script_total == 0 or char_count <= 2:
         return "sfx"
     return "dialogue"
 
+
+def _is_effect_like_source(clean: str, kana_count: int, kanji_count: int) -> bool:
+    """Detect compact kana effects by shape, not by manga-specific word lists."""
+    if kanji_count > 0 or kana_count == 0:
+        return False
+
+    kana = "".join(ch for ch in clean if _is_kana_char(ch))
+    if not kana or len(kana) != kana_count:
+        return False
+
+    if kana_count == 1:
+        return True
+
+    if kana_count <= 8 and any(ch in clean for ch in "っッぁぃぅぇぉァィゥェォー〜～"):
+        return True
+
+    return kana_count <= 8 and re.search(r"([\u3040-\u30ff])\1", kana) is not None
 
 
 
@@ -1384,11 +1379,36 @@ def _is_renderable_unit(unit: RenderTextUnit, text: str) -> bool:
         # Skip numeric/symbol-only SFX (e.g. "13", "1/", "1:")
         if re.fullmatch(r'[\d\s/.:;,!?\-()]+', cleaned):
             return False
+        if not _is_compact_sfx_render(cleaned):
+            return False
+        if not _is_effect_like_source(src_compact, kana_count=kana_count, kanji_count=kanji_count):
+            return False
 
     if unit.style_hint == "dialogue" and _is_short_nonbubble_dialogue_noise(unit, cleaned):
         return False
 
     return True
+
+
+def _is_compact_sfx_render(text: str) -> bool:
+    """Return True when translated SFX is short enough to render as lettering."""
+    clean = text.strip()
+    if not clean:
+        return False
+
+    tokens = re.findall(r"[A-Za-z]+", clean)
+    if not tokens:
+        return False
+
+    letters = "".join(tokens)
+    if len(tokens) > 2 or not (2 <= len(letters) <= 14):
+        return False
+
+    has_separator = any(not ch.isalnum() and not ch.isspace() for ch in clean)
+    has_repeated_letter = re.search(r"([A-Za-z])\1", letters) is not None
+    if len(tokens) > 1:
+        return has_separator
+    return has_repeated_letter or len(letters) <= 3
 
 
 def _is_short_nonbubble_dialogue_noise(unit: RenderTextUnit, translated: str) -> bool:
@@ -1414,42 +1434,24 @@ def _is_short_nonbubble_dialogue_noise(unit: RenderTextUnit, translated: str) ->
     large_source_region = region_area >= 12_000 or (
         context.w * context.h >= 35_000 and region_area >= 5_000
     )
-    common_fragment = {
-        "so",
-        "no",
-        "yes",
-        "i",
-        "i'm",
-        "im",
-        "well",
-        "then",
-        "however",
-        "event",
-        "good",
-        "nice",
-        "already",
-        "that's",
-        "it's",
-        "that",
-        "this",
-        "fine",
-    }
-    normalized_words = [w.lower().strip("'") for w in alpha_words]
-    if not normalized_words:
+    if not alpha_words:
         return True
 
-    # Preserve short, ordinary dialogue when OCR found it inside a speech
-    # balloon. The generic-fragment rules below are only meant for free text
-    # picked up from artwork or SFX.
-    if _context_region_has_bright_bubble(context):
+    # Preserve short, ordinary dialogue when the OCR glyph crop itself sits on
+    # speech-balloon paper.  A large expanded context can contain some white
+    # bubble elsewhere, which previously let free-text fragments render on art.
+    if _context_region_has_bright_bubble(unit.region):
         return False
 
+    source_has_sentence_punct = any(c in src_clean for c in "。！？?!")
     if (
         kanji_count == 0
-        and word_count <= 3
-        and all(word in common_fragment for word in normalized_words)
+        and not source_has_sentence_punct
+        and word_count <= 8
+        and translated_len <= 60
     ):
         return True
+
     if (
         kanji_count == 0
         and word_count <= 3
@@ -1461,11 +1463,7 @@ def _is_short_nonbubble_dialogue_noise(unit: RenderTextUnit, translated: str) ->
     if not (short_source and short_translation and large_source_region):
         return False
 
-    if all(word in common_fragment for word in normalized_words):
-        return True
-    if translated_len <= 10 and word_count <= 2:
-        return True
-    return False
+    return translated_len <= 10 or word_count <= 2
 
 
 def _context_region_has_bright_bubble(region: TextRegion) -> bool:
@@ -1579,73 +1577,9 @@ def _script_profile(text: str) -> tuple[int, int, int, int]:
     return script_total, kana_count, kanji_count, punct_count
 
 
-def _looks_like_romaji_noise(text: str) -> bool:
-    """Detect transliterated gibberish that should not be rendered as English."""
-    words = [w.lower() for w in re.findall(r"[A-Za-z']+", text)]
-    if len(words) < 3:
-        return False
-
-    common_en = {
-        "the",
-        "this",
-        "that",
-        "what",
-        "when",
-        "where",
-        "then",
-        "well",
-        "okay",
-        "right",
-        "please",
-        "come",
-        "again",
-        "good",
-        "more",
-        "with",
-        "have",
-        "gonna",
-        "suck",
-        "lick",
-        "ouch",
-        "slip",
-        "gulp",
-        "throb",
-        "twitch",
-        "moan",
-        "heh",
-        "huh",
-        "ah",
-        "oh",
-        "mmm",
-        "yeah",
-        "is",
-        "it",
-        "so",
-        "hot",
-        "mom",
-    }
-    english_hits = sum(
-        1
-        for w in words
-        if w in common_en
-        or w.endswith(("ing", "ed", "ly", "er", "est", "tion", "ness", "ment", "ful"))
-    )
-    romaji_hits = sum(
-        1
-        for w in words
-        if len(w) >= 4
-        and (
-            re.search(r"(sh|ch|ts|ry|ny|ky|gy|ja|ju|jo)", w) is not None
-            or w in {"desu", "kun", "chan", "sama", "senpai"}
-        )
-    )
-    vowel_ending = sum(1 for w in words if len(w) >= 3 and w[-1] in "aeiou")
-
-    if romaji_hits >= 2 and english_hits <= max(1, len(words) // 4):
-        return True
-    if vowel_ending >= max(3, int(len(words) * 0.75)) and english_hits == 0:
-        return True
-    return False
+def _is_kana_char(ch: str) -> bool:
+    code = ord(ch)
+    return 0x3040 <= code <= 0x30FF
 
 
 def _merge_overlapping_detected_regions(
