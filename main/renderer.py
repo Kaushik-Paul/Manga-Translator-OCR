@@ -473,13 +473,28 @@ def render_text_on_image(
         translated_text=text,
         text_style=text_style,
     )
+
+    def _skip_render(reason: str) -> NDArray:
+        logger.debug(
+            "Skipping render (%s): style=%s bubble=%s box=(%d,%d,%d,%d) text='%s'",
+            reason,
+            text_style,
+            bubble_used,
+            box_x,
+            box_y,
+            box_w,
+            box_h,
+            " ".join(text.split())[:80],
+        )
+        return image
+
     non_bubble_dialogue = text_style == "dialogue" and not bubble_used
     forced_box_clip_mask: NDArray | None = None
     if non_bubble_dialogue:
         # Non-bubble regions are often noisy merged text; force compact phrasing.
         text = _tighten_non_bubble_dialogue(text=text, box_w=box_w, box_h=box_h)
         if _is_low_signal_dialogue_fragment(text):
-            return image
+            return _skip_render("low-signal non-bubble dialogue")
         if _prefer_sfx_for_free_text(text=text, box_w=box_w, box_h=box_h):
             text_style = "sfx"
             non_bubble_dialogue = False
@@ -491,14 +506,14 @@ def render_text_on_image(
                 box_h=box_h,
             )
             if surface is None:
-                return image
+                return _skip_render("no safe non-bubble surface")
             local_x, local_y, local_w, local_h, forced_box_clip_mask = surface
             box_x += local_x
             box_y += local_y
             box_w = local_w
             box_h = local_h
     if _is_punctuation_only(text):
-        return image
+        return _skip_render("punctuation-only")
 
     if (
         forced_box_clip_mask is not None
@@ -516,7 +531,7 @@ def render_text_on_image(
             box_h=box_h,
         )
     ):
-        return image
+        return _skip_render("unsafe non-bubble surface")
 
     is_tall_dialogue = text_style == "dialogue" and box_h > box_w * 1.20
     if font_path:
@@ -571,7 +586,7 @@ def render_text_on_image(
             if mask_avail < avail_w * 0.80:
                 avail_w = int(max(avail_w * 0.80, mask_avail))
     if avail_w <= 10 or avail_h <= 10:
-        return image
+        return _skip_render("no available text area")
 
     # Determine outline color from background brightness (original logic).
     region = result[box_y : box_y + box_h, box_x : box_x + box_w]
@@ -590,9 +605,11 @@ def render_text_on_image(
     if text_color is not None:
         tr, tg, tb = text_color
         text_luma = 0.299 * tr + 0.587 * tg + 0.114 * tb
+        text_chroma = max(tr, tg, tb) - min(tr, tg, tb)
         contrast_ratio = abs(text_luma - mean_brightness)
         if contrast_ratio >= 40:  # Minimum perceptual contrast
-            render_color = text_color
+            if not (text_style == "dialogue" and text_chroma > 45 and text_luma > 55):
+                render_color = text_color
 
     # Auto-size font to fit
     max_size_cap = None
@@ -628,7 +645,7 @@ def render_text_on_image(
                     stroke_width = _stroke_width_for_font(font)
                     widest = _max_line_width(draw, lines, font, stroke_width=stroke_width)
         if (not bubble_used) and widest > int(avail_w * 1.12):
-            return image
+            return _skip_render("non-bubble sfx too wide")
 
     # Enforce minimum readable font size (12px) AND a dynamic max line count for dialogue.
     # Tall narrow bubbles need more lines; cap based on available height.
@@ -746,9 +763,9 @@ def render_text_on_image(
                 stroke_width = _stroke_width_for_font(font)
 
     if not lines:
-        return image
+        return _skip_render("no fitted lines")
     if _is_overbroken_sfx(text=text, text_style=text_style, lines=lines, font=font):
-        return image
+        return _skip_render("overbroken sfx")
     if _should_skip_render_text(
         text=text,
         box_w=box_w,
@@ -756,7 +773,7 @@ def render_text_on_image(
         text_style=text_style,
         bubble_used=bubble_used,
     ):
-        return image
+        return _skip_render("tiny/noise text")
 
     # Calculate total text height (anchor-aware to avoid clipping)
     line_metrics: list[tuple[int, int, int, int]] = []
@@ -778,7 +795,7 @@ def render_text_on_image(
         and line_metrics
         and max(lw for lw, _, _, _ in line_metrics) > avail_w + 2
     ):
-        return image
+        return _skip_render("dialogue line wider than unmasked box")
 
     total_text_height = (
         sum(lh for _, lh, _, _ in line_metrics) + (len(lines) - 1) * line_spacing
@@ -899,8 +916,31 @@ def render_text_on_image(
                 max_lines=_DIALOGUE_MAX_LINES,
             )
             if shortened_layout is None:
-                return image
-            font, lines, line_spacing, line_metrics, local_start_y, text = shortened_layout
+                relaxed_layout = _fit_relaxed_spill_dialogue_to_bubble_mask(
+                    draw=draw,
+                    text=text,
+                    font_path=font_file,
+                    avail_w=avail_w,
+                    avail_h=avail_h,
+                    mask=box_clip_mask,
+                    text_padding=text_padding,
+                    min_size=_DIALOGUE_MIN_SIZE,
+                    max_size=getattr(font, "size", _DIALOGUE_MIN_SIZE),
+                    max_lines=_DIALOGUE_MAX_LINES,
+                )
+                if relaxed_layout is None:
+                    return _skip_render("dialogue does not fit bubble mask")
+                (
+                    font,
+                    lines,
+                    line_spacing,
+                    line_metrics,
+                    local_start_y,
+                    text,
+                    box_clip_mask,
+                ) = relaxed_layout
+            else:
+                font, lines, line_spacing, line_metrics, local_start_y, text = shortened_layout
             stroke_width = _stroke_width_for_font(font)
             start_y = box_y + local_start_y
 
@@ -1706,7 +1746,7 @@ def _bubble_mask_has_paper_surface(
     if (
         edge_touches >= 2
         and bbox_area > int(bw * bh * 0.45)
-        and mean_gray < 238
+        and mean_gray < 232
     ):
         return False
 
@@ -2225,13 +2265,6 @@ def _non_bubble_dialogue_surface(
     box_h: int,
 ) -> tuple[int, int, int, int, NDArray] | None:
     """Find a bright local paper surface for fallback dialogue rendering."""
-    if not _non_bubble_dialogue_has_safe_surface(
-        region_image=region_image,
-        text=text,
-        box_w=box_w,
-        box_h=box_h,
-    ):
-        return None
     if region_image is None or region_image.size == 0:
         return None
 
@@ -2241,6 +2274,19 @@ def _non_bubble_dialogue_surface(
 
     gray = cv2.cvtColor(region_image, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(region_image, cv2.COLOR_BGR2HSV)
+    clean = " ".join(text.split())
+    word_count = len(re.findall(r"[A-Za-z']+", clean))
+    crop_area = max(1, w * h)
+
+    high_confidence_surface = _bright_rect_dialogue_surface(
+        gray=gray,
+        hsv=hsv,
+        crop_area=crop_area,
+        word_count=word_count,
+    )
+    if high_confidence_surface is not None:
+        return high_confidence_surface
+
     paper = ((gray > 200) & (hsv[:, :, 1] < 48)).astype(np.uint8) * 255
     paper = cv2.morphologyEx(
         paper,
@@ -2262,13 +2308,14 @@ def _non_bubble_dialogue_surface(
     if num_labels <= 1:
         return None
 
-    crop_area = max(1, w * h)
     cx = w * 0.5
     cy = h * 0.5
     best_label = -1
     best_score = -1e9
     best_edge_large = False
     best_mean_gray = 0.0
+    best_area = 0
+    best_bbox_area = 0
     for label in range(1, num_labels):
         x = int(stats[label, cv2.CC_STAT_LEFT])
         y = int(stats[label, cv2.CC_STAT_TOP])
@@ -2297,7 +2344,7 @@ def _non_bubble_dialogue_surface(
             # Pale skin/walls often pass the low-saturation paper test. True
             # narration boxes are usually near-white, so only heavily penalize
             # large edge-touching surfaces that are not very bright.
-            if comp_mean_gray < 238:
+            if comp_mean_gray < 232:
                 score -= area * 4.0
             else:
                 score -= area * 0.35
@@ -2306,11 +2353,18 @@ def _non_bubble_dialogue_surface(
             best_label = label
             best_edge_large = edge_large
             best_mean_gray = comp_mean_gray
+            best_area = area
+            best_bbox_area = bbox_area
 
     if best_label < 0:
         return None
-    if best_edge_large and best_mean_gray < 238:
+    if best_edge_large and best_mean_gray < 232:
         return None
+    if word_count > 2:
+        area_ratio = best_area / float(crop_area)
+        bbox_ratio = best_bbox_area / float(crop_area)
+        if area_ratio < 0.11 and bbox_ratio < 0.18:
+            return None
 
     component = (labels == best_label).astype(np.uint8) * 255
     bbox = _mask_bbox(component)
@@ -2328,6 +2382,82 @@ def _non_bubble_dialogue_surface(
         return None
 
     return x1, y1, bw, bh, local_mask
+
+
+def _bright_rect_dialogue_surface(
+    *,
+    gray: NDArray,
+    hsv: NDArray,
+    crop_area: int,
+    word_count: int,
+) -> tuple[int, int, int, int, NDArray] | None:
+    """Find a clean white narration/bubble surface before broader paper fill."""
+    h, w = gray.shape[:2]
+    bright = ((gray > 225) & (hsv[:, :, 1] < 45)).astype(np.uint8) * 255
+    bright = cv2.morphologyEx(
+        bright,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+        iterations=1,
+    )
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        bright,
+        connectivity=8,
+    )
+    if num_labels <= 1:
+        return None
+
+    cx = w * 0.5
+    cy = h * 0.5
+    best_label = -1
+    best_score = -1e9
+    for label in range(1, num_labels):
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        cw = int(stats[label, cv2.CC_STAT_WIDTH])
+        ch = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        bbox_area = max(1, cw * ch)
+        if area < max(240, int(crop_area * 0.035)):
+            continue
+        if cw < 28 or ch < 28:
+            continue
+        fill_ratio = area / float(bbox_area)
+        if fill_ratio < 0.78:
+            continue
+        comp_mask = labels == label
+        comp_mean_gray = float(np.mean(gray[comp_mask])) if np.any(comp_mask) else 0.0
+        if comp_mean_gray < 238:
+            continue
+        if word_count > 2:
+            area_ratio = area / float(crop_area)
+            bbox_ratio = bbox_area / float(crop_area)
+            if area_ratio < 0.08 and bbox_ratio < 0.10:
+                continue
+        edge_touches = int(x <= 1) + int(y <= 1)
+        edge_touches += int((x + cw) >= w - 1)
+        edge_touches += int((y + ch) >= h - 1)
+        if edge_touches >= 2 and bbox_area > int(crop_area * 0.62):
+            continue
+        center_dist = abs((x + cw * 0.5) - cx) + abs((y + ch * 0.5) - cy)
+        score = area * 1.4 + fill_ratio * 2000.0 - center_dist * 5.0
+        if score > best_score:
+            best_score = score
+            best_label = label
+
+    if best_label < 0:
+        return None
+
+    component = (labels == best_label).astype(np.uint8) * 255
+    bbox = _mask_bbox(component)
+    if bbox is None:
+        return None
+    x1, y1, x2, y2 = bbox
+    bw = x2 - x1
+    bh = y2 - y1
+    if bw < 18 or bh < 18:
+        return None
+    return x1, y1, bw, bh, component[y1:y2, x1:x2].copy()
 
 
 def _is_low_signal_dialogue_fragment(text: str) -> bool:
@@ -2658,6 +2788,99 @@ def _fit_shortened_dialogue_to_bubble_mask(
             continue
         font, lines, line_spacing, metrics, local_start_y = layout
         return font, lines, line_spacing, metrics, local_start_y, candidate
+
+    return None
+
+
+def _fit_relaxed_spill_dialogue_to_bubble_mask(
+    *,
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font_path: str | None,
+    avail_w: int,
+    avail_h: int,
+    mask: NDArray,
+    text_padding: int,
+    min_size: int,
+    max_size: int,
+    max_lines: int,
+) -> tuple[
+    ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    list[str],
+    int,
+    list[tuple[int, int, int, int]],
+    int,
+    str,
+    NDArray,
+] | None:
+    """Last-resort readable dialogue fit with a tiny controlled mask overflow."""
+    clean = " ".join(text.replace("\r", " ").replace("\n", " ").split())
+    if not clean or mask.size == 0:
+        return None
+
+    # Keep this as an emergency path for awkward speech balloons. Normal
+    # medium/large rectangular bubbles should keep the strict no-spill behavior.
+    min_dim = min(avail_w, avail_h)
+    max_dim = max(avail_w, avail_h)
+    aspect = max_dim / float(max(1, min_dim))
+    area = avail_w * avail_h
+    if min_dim > 120 and aspect < 1.45 and area > 22000:
+        return None
+
+    spill_px = int(np.clip(round(min_dim * 0.10), 3, 10))
+    if aspect >= 2.0:
+        spill_px = min(12, spill_px + 2)
+    kernel_size = spill_px * 2 + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    relaxed_mask = cv2.dilate((mask > 0).astype(np.uint8) * 255, kernel, iterations=1)
+
+    words = clean.split()
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add_candidate(candidate: str) -> None:
+        candidate = " ".join(candidate.split()).strip()
+        if candidate and candidate not in seen:
+            candidates.append(candidate)
+            seen.add(candidate)
+
+    add_candidate(clean)
+    for max_words in range(min(len(words) - 1, 12), 0, -1):
+        add_candidate(_compress_dialogue_for_tiny_box(clean, max_words=max_words))
+    for max_words in range(min(len(words) - 1, 10), 0, -1):
+        add_candidate(_truncate_dialogue_at_word_boundary(clean, max_words=max_words))
+
+    relaxed_max_lines = max_lines + (1 if avail_h >= 80 else 0)
+    for candidate in candidates:
+        layout = _fit_dialogue_to_bubble_mask(
+            draw=draw,
+            text=candidate,
+            font_path=font_path,
+            avail_w=avail_w,
+            avail_h=avail_h,
+            mask=relaxed_mask,
+            text_padding=text_padding,
+            min_size=min_size,
+            max_size=max(min_size, max_size),
+            max_lines=relaxed_max_lines,
+        )
+        if layout is None:
+            continue
+        font, lines, line_spacing, metrics, local_start_y = layout
+        logger.debug(
+            "Dialogue constraints: using controlled spill fallback, spill=%dpx, lines=%d",
+            spill_px,
+            len(lines),
+        )
+        return (
+            font,
+            lines,
+            line_spacing,
+            metrics,
+            local_start_y,
+            candidate,
+            relaxed_mask,
+        )
 
     return None
 
