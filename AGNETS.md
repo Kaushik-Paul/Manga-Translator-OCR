@@ -78,7 +78,7 @@ Use factory functions to get the right backend based on config:
 ### Parallelism
 - Multiple pages: `ThreadPoolExecutor` with batch processing (configurable via `MODAL_MAX_PARALLEL_PAGES` / `LOCAL_MAX_PARALLEL_PAGES`)
 - Multiple OCR sub-regions per page: parallel only when `USE_MODAL=true` (3 workers max)
-- LLM translation API: bounded by `BoundedSemaphore` (`OPENROUTER_MAX_CONCURRENT_CALLS`)
+- LLM translation API: bounded by `BoundedSemaphore` (`TRANSLATION_MAX_CONCURRENT_CALLS`)
 
 ## Code Style Conventions
 - `from __future__ import annotations` at the top of every module
@@ -123,7 +123,7 @@ USE_MANGAOCR_CPU          # true/false — Modal CPU vs GPU OCR
 USE_DETECTION_MODEL       # true/false — Modal vs local ONNX detector
 MODAL_MAX_PARALLEL_PAGES  # Parallelism when USE_MODAL=true
 LOCAL_MAX_PARALLEL_PAGES  # Parallelism when USE_MODAL=false
-OPENROUTER_MAX_CONCURRENT_CALLS  # LLM translation request concurrency
+TRANSLATION_MAX_CONCURRENT_CALLS  # LLM translation request concurrency
 GCP_SERVICE_ACCOUNT_BASE64
 GCP_BUCKET_NAME
 GRADIO_ACTION_PASSWORD

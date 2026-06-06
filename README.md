@@ -91,7 +91,7 @@ USE_MANGAOCR_CPU="false"
 HF_TOKEN="hf_xxx"
 
 # Optional: Max parallel LLM translation requests (set to 1 to fully serialize)
-OPENROUTER_MAX_CONCURRENT_CALLS="3"
+TRANSLATION_MAX_CONCURRENT_CALLS="3"
 
 # Optional: Parallel pages when running locally (USE_MODAL=false).
 # 2 is ideal for dual-core CPU + 16 GB RAM setups (e.g. HF Spaces).
