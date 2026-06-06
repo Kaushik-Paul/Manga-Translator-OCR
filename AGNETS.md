@@ -78,7 +78,7 @@ Use factory functions to get the right backend based on config:
 ### Parallelism
 - Multiple pages: `ThreadPoolExecutor` with batch processing (configurable via `MODAL_MAX_PARALLEL_PAGES` / `LOCAL_MAX_PARALLEL_PAGES`)
 - Multiple OCR sub-regions per page: parallel only when `USE_MODAL=true` (3 workers max)
-- OpenRouter API: bounded by `BoundedSemaphore` (`OPENROUTER_MAX_CONCURRENT_CALLS`)
+- LLM translation API: bounded by `BoundedSemaphore` (`OPENROUTER_MAX_CONCURRENT_CALLS`)
 
 ## Code Style Conventions
 - `from __future__ import annotations` at the top of every module
@@ -101,7 +101,7 @@ Use factory functions to get the right backend based on config:
 | `onnxruntime` | Local inference for `comic-text-detector` ONNX model |
 | `opencv-python-headless` | Image processing, inpainting, morphological ops |
 | `Pillow` | Text rendering onto images |
-| `httpx` | OpenRouter API calls (sync, with timeout config) |
+| `httpx` | LLM provider API calls (sync, with timeout config) |
 | `python-dotenv` | `.env` loading via `main/config.py` |
 | `gradio>=5.0` | Web UI |
 | `modal>=0.73` | Cloud GPU offloading for OCR and detection |
@@ -112,14 +112,18 @@ Use factory functions to get the right backend based on config:
 All settings are loaded from `.env` via `main/config.py` into a `Settings` dataclass singleton (`settings`). Key env vars:
 
 ```
-OPENROUTER_API_KEY        # Required
-TRANSLATION_MODEL         # Default: qwen/qwen3-235b-a22b-2507
+OPENCODE_GO_API_KEY       # Required when USE_OPENROUTER=false
+OPENCODE_GO_MODEL         # Default: deepseek-v4-flash
+OPENCODE_GO_API_STYLE     # auto/openai/anthropic
+USE_OPENROUTER            # false -> OpenCode Go, true -> OpenRouter
+OPENROUTER_API_KEY        # Required when USE_OPENROUTER=true
+OPENROUTER_MODEL          # Default: deepseek/deepseek-chat
 USE_MODAL                 # true/false — enables Modal GPU offloading
 USE_MANGAOCR_CPU          # true/false — Modal CPU vs GPU OCR
 USE_DETECTION_MODEL       # true/false — Modal vs local ONNX detector
 MODAL_MAX_PARALLEL_PAGES  # Parallelism when USE_MODAL=true
 LOCAL_MAX_PARALLEL_PAGES  # Parallelism when USE_MODAL=false
-OPENROUTER_MAX_CONCURRENT_CALLS
+OPENROUTER_MAX_CONCURRENT_CALLS  # LLM translation request concurrency
 GCP_SERVICE_ACCOUNT_BASE64
 GCP_BUCKET_NAME
 GRADIO_ACTION_PASSWORD

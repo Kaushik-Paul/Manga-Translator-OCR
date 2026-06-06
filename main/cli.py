@@ -52,8 +52,8 @@ Examples:
   # Translate a directory of pages
   uv run python -m main.cli --input ./manga_pages/ --output ./translated/
 
-  # Use a specific model
-  uv run python -m main.cli --input page.png --model mistralai/mistral-large-latest
+  # Use a specific model for the active provider
+  uv run python -m main.cli --input page.png --model deepseek-v4-flash
         """,
     )
 
@@ -76,7 +76,7 @@ Examples:
         "--model",
         "-m",
         default=None,
-        help="OpenRouter model override (default: deepseek/deepseek-chat)",
+        help="Model override for the active translation provider",
     )
     parser.add_argument(
         "--verbose",
@@ -100,7 +100,7 @@ def run(argv: list[str] | None = None) -> None:
     # Apply CLI args to settings
     settings.output_dir = Path(args.output)
     if args.model:
-        settings.translation_model = args.model
+        settings.set_active_translation_model(args.model)
 
     # Validate
     try:
@@ -110,7 +110,8 @@ def run(argv: list[str] | None = None) -> None:
         sys.exit(1)
 
     logger.info("Source language: %s", settings.source_lang)
-    logger.info("Translation model: %s", settings.translation_model)
+    logger.info("Translation provider: %s", settings.translation_provider)
+    logger.info("Translation model: %s", settings.active_translation_model)
     logger.info(
         "Detection backend: %s",
         "modal service" if settings.use_detection_model else "local model",

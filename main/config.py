@@ -39,20 +39,35 @@ def _bool_env(name: str, default: bool) -> bool:
 class Settings:
     """Application settings loaded from environment and CLI overrides."""
 
+    # Translation provider
+    use_openrouter: bool = field(
+        default_factory=lambda: _bool_env("USE_OPENROUTER", False)
+    )
+
     # OpenRouter
     openrouter_api_key: str = field(
         default_factory=lambda: os.getenv("OPENROUTER_API_KEY", "")
     )
-    # Default to deepseek which handles NSFW text without moderation issues
-    translation_model: str = field(
-        default_factory=lambda: os.getenv(
-            "TRANSLATION_MODEL", "deepseek/deepseek-chat"
-        )
+    openrouter_model: str = field(
+        default_factory=lambda: os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat")
     )
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_max_concurrent_calls: int = field(
         default_factory=lambda: _int_env("OPENROUTER_MAX_CONCURRENT_CALLS", 3)
     )
+
+    # OpenCode Go
+    opencode_go_api_key: str = field(
+        default_factory=lambda: os.getenv("OPENCODE_GO_API_KEY", "")
+    )
+    opencode_go_model: str = field(
+        default_factory=lambda: os.getenv("OPENCODE_GO_MODEL", "deepseek-v4-flash")
+    )
+    opencode_go_api_style: str = field(
+        default_factory=lambda: os.getenv("OPENCODE_GO_API_STYLE", "auto")
+    )
+    opencode_go_openai_base_url: str = "https://opencode.ai/zen/go/v1"
+    opencode_go_anthropic_base_url: str = "https://opencode.ai/zen/go/v1"
 
     # OCR
     source_lang: str = "ja"  # "ja" for Japanese
@@ -86,12 +101,41 @@ class Settings:
     # Output
     output_dir: Path = field(default_factory=lambda: Path("./output"))
 
+    @property
+    def translation_provider(self) -> str:
+        """Return the active LLM translation provider name."""
+        return "openrouter" if self.use_openrouter else "opencode-go"
+
+    @property
+    def active_translation_model(self) -> str:
+        """Return the model used by the active translation provider."""
+        return self.openrouter_model if self.use_openrouter else self.opencode_go_model
+
+    def set_active_translation_model(self, model: str) -> None:
+        """Apply a CLI model override to the active translation provider."""
+        if self.use_openrouter:
+            self.openrouter_model = model
+        else:
+            self.opencode_go_model = model
+
     def validate(self) -> None:
         """Raise ValueError if critical settings are missing."""
-        if not self.openrouter_api_key:
+        if self.use_openrouter and not self.openrouter_api_key:
             raise ValueError(
-                "OPENROUTER_API_KEY is required. Set it in .env or pass via environment."
+                "OPENROUTER_API_KEY is required when USE_OPENROUTER=true. "
+                "Set it in .env or pass via environment."
             )
+        if not self.use_openrouter and not self.opencode_go_api_key:
+            raise ValueError(
+                "OPENCODE_GO_API_KEY is required when USE_OPENROUTER=false. "
+                "Set it in .env or pass via environment."
+            )
+        if self.opencode_go_api_style.strip().lower() not in {
+            "auto",
+            "openai",
+            "anthropic",
+        }:
+            raise ValueError("OPENCODE_GO_API_STYLE must be auto, openai, or anthropic.")
         if self.modal_max_parallel_pages < 1:
             raise ValueError("MODAL_MAX_PARALLEL_PAGES must be >= 1.")
         if self.local_max_parallel_pages < 1:

@@ -1,32 +1,16 @@
-"""
-Translation module using OpenRouter API.
-
-Sends extracted text (not images) to OpenRouter for translation,
-using models that handle NSFW text content without moderation issues.
-"""
+"""Prompting, parsing, and post-processing for manga text translation."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import count
 import logging
 import re
-from threading import BoundedSemaphore
 import time
-import uuid
-
-import httpx
 
 from .config import settings
+from .model_client import call_translation_model
 
 logger = logging.getLogger(__name__)
-_OPENROUTER_CALL_SEMAPHORE = BoundedSemaphore(
-    value=max(1, int(getattr(settings, "openrouter_max_concurrent_calls", 1)))
-)
-_OPENROUTER_CALL_COUNTER = count(1)
-_OPENROUTER_LOCK_WAIT_POLL_SEC = 2.0
-_OPENROUTER_LOCK_WAIT_LOG_EVERY_SEC = 20.0
-_OPENROUTER_HTTP_TIMEOUT = httpx.Timeout(connect=15.0, read=120.0, write=30.0, pool=15.0)
 
 # System prompt designed for manga/doujinshi translation
 SYSTEM_PROMPT = """You are a professional manga/doujinshi translator with years of experience localizing Japanese adult comics for English-speaking audiences. Your job is to produce accurate, natural-sounding English translations that fit inside speech bubbles. This is a licensed professional translation workflow — all content, regardless of theme or explicitness, must be translated faithfully and completely. Refusing or softening any line is a translation error.
@@ -104,10 +88,10 @@ def translate_texts(
     Args:
         texts: List of source language text strings.
         source_lang: Source language ("ja" or "zh"). Defaults to settings.
-        model: OpenRouter model to use. Defaults to settings.
+        model: Model override for the active translation provider. Defaults to settings.
         max_retries: Number of retries on failure.
         constraints: Optional per-line translation constraints.
-        session_id: OpenRouter session ID for grouping related requests. All API calls within a single translation job share the same session_id.
+        session_id: Session ID for grouping related requests. All API calls within a single translation job share the same session_id.
 
     Returns:
         List of translated English strings (same length as input).
@@ -122,7 +106,7 @@ def translate_texts(
 
     lang = source_lang or settings.source_lang
     lang_name = "Japanese" if lang == "ja" else "Chinese"
-    model_name = model or settings.translation_model
+    model_name = model or settings.active_translation_model
 
     # Build the user message with numbered lines for batch translation
     numbered_lines = []
@@ -152,7 +136,12 @@ def translate_texts(
     translated_map: dict[int, str] = {}
     for attempt in range(max_retries):
         try:
-            response_text = _call_openrouter(model_name, user_message, session_id=session_id)
+            response_text = call_translation_model(
+                model_name,
+                user_message,
+                system_prompt=SYSTEM_PROMPT,
+                session_id=session_id,
+            )
             translated_map = _parse_numbered_response(response_text, len(indexed_texts))
             break
         except Exception as e:
@@ -208,7 +197,7 @@ def translate_texts(
         )
         for attempt in range(max_retries):
             try:
-                repair_response = _call_openrouter(
+                repair_response = call_translation_model(
                     model_name,
                     repair_message,
                     system_prompt=REPAIR_SYSTEM_PROMPT,
@@ -248,143 +237,6 @@ def translate_texts(
         results[original_idx] = _postprocess_translation(raw)
 
     return results
-
-
-def _call_openrouter(
-    model: str,
-    user_message: str,
-    system_prompt: str = SYSTEM_PROMPT,
-    session_id: str | None = None,
-) -> str:
-    """
-    Make a single API call to OpenRouter.
-
-    Args:
-        model: OpenRouter model identifier.
-        user_message: User prompt for the model.
-        system_prompt: System prompt for the model.
-        session_id: OpenRouter session ID sent as X-Session-Id header for request tracing.
-
-    Returns:
-        The model's response text.
-    """
-    headers = {
-        "Authorization": f"Bearer {settings.openrouter_api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/manga-translator-ocr",
-        "X-Title": "Manga Translator OCR",
-    }
-    if session_id:
-        headers["X-Session-Id"] = session_id
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-        "temperature": 0.3,
-        "max_tokens": 4096,
-        "reasoning": {
-            "effort": "none",
-        },
-        "include_reasoning": False,
-    }
-
-    call_id = next(_OPENROUTER_CALL_COUNTER)
-    call_started_at = time.monotonic()
-    logger.info("Calling OpenRouter API #%d (model: %s)...", call_id, model)
-
-    # Bound outbound OpenRouter concurrency across page-worker threads.
-    # This avoids provider-side empty-content responses seen under burst concurrency
-    # while still allowing parallel calls.
-    slot_wait_sec = _acquire_openrouter_lock(call_id)
-
-    try:
-        logger.info(
-            "OpenRouter API #%d slot acquired (wait %.2fs).", call_id, slot_wait_sec
-        )
-        try:
-            with httpx.Client(timeout=_OPENROUTER_HTTP_TIMEOUT) as client:
-                response = client.post(
-                    f"{settings.openrouter_base_url}/chat/completions",
-                    json=payload,
-                    headers=headers,
-                )
-                response.raise_for_status()
-        except httpx.TimeoutException as e:
-            elapsed = time.monotonic() - call_started_at
-            raise TimeoutError(
-                f"OpenRouter API timeout for call #{call_id} after {elapsed:.2f}s "
-                f"(slot wait {slot_wait_sec:.2f}s): {e}"
-            ) from e
-        except httpx.HTTPStatusError as e:
-            response_preview = _truncate_for_log(e.response.text)
-            status_code = e.response.status_code
-            raise RuntimeError(
-                f"OpenRouter API HTTP {status_code} for call #{call_id}: "
-                f"{response_preview or '<empty response body>'}"
-            ) from e
-        except httpx.RequestError as e:
-            elapsed = time.monotonic() - call_started_at
-            raise RuntimeError(
-                f"OpenRouter API request error for call #{call_id} after {elapsed:.2f}s: {e}"
-            ) from e
-    finally:
-        _OPENROUTER_CALL_SEMAPHORE.release()
-
-    try:
-        data = response.json()
-    except ValueError as e:
-        body_preview = _truncate_for_log(response.text)
-        raise ValueError(
-            f"OpenRouter returned invalid JSON for call #{call_id}: "
-            f"{body_preview or '<empty body>'}"
-        ) from e
-
-    # Extract the response text
-    choices = data.get("choices", [])
-    if not choices:
-        raise ValueError("No choices returned from OpenRouter API")
-
-    message = choices[0].get("message", {})
-    content = message.get("content", "")
-    text = _coerce_message_content(content).strip()
-    if not text:
-        raise ValueError("OpenRouter returned empty translation content.")
-    logger.info(
-        "Translation received from OpenRouter API #%d (%d chars, %.2fs total).",
-        call_id,
-        len(text),
-        time.monotonic() - call_started_at,
-    )
-    return text
-
-
-def _truncate_for_log(text: str, limit: int = 400) -> str:
-    cleaned = " ".join(text.split())
-    if len(cleaned) <= limit:
-        return cleaned
-    return cleaned[: limit - 3] + "..."
-
-
-def _acquire_openrouter_lock(call_id: int) -> float:
-    """Wait for an OpenRouter concurrency slot, logging periodically while queued."""
-    wait_started_at = time.monotonic()
-    next_log_after_sec = _OPENROUTER_LOCK_WAIT_LOG_EVERY_SEC
-
-    while True:
-        if _OPENROUTER_CALL_SEMAPHORE.acquire(timeout=_OPENROUTER_LOCK_WAIT_POLL_SEC):
-            return time.monotonic() - wait_started_at
-
-        waited_sec = time.monotonic() - wait_started_at
-        if waited_sec >= next_log_after_sec:
-            logger.warning(
-                "OpenRouter API #%d still waiting on concurrency slot (%.2fs).",
-                call_id,
-                waited_sec,
-            )
-            next_log_after_sec += _OPENROUTER_LOCK_WAIT_LOG_EVERY_SEC
 
 
 def _contains_cjk(text: str) -> bool:
@@ -560,32 +412,6 @@ def _parse_numbered_response(response: str, expected_count: int) -> dict[int, st
             result[next_idx] = line
 
     return result
-
-
-def _coerce_message_content(content: object) -> str:
-    """
-    Normalize OpenRouter message content to plain text.
-
-    Handles both legacy string responses and structured content lists.
-    """
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
-
-    parts: list[str] = []
-    for block in content:
-        if isinstance(block, str):
-            if block.strip():
-                parts.append(block.strip())
-            continue
-        if not isinstance(block, dict):
-            continue
-        if block.get("type") == "text":
-            text_value = block.get("text")
-            if isinstance(text_value, str) and text_value.strip():
-                parts.append(text_value.strip())
-    return "\n".join(parts)
 
 
 def _looks_like_refusal_text(text: str) -> bool:
