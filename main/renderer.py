@@ -626,6 +626,24 @@ def render_text_on_image(
         max_size_cap=max_size_cap,
     )
     stroke_width = _stroke_width_for_font(font)
+    if text_style == "dialogue" and not lines:
+        rescue = _fit_narrow_dialogue_rescue(
+            draw=draw,
+            text=text,
+            max_w=avail_w,
+            max_h=avail_h,
+            font_path=font_file,
+            max_size_cap=max_size_cap,
+        )
+        if rescue is not None:
+            text, font, lines, line_spacing = rescue
+            stroke_width = _stroke_width_for_font(font)
+            logger.debug(
+                "Dialogue constraints: using narrow rescue text='%s' size=%d lines=%d",
+                text,
+                getattr(font, "size", 0),
+                len(lines),
+            )
     if text_style == "sfx" and lines:
         widest = _max_line_width(draw, lines, font, stroke_width=stroke_width)
         if widest > int(avail_w * 1.08):
@@ -2084,6 +2102,125 @@ def _fit_text_to_box(
     return font, lines, spacing
 
 
+def _fit_narrow_dialogue_rescue(
+    *,
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    max_w: int,
+    max_h: int,
+    font_path: str | None,
+    max_size_cap: int | None,
+) -> tuple[
+    str,
+    ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    list[str],
+    int,
+] | None:
+    """Fit otherwise-blank dialogue using shorter word-boundary candidates."""
+    clean = " ".join(text.replace("\r", " ").replace("\n", " ").split())
+    if not clean:
+        return None
+
+    if max_h > max_w * 3:
+        max_lines = 10
+    elif max_h > max_w * 2:
+        max_lines = 8
+    else:
+        max_lines = 6
+
+    best: tuple[
+        float,
+        str,
+        ImageFont.FreeTypeFont | ImageFont.ImageFont,
+        list[str],
+        int,
+    ] | None = None
+    for order, candidate in enumerate(_narrow_dialogue_rescue_candidates(clean)):
+        if _is_punctuation_only(candidate):
+            continue
+        font, lines, spacing = _fit_text_to_box(
+            draw=draw,
+            text=candidate,
+            max_w=max_w,
+            max_h=max_h,
+            font_path=font_path,
+            style="dialogue",
+            min_size=12,
+            max_size_cap=max_size_cap,
+        )
+        if not lines or len(lines) > max_lines:
+            continue
+        stroke_width = _stroke_width_for_font(font)
+        if _max_line_width(draw, lines, font, stroke_width=stroke_width) > max_w + 1:
+            continue
+        total_h = _text_layout_height(
+            draw=draw,
+            lines=lines,
+            font=font,
+            line_spacing=spacing,
+            stroke_width=stroke_width,
+        )
+        if total_h > max_h:
+            continue
+
+        word_score = len(re.findall(r"[A-Za-z0-9']+", candidate))
+        size_score = getattr(font, "size", 0)
+        score = word_score * 100.0 + size_score * 2.0 - len(lines) * 3.0 - order * 0.1
+        if best is None or score > best[0]:
+            best = (score, candidate, font, lines, spacing)
+
+    if best is None:
+        return None
+
+    _, candidate, font, lines, spacing = best
+    return candidate, font, lines, spacing
+
+
+def _narrow_dialogue_rescue_candidates(text: str) -> list[str]:
+    """Generate short dialogue variants without breaking words or adding hyphens."""
+    normalized = re.sub(r"\b([A-Z])-([A-Z][A-Z]+)", r"\2", text)
+    normalized = re.sub(r"(?<=[A-Za-z])-(?=[A-Za-z])", " ", normalized)
+    normalized = " ".join(normalized.split())
+    words = normalized.split()
+    if not words:
+        return []
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add(candidate: str) -> None:
+        candidate = " ".join(candidate.split()).strip()
+        candidate = candidate.strip(" ,;:")
+        if not candidate or candidate in seen:
+            return
+        seen.add(candidate)
+        candidates.append(candidate)
+
+    add(normalized)
+
+    max_words = min(8, len(words))
+    for count in range(max_words, 0, -1):
+        add(_truncate_dialogue_at_word_boundary(normalized, max_words=count))
+        head = " ".join(words[:count]).rstrip(".,;:!?")
+        if count < len(words):
+            head = f"{head}..."
+        add(head)
+        add(" ".join(words[-count:]))
+
+    # Prefer meaningful short words over rendering nothing when the first word
+    # is the one that makes the layout impossible, e.g. "ESPECIALLY".
+    shortish_words = [
+        word
+        for word in words
+        if len(word.strip(".,;:!?\"'")) <= 8
+        and any(ch.isalnum() for ch in word)
+    ]
+    for count in range(min(6, len(shortish_words)), 0, -1):
+        add(" ".join(shortish_words[-count:]))
+
+    return candidates
+
+
 def _should_prefer_hyphenated_layout(
     *,
     no_hyphen_size: int,
@@ -2316,6 +2453,7 @@ def _non_bubble_dialogue_surface(
     best_mean_gray = 0.0
     best_area = 0
     best_bbox_area = 0
+    best_fill_ratio = 0.0
     for label in range(1, num_labels):
         x = int(stats[label, cv2.CC_STAT_LEFT])
         y = int(stats[label, cv2.CC_STAT_TOP])
@@ -2355,6 +2493,7 @@ def _non_bubble_dialogue_surface(
             best_mean_gray = comp_mean_gray
             best_area = area
             best_bbox_area = bbox_area
+            best_fill_ratio = fill_ratio
 
     if best_label < 0:
         return None
@@ -2363,7 +2502,16 @@ def _non_bubble_dialogue_surface(
     if word_count > 2:
         area_ratio = best_area / float(crop_area)
         bbox_ratio = best_bbox_area / float(crop_area)
-        if area_ratio < 0.11 and bbox_ratio < 0.18:
+        high_confidence_jagged_paper = (
+            best_mean_gray >= 245
+            and best_fill_ratio >= 0.48
+            and (area_ratio >= 0.075 or bbox_ratio >= 0.14)
+        )
+        if (
+            area_ratio < 0.11
+            and bbox_ratio < 0.18
+            and not high_confidence_jagged_paper
+        ):
             return None
 
     component = (labels == best_label).astype(np.uint8) * 255
@@ -2508,6 +2656,30 @@ def _max_line_width(
         )
         widths.append(max(0, int(right - left)))
     return max(widths) if widths else 0
+
+
+def _text_layout_height(
+    *,
+    draw: ImageDraw.ImageDraw,
+    lines: list[str],
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    line_spacing: int,
+    stroke_width: int = 0,
+) -> int:
+    """Return the rendered text block height in pixels."""
+    if not lines:
+        return 0
+    heights: list[int] = []
+    for line in lines:
+        _, top, _, bottom = draw.textbbox(
+            (0, 0),
+            line,
+            font=font,
+            anchor="lt",
+            stroke_width=stroke_width,
+        )
+        heights.append(max(0, int(bottom - top)))
+    return sum(heights) + max(0, len(lines) - 1) * line_spacing
 
 
 def _is_overbroken_sfx(
@@ -2770,6 +2942,10 @@ def _fit_shortened_dialogue_to_bubble_mask(
         if candidate and candidate not in seen:
             candidates.append(candidate)
             seen.add(candidate)
+    for candidate in _narrow_dialogue_rescue_candidates(clean):
+        if candidate and candidate not in seen:
+            candidates.append(candidate)
+            seen.add(candidate)
 
     for candidate in candidates:
         layout = _fit_dialogue_to_bubble_mask(
@@ -2849,6 +3025,8 @@ def _fit_relaxed_spill_dialogue_to_bubble_mask(
         add_candidate(_compress_dialogue_for_tiny_box(clean, max_words=max_words))
     for max_words in range(min(len(words) - 1, 10), 0, -1):
         add_candidate(_truncate_dialogue_at_word_boundary(clean, max_words=max_words))
+    for candidate in _narrow_dialogue_rescue_candidates(clean):
+        add_candidate(candidate)
 
     relaxed_max_lines = max_lines + (1 if avail_h >= 80 else 0)
     for candidate in candidates:
