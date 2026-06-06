@@ -25,7 +25,7 @@ _TRANSLATION_CALL_COUNTER = count(1)
 _TRANSLATION_LOCK_WAIT_POLL_SEC = 2.0
 _TRANSLATION_LOCK_WAIT_LOG_EVERY_SEC = 20.0
 _TRANSLATION_HTTP_TIMEOUT = httpx.Timeout(connect=15.0, read=120.0, write=30.0, pool=15.0)
-_OPENCODE_GO_ANTHROPIC_PREFIXES = ("minimax-", "qwen")
+_OPENCODE_GO_ANTHROPIC_MODELS = {"minimax-m2.7", "qwen3.5-plus", "qwen3.6-plus"}
 
 
 def call_translation_model(
@@ -190,6 +190,13 @@ def _call_opencode_go_openai(
         ],
         "temperature": 0.3,
         "max_tokens": 4096,
+        "reasoning": {
+            "effort": "none",
+        },
+        "thinking": {
+            "type": "disabled",
+        },
+        "include_reasoning": False,
     }
 
     call_id = next(_TRANSLATION_CALL_COUNTER)
@@ -376,7 +383,7 @@ def _opencode_go_api_style(model: str) -> str:
         raise RuntimeError("OPENCODE_GO_API_STYLE must be auto, openai, or anthropic")
 
     model_id = _opencode_go_model_id(model).lower()
-    if model_id.startswith(_OPENCODE_GO_ANTHROPIC_PREFIXES):
+    if model_id in _OPENCODE_GO_ANTHROPIC_MODELS:
         return "anthropic"
     return "openai"
 
@@ -416,10 +423,11 @@ def _coerce_openai_content(content: object) -> str:
             continue
         if not isinstance(block, dict):
             continue
-        if block.get("type") == "text":
-            text_value = block.get("text")
+        for key in ("text", "output_text", "content"):
+            text_value = block.get(key)
             if isinstance(text_value, str) and text_value.strip():
                 parts.append(text_value.strip())
+                break
     return "\n".join(parts)
 
 
@@ -438,7 +446,9 @@ def _coerce_anthropic_content(content: object) -> str:
             continue
         if not isinstance(block, dict):
             continue
-        text_value = block.get("text")
-        if isinstance(text_value, str) and text_value.strip():
-            parts.append(text_value.strip())
+        for key in ("text", "output_text", "content"):
+            text_value = block.get(key)
+            if isinstance(text_value, str) and text_value.strip():
+                parts.append(text_value.strip())
+                break
     return "\n".join(parts)

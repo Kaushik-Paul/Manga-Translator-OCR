@@ -75,8 +75,8 @@ USE_OPENROUTER="false"
 OPENROUTER_API_KEY="your-openrouter-api-key-here"
 OPENROUTER_MODEL="deepseek/deepseek-chat"
 
-# Optional: auto, openai, or anthropic. Auto handles MiniMax/Qwen Anthropic-style
-# OpenCode Go models and OpenAI-compatible models like deepseek-v4-flash.
+# Optional: auto, openai, or anthropic. Auto handles Anthropic-style OpenCode Go
+# models minimax-m2.7, qwen3.5-plus, and qwen3.6-plus.
 OPENCODE_GO_API_STYLE="auto"
 
 # Optional: Enable Modal OCR offloading
