@@ -851,10 +851,17 @@ def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:
                 region_h=region.h,
             )
         else:
-            # A detector region lying on one balloon is already one semantic
-            # dialogue unit. Splitting its vertical glyph columns produces
-            # one-character translations and leaves most of the balloon blank.
-            return [region]
+            clustered_boxes = _split_bright_bubble_by_text_clusters(
+                region=region,
+                boxes=boxes,
+            )
+            if len(clustered_boxes) >= 2:
+                merged_boxes = clustered_boxes
+            else:
+                # A detector region lying on one balloon is already one semantic
+                # dialogue unit. Splitting its vertical glyph columns produces
+                # one-character translations and leaves most of the balloon blank.
+                return [region]
     else:
         merged_boxes = []
 
@@ -982,7 +989,7 @@ def _split_bright_bubble_text_groups(
         connectivity=8,
     )
     region_area = max(1, region.w * region.h)
-    candidates: list[tuple[int, int, int, int, int]] = []
+    candidates: list[tuple[int, int, int, int, int, int]] = []
     for label in range(1, num_labels):
         x = int(stats[label, cv2.CC_STAT_LEFT])
         y = int(stats[label, cv2.CC_STAT_TOP])
@@ -1005,7 +1012,7 @@ def _split_bright_bubble_text_groups(
             continue
         if fill_ratio < 0.34:
             continue
-        candidates.append((x, y, x + w, y + h, area))
+        candidates.append((x, y, x + w, y + h, area, label))
 
     if not candidates:
         return [], boxes
@@ -1013,7 +1020,7 @@ def _split_bright_bubble_text_groups(
     candidates.sort(key=lambda item: item[4], reverse=True)
     used: set[int] = set()
     bubble_groups: list[tuple[int, int, int, int]] = []
-    for cx1, cy1, cx2, cy2, area in candidates:
+    for cx1, cy1, cx2, cy2, area, label in candidates:
         members: list[tuple[int, int, int, int]] = []
         for idx, box in enumerate(boxes):
             if idx in used:
@@ -1034,6 +1041,25 @@ def _split_bright_bubble_text_groups(
         if len(members) < 2 and area < 6000:
             continue
 
+        lobe_groups = _split_bright_component_into_text_lobes(
+            component_mask=(labels == label).astype(np.uint8) * 255,
+            component_box=(cx1, cy1, cx2, cy2),
+            members=members,
+        )
+        if len(lobe_groups) >= 2:
+            for group_members in lobe_groups:
+                gx1 = min(item[0] for item in group_members)
+                gy1 = min(item[1] for item in group_members)
+                gx2 = max(item[2] for item in group_members)
+                gy2 = max(item[3] for item in group_members)
+                if (gx2 - gx1) < 12 or (gy2 - gy1) < 12:
+                    continue
+                bubble_groups.append((gx1, gy1, gx2, gy2))
+            for idx, box in enumerate(boxes):
+                if box in members:
+                    used.add(idx)
+            continue
+
         gx1 = min(item[0] for item in members)
         gy1 = min(item[1] for item in members)
         gx2 = max(item[2] for item in members)
@@ -1048,6 +1074,180 @@ def _split_bright_bubble_text_groups(
 
     remaining = [box for idx, box in enumerate(boxes) if idx not in used]
     return bubble_groups, remaining
+
+
+def _split_bright_component_into_text_lobes(
+    component_mask: np.ndarray,
+    component_box: tuple[int, int, int, int],
+    members: list[tuple[int, int, int, int]],
+) -> list[list[tuple[int, int, int, int]]]:
+    """Split touching speech-balloon paper into separate text lobe groups."""
+    if component_mask.size == 0 or len(members) < 2:
+        return []
+
+    cx1, cy1, cx2, cy2 = component_box
+    cw = max(1, cx2 - cx1)
+    ch = max(1, cy2 - cy1)
+    if cw < 90 and ch < 90:
+        return []
+
+    crop = component_mask[cy1:cy2, cx1:cx2].astype(np.uint8)
+    comp_area = cv2.countNonZero(crop)
+    if comp_area < 1200:
+        return []
+
+    # Erosion exposes the neck between adjacent balloons while usually keeping
+    # a single balloon as one component. The selected lobes are dilated back
+    # before text boxes are assigned to avoid losing edge glyphs.
+    k = _odd(max(7, min(35, int(round(min(cw, ch) * 0.13)))))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    eroded = cv2.erode(crop, kernel, iterations=1)
+    if cv2.countNonZero(eroded) < max(220, int(comp_area * 0.16)):
+        return []
+
+    num_lobes, lobe_labels, stats, _ = cv2.connectedComponentsWithStats(
+        eroded,
+        connectivity=8,
+    )
+    lobes: list[tuple[int, int, int, int, int, np.ndarray]] = []
+    for label in range(1, num_lobes):
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < max(180, int(comp_area * 0.055)):
+            continue
+        if w < 22 or h < 22:
+            continue
+        lobe = (lobe_labels == label).astype(np.uint8) * 255
+        lobe = cv2.dilate(lobe, kernel, iterations=1)
+        lobe = cv2.bitwise_and(lobe, crop)
+        if cv2.countNonZero(lobe) < max(220, int(comp_area * 0.07)):
+            continue
+        bbox = _mask_bbox_local(lobe)
+        if bbox is None:
+            continue
+        lx1, ly1, lx2, ly2 = bbox
+        lobes.append((lx1, ly1, lx2, ly2, cv2.countNonZero(lobe), lobe))
+
+    if len(lobes) < 2:
+        return []
+
+    groups: list[list[tuple[int, int, int, int]]] = [[] for _ in lobes]
+    for box in members:
+        bx1, by1, bx2, by2 = box
+        local_box = (
+            max(0, bx1 - cx1),
+            max(0, by1 - cy1),
+            min(cw, bx2 - cx1),
+            min(ch, by2 - cy1),
+        )
+        if local_box[2] <= local_box[0] or local_box[3] <= local_box[1]:
+            continue
+
+        bcx = (local_box[0] + local_box[2]) * 0.5
+        bcy = (local_box[1] + local_box[3]) * 0.5
+        best_idx = -1
+        best_score = -1e9
+        box_area = max(1, (local_box[2] - local_box[0]) * (local_box[3] - local_box[1]))
+        for idx, (lx1, ly1, lx2, ly2, lobe_area, lobe_mask) in enumerate(lobes):
+            crop_mask = lobe_mask[
+                local_box[1] : local_box[3],
+                local_box[0] : local_box[2],
+            ]
+            overlap = cv2.countNonZero(crop_mask)
+            inside = lx1 - 3 <= bcx <= lx2 + 3 and ly1 - 3 <= bcy <= ly2 + 3
+            lcx = (lx1 + lx2) * 0.5
+            lcy = (ly1 + ly2) * 0.5
+            dist = abs(lcx - bcx) + abs(lcy - bcy)
+            score = overlap * 12.0 + (500.0 if inside else 0.0) - dist
+            if overlap >= int(box_area * 0.08) and score > best_score:
+                best_idx = idx
+                best_score = score
+
+        if best_idx >= 0:
+            groups[best_idx].append(box)
+
+    groups = [group for group in groups if group]
+    if len(groups) < 2:
+        return []
+
+    centers: list[tuple[float, float]] = []
+    for group in groups:
+        gx1 = min(item[0] for item in group)
+        gy1 = min(item[1] for item in group)
+        gx2 = max(item[2] for item in group)
+        gy2 = max(item[3] for item in group)
+        centers.append(((gx1 + gx2) * 0.5, (gy1 + gy2) * 0.5))
+
+    separated_pairs = 0
+    for i, (ax, ay) in enumerate(centers):
+        for bx, by in centers[i + 1 :]:
+            if abs(ax - bx) >= max(28, cw * 0.16) or abs(ay - by) >= max(28, ch * 0.16):
+                separated_pairs += 1
+    if separated_pairs == 0:
+        return []
+
+    return groups
+
+
+def _split_bright_bubble_by_text_clusters(
+    region: TextRegion,
+    boxes: list[tuple[int, int, int, int]],
+) -> list[tuple[int, int, int, int]]:
+    """Split side-by-side balloons when text clusters have a clear empty gap."""
+    if len(boxes) < 4 or region.w < 110 or region.h < 70:
+        return []
+
+    gap = max(14, int(min(region.w, region.h) * 0.085))
+    clusters = _merge_nearby_boxes(boxes, gap=gap)
+    clusters = [
+        box
+        for box in clusters
+        if (box[2] - box[0]) >= 18
+        and (box[3] - box[1]) >= 18
+        and ((box[2] - box[0]) * (box[3] - box[1])) >= 300
+    ]
+    if not (2 <= len(clusters) <= 5):
+        return []
+
+    clusters = sorted(clusters, key=lambda b: (b[0] + b[2]) * 0.5)
+    clear_gap = False
+    for left, right in zip(clusters, clusters[1:]):
+        x_gap = right[0] - left[2]
+        y_overlap = max(0, min(left[3], right[3]) - max(left[1], right[1]))
+        min_h = max(1, min(left[3] - left[1], right[3] - right[1]))
+        if x_gap >= max(38, int(region.w * 0.20)) and y_overlap >= int(min_h * 0.20):
+            clear_gap = True
+            break
+
+    if not clear_gap:
+        clusters_y = sorted(clusters, key=lambda b: (b[1] + b[3]) * 0.5)
+        for upper, lower in zip(clusters_y, clusters_y[1:]):
+            y_gap = lower[1] - upper[3]
+            x_overlap = max(0, min(upper[2], lower[2]) - max(upper[0], lower[0]))
+            min_w = max(1, min(upper[2] - upper[0], lower[2] - lower[0]))
+            if y_gap >= max(38, int(region.h * 0.20)) and x_overlap >= int(min_w * 0.20):
+                clear_gap = True
+                break
+
+    if not clear_gap:
+        return []
+
+    return clusters
+
+
+def _mask_bbox_local(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    ys, xs = np.where(mask > 0)
+    if len(xs) < 20:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def _odd(value: int) -> int:
+    """Round up to an odd integer for morphology kernels."""
+    return value if value % 2 == 1 else value + 1
 
 
 def _refine_oversized_ocr_groups(

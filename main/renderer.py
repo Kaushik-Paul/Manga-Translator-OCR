@@ -772,6 +772,14 @@ def render_text_on_image(
         lh = max(0, int(bottom - top))
         line_metrics.append((lw, lh, int(left), int(top)))
 
+    if (
+        text_style == "dialogue"
+        and box_clip_mask is None
+        and line_metrics
+        and max(lw for lw, _, _, _ in line_metrics) > avail_w + 2
+    ):
+        return image
+
     total_text_height = (
         sum(lh for _, lh, _, _ in line_metrics) + (len(lines) - 1) * line_spacing
     )
@@ -1687,6 +1695,21 @@ def _bubble_mask_has_paper_surface(
     mean_sat = float(np.mean(sat_vals))
     mean_gray = float(np.mean(gray_vals))
 
+    bbox = _mask_bbox(bubble_mask)
+    if bbox is None:
+        return False
+    bx1, by1, bx2, by2 = bbox
+    bh, bw = bubble_mask.shape[:2]
+    bbox_area = max(1, (bx2 - bx1) * (by2 - by1))
+    edge_touches = int(bx1 <= 1) + int(by1 <= 1)
+    edge_touches += int(bx2 >= bw - 1) + int(by2 >= bh - 1)
+    if (
+        edge_touches >= 2
+        and bbox_area > int(bw * bh * 0.45)
+        and mean_gray < 238
+    ):
+        return False
+
     if paper_ratio >= 0.38:
         return True
     if paper_ratio >= 0.26 and mean_gray >= 185 and mean_sat < 52:
@@ -2244,6 +2267,8 @@ def _non_bubble_dialogue_surface(
     cy = h * 0.5
     best_label = -1
     best_score = -1e9
+    best_edge_large = False
+    best_mean_gray = 0.0
     for label in range(1, num_labels):
         x = int(stats[label, cv2.CC_STAT_LEFT])
         y = int(stats[label, cv2.CC_STAT_TOP])
@@ -2258,15 +2283,33 @@ def _non_bubble_dialogue_surface(
             continue
         if fill_ratio < 0.34:
             continue
+        edge_touches = int(x <= 1) + int(y <= 1)
+        edge_touches += int((x + cw) >= w - 1)
+        edge_touches += int((y + ch) >= h - 1)
+        edge_large = edge_touches >= 2 and bbox_area > int(crop_area * 0.45)
+        comp_mask = labels == label
+        comp_mean_gray = float(np.mean(gray[comp_mask])) if np.any(comp_mask) else 0.0
         comp_cx = x + cw * 0.5
         comp_cy = y + ch * 0.5
         center_dist = abs(comp_cx - cx) + abs(comp_cy - cy)
         score = area * 1.4 + bbox_area * 0.15 - center_dist * 3.0
+        if edge_large:
+            # Pale skin/walls often pass the low-saturation paper test. True
+            # narration boxes are usually near-white, so only heavily penalize
+            # large edge-touching surfaces that are not very bright.
+            if comp_mean_gray < 238:
+                score -= area * 4.0
+            else:
+                score -= area * 0.35
         if score > best_score:
             best_score = score
             best_label = label
+            best_edge_large = edge_large
+            best_mean_gray = comp_mean_gray
 
     if best_label < 0:
+        return None
+    if best_edge_large and best_mean_gray < 238:
         return None
 
     component = (labels == best_label).astype(np.uint8) * 255
@@ -2592,6 +2635,11 @@ def _fit_shortened_dialogue_to_bubble_mask(
         if candidate and candidate not in seen:
             candidates.append(candidate)
             seen.add(candidate)
+    for max_words in range(min(len(words) - 1, 10), 1, -1):
+        candidate = _truncate_dialogue_at_word_boundary(clean, max_words=max_words)
+        if candidate and candidate not in seen:
+            candidates.append(candidate)
+            seen.add(candidate)
 
     for candidate in candidates:
         layout = _fit_dialogue_to_bubble_mask(
@@ -2612,6 +2660,18 @@ def _fit_shortened_dialogue_to_bubble_mask(
         return font, lines, line_spacing, metrics, local_start_y, candidate
 
     return None
+
+
+def _truncate_dialogue_at_word_boundary(text: str, max_words: int) -> str:
+    """Shorten dialogue for tiny masks without breaking or hyphenating words."""
+    clean = " ".join(text.replace("\r", " ").replace("\n", " ").split())
+    if not clean:
+        return clean
+    words = clean.split()
+    if len(words) <= max_words:
+        return clean
+    trimmed = " ".join(words[:max_words]).rstrip(".,;:!?")
+    return f"{trimmed}..."
 
 
 def _candidate_mask_start_ys(centered: int, padding: int, slack: int) -> list[int]:
