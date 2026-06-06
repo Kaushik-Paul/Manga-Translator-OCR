@@ -669,8 +669,10 @@ def render_text_on_image(
     # Tall narrow bubbles need more lines; cap based on available height.
     _DIALOGUE_MIN_SIZE = 12
     if box_h > box_w * 3:
-        _DIALOGUE_MAX_LINES = 10
+        _DIALOGUE_MAX_LINES = 11
     elif box_h > box_w * 2:
+        _DIALOGUE_MAX_LINES = 10
+    elif box_h > box_w * 1.5:
         _DIALOGUE_MAX_LINES = 8
     else:
         _DIALOGUE_MAX_LINES = 6
@@ -2571,21 +2573,33 @@ def _bright_rect_dialogue_surface(
         if cw < 28 or ch < 28:
             continue
         fill_ratio = area / float(bbox_area)
-        if fill_ratio < 0.78:
-            continue
         comp_mask = labels == label
         comp_mean_gray = float(np.mean(gray[comp_mask])) if np.any(comp_mask) else 0.0
         if comp_mean_gray < 238:
             continue
-        if word_count > 2:
-            area_ratio = area / float(crop_area)
-            bbox_ratio = bbox_area / float(crop_area)
-            if area_ratio < 0.08 and bbox_ratio < 0.10:
-                continue
         edge_touches = int(x <= 1) + int(y <= 1)
         edge_touches += int((x + cw) >= w - 1)
         edge_touches += int((y + ch) >= h - 1)
-        if edge_touches >= 2 and bbox_area > int(crop_area * 0.62):
+        area_ratio = area / float(crop_area)
+        bbox_ratio = bbox_area / float(crop_area)
+        is_clean_rect = fill_ratio >= 0.78
+        is_jagged_white_bubble = (
+            comp_mean_gray >= 248
+            and fill_ratio >= 0.45
+            and area_ratio >= 0.06
+            and bbox_ratio >= 0.12
+            and bbox_ratio <= 0.82
+            and not (edge_touches >= 3 and bbox_ratio > 0.55)
+        )
+        if not is_clean_rect and not is_jagged_white_bubble:
+            continue
+        if word_count > 2:
+            if is_clean_rect:
+                if area_ratio < 0.08 and bbox_ratio < 0.10:
+                    continue
+            elif area_ratio < 0.14 and bbox_ratio < 0.24:
+                continue
+        if is_clean_rect and edge_touches >= 2 and bbox_area > int(crop_area * 0.62):
             continue
         center_dist = abs((x + cw * 0.5) - cx) + abs((y + ch * 0.5) - cy)
         score = area * 1.4 + fill_ratio * 2000.0 - center_dist * 5.0
