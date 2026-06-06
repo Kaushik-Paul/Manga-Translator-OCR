@@ -831,11 +831,32 @@ def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:
     region_area = region.w * region.h
     large_mixed_region = region_area >= 120_000 and len(boxes) >= 10
 
-    if not large_mixed_region and _context_region_has_bright_bubble(region):
-        # A detector region lying on balloon paper is already one semantic
-        # dialogue unit. Splitting its vertical glyph columns produces
-        # one-character translations and leaves most of the balloon blank.
-        return [region]
+    bright_bubble_region = (
+        not large_mixed_region and _context_region_has_bright_bubble(region)
+    )
+    if bright_bubble_region:
+        bubble_text_boxes, remaining_boxes = _split_bright_bubble_text_groups(
+            region=region,
+            boxes=boxes,
+        )
+        if len(bubble_text_boxes) >= 2:
+            merged_boxes = bubble_text_boxes + _merge_nearby_boxes(
+                remaining_boxes,
+                gap=max(8, int(min(region.w, region.h) * 0.04)),
+            )
+            merged_boxes = _refine_oversized_ocr_groups(
+                merged_boxes=merged_boxes,
+                component_boxes=boxes,
+                region_w=region.w,
+                region_h=region.h,
+            )
+        else:
+            # A detector region lying on one balloon is already one semantic
+            # dialogue unit. Splitting its vertical glyph columns produces
+            # one-character translations and leaves most of the balloon blank.
+            return [region]
+    else:
+        merged_boxes = []
 
     if large_mixed_region:
         # Panel-sized detections often contain several speech bubbles plus SFX.
@@ -863,10 +884,10 @@ def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:
             region_w=region.w,
             region_h=region.h,
         )
-    else:
+    elif not bright_bubble_region:
         merged_boxes = _merge_nearby_boxes(boxes, gap=merge_gap)
 
-    if not large_mixed_region:
+    if not large_mixed_region and not bright_bubble_region:
         merged_boxes = _merge_aligned_ocr_boxes(
             merged_boxes,
             region_w=region.w,

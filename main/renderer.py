@@ -474,6 +474,7 @@ def render_text_on_image(
         text_style=text_style,
     )
     non_bubble_dialogue = text_style == "dialogue" and not bubble_used
+    forced_box_clip_mask: NDArray | None = None
     if non_bubble_dialogue:
         # Non-bubble regions are often noisy merged text; force compact phrasing.
         text = _tighten_non_bubble_dialogue(text=text, box_w=box_w, box_h=box_h)
@@ -482,7 +483,39 @@ def render_text_on_image(
         if _prefer_sfx_for_free_text(text=text, box_w=box_w, box_h=box_h):
             text_style = "sfx"
             non_bubble_dialogue = False
+        else:
+            surface = _non_bubble_dialogue_surface(
+                region_image=result[box_y : box_y + box_h, box_x : box_x + box_w],
+                text=text,
+                box_w=box_w,
+                box_h=box_h,
+            )
+            if surface is None:
+                return image
+            local_x, local_y, local_w, local_h, forced_box_clip_mask = surface
+            box_x += local_x
+            box_y += local_y
+            box_w = local_w
+            box_h = local_h
     if _is_punctuation_only(text):
+        return image
+
+    if (
+        forced_box_clip_mask is not None
+        and forced_box_clip_mask.shape[:2] != (box_h, box_w)
+    ):
+        forced_box_clip_mask = None
+
+    if (
+        non_bubble_dialogue
+        and forced_box_clip_mask is None
+        and not _non_bubble_dialogue_has_safe_surface(
+            region_image=result[box_y : box_y + box_h, box_x : box_x + box_w],
+            text=text,
+            box_w=box_w,
+            box_h=box_h,
+        )
+    ):
         return image
 
     is_tall_dialogue = text_style == "dialogue" and box_h > box_w * 1.20
@@ -508,6 +541,11 @@ def render_text_on_image(
     # If the clip mask is already box-sized (from expanded bubble search),
     # use it directly; otherwise crop from the region-local mask.
     if (
+        forced_box_clip_mask is not None
+        and forced_box_clip_mask.shape[:2] == (box_h, box_w)
+    ):
+        box_clip_mask = forced_box_clip_mask
+    elif (
         bubble_clip_mask_local is not None
         and bubble_clip_mask_local.shape[:2] == (box_h, box_w)
     ):
@@ -557,6 +595,9 @@ def render_text_on_image(
             render_color = text_color
 
     # Auto-size font to fit
+    max_size_cap = None
+    if non_bubble_dialogue:
+        max_size_cap = max(14, min(24, int(min(avail_w, avail_h) * 0.42)))
     font, lines, line_spacing = _fit_text_to_box(
         draw=draw,
         text=text,
@@ -565,6 +606,7 @@ def render_text_on_image(
         font_path=font_file,
         style=text_style,
         min_size=10 if text_style == "sfx" else 12,
+        max_size_cap=max_size_cap,
     )
     stroke_width = _stroke_width_for_font(font)
     if text_style == "sfx" and lines:
@@ -1017,11 +1059,23 @@ def _resolve_dialogue_box(
                     bw, bh, w, h,
                 )
                 continue
-            bubble_mask = np.zeros((h, w), dtype=np.uint8)
-            bubble_mask[by : by + bh, bx : bx + bw] = 255
+            bubble_mask = _surface_mask_from_estimated_bubble_box(
+                region_image=region_image,
+                bubble_box=(bx, by, bw, bh),
+                translated_text=translated_text,
+            )
+            if bubble_mask is None:
+                continue
             break
         if bubble_mask is None:
             return (*fallback_box, False, None)
+
+    bubble_mask = _isolate_bubble_lobe_near_text(
+        bubble_mask=bubble_mask,
+        region_mask=region_mask,
+    )
+    if bubble_mask is None:
+        return (*fallback_box, False, None)
 
     bubble_bbox = _mask_bbox(bubble_mask)
     if bubble_bbox is None:
@@ -1033,6 +1087,16 @@ def _resolve_dialogue_box(
     if bubble_area < int(region_area * 0.16):
         return (*fallback_box, False, None)
     if bubble_area > int(region_area * 0.99):
+        return (*fallback_box, False, None)
+    if not _bubble_mask_is_plausible_for_text(
+        bubble_mask=bubble_mask,
+        region_mask=region_mask,
+    ):
+        return (*fallback_box, False, None)
+    if not _bubble_mask_has_paper_surface(
+        region_image=region_image,
+        bubble_mask=bubble_mask,
+    ):
         return (*fallback_box, False, None)
 
     bubble_render_mask = _prepare_bubble_render_mask(bubble_mask)
@@ -1430,6 +1494,233 @@ def _mask_bbox(mask: NDArray) -> tuple[int, int, int, int] | None:
     x2 = int(xs.max()) + 1
     y2 = int(ys.max()) + 1
     return (x1, y1, x2, y2)
+
+
+def _surface_mask_from_estimated_bubble_box(
+    region_image: NDArray,
+    bubble_box: tuple[int, int, int, int],
+    translated_text: str,
+) -> NDArray | None:
+    """Create a real white-surface mask from an estimated bubble rectangle."""
+    if region_image.size == 0:
+        return None
+
+    region_h, region_w = region_image.shape[:2]
+    bx, by, bw, bh = bubble_box
+    bx = int(np.clip(bx, 0, max(0, region_w - 1)))
+    by = int(np.clip(by, 0, max(0, region_h - 1)))
+    bw = int(max(1, min(bw, region_w - bx)))
+    bh = int(max(1, min(bh, region_h - by)))
+    crop = region_image[by : by + bh, bx : bx + bw]
+    if crop.size == 0:
+        return None
+
+    surface = _non_bubble_dialogue_surface(
+        region_image=crop,
+        text=translated_text,
+        box_w=bw,
+        box_h=bh,
+    )
+    if surface is None:
+        return None
+
+    sx, sy, sw, sh, local_mask = surface
+    mask = np.zeros((region_h, region_w), dtype=np.uint8)
+    mask[by + sy : by + sy + sh, bx + sx : bx + sx + sw] = local_mask
+    if cv2.countNonZero(mask) < 120:
+        return None
+    return mask
+
+
+def _isolate_bubble_lobe_near_text(
+    bubble_mask: NDArray,
+    region_mask: NDArray | None,
+) -> NDArray | None:
+    """Keep the speech-bubble lobe nearest the OCR text cluster.
+
+    Adjacent balloons can be connected by a tiny white bridge or by a broad
+    detector context. A light erosion often separates those lobes; choosing the
+    one anchored to the OCR mask prevents rendering one translation across two
+    neighbouring bubbles.
+    """
+    if bubble_mask.size == 0:
+        return None
+
+    bubble = (bubble_mask > 0).astype(np.uint8) * 255
+    bubble_bbox = _mask_bbox(bubble)
+    if bubble_bbox is None:
+        return None
+
+    text_info = _text_mask_geometry(region_mask, bubble.shape[1], bubble.shape[0])
+    if text_info is None:
+        return bubble
+    text_bbox, text_centroid = text_info
+
+    comp_area = cv2.countNonZero(bubble)
+    if comp_area < 300:
+        return bubble
+
+    # Stronger than the final render-mask erosion: this is only used to reveal
+    # whether the accepted white area is really multiple adjacent lobes.
+    k = _odd(max(5, int(round(np.sqrt(comp_area) / 34))))
+    eroded = cv2.erode(
+        bubble,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)),
+        iterations=1,
+    )
+    if cv2.countNonZero(eroded) < max(140, int(comp_area * 0.18)):
+        return bubble
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        eroded,
+        connectivity=8,
+    )
+    components: list[tuple[int, float]] = []
+    tcx, tcy = text_centroid
+    tx1, ty1, tx2, ty2 = text_bbox
+    for label in range(1, num_labels):
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < max(80, int(comp_area * 0.035)):
+            continue
+
+        cx = x + w * 0.5
+        cy = y + h * 0.5
+        overlap_w = max(0, min(tx2, x + w) - max(tx1, x))
+        overlap_h = max(0, min(ty2, y + h) - max(ty1, y))
+        overlap = overlap_w * overlap_h
+        inside = x <= tcx <= x + w and y <= tcy <= y + h
+        dist = abs(cx - tcx) + abs(cy - tcy)
+        score = overlap * 8.0 + area * 0.05 - dist * 2.0
+        if inside:
+            score += 2000.0
+        components.append((label, score))
+
+    if len(components) < 2:
+        return bubble
+
+    best_label = max(components, key=lambda item: item[1])[0]
+    selected = (labels == best_label).astype(np.uint8) * 255
+    selected = cv2.dilate(
+        selected,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)),
+        iterations=1,
+    )
+    selected = cv2.bitwise_and(selected, bubble)
+    if cv2.countNonZero(selected) < max(160, int(comp_area * 0.12)):
+        return bubble
+
+    return selected
+
+
+def _bubble_mask_is_plausible_for_text(
+    bubble_mask: NDArray,
+    region_mask: NDArray | None,
+) -> bool:
+    """Check that a bubble candidate is anchored to the OCR mask."""
+    h, w = bubble_mask.shape[:2]
+    text_info = _text_mask_geometry(region_mask, w, h)
+    if text_info is None:
+        return True
+
+    text_bbox, text_centroid = text_info
+    bubble_bbox = _mask_bbox(bubble_mask)
+    if bubble_bbox is None:
+        return False
+
+    tx1, ty1, tx2, ty2 = text_bbox
+    bx1, by1, bx2, by2 = bubble_bbox
+    tcx, tcy = text_centroid
+    bw = max(1, bx2 - bx1)
+    bh = max(1, by2 - by1)
+    tw = max(1, tx2 - tx1)
+    th = max(1, ty2 - ty1)
+
+    if not (bx1 - 6 <= tcx <= bx2 + 6 and by1 - 6 <= tcy <= by2 + 6):
+        return False
+
+    overlap_w = max(0, min(tx2, bx2) - max(tx1, bx1))
+    overlap_h = max(0, min(ty2, by2) - max(ty1, by1))
+    if (overlap_w * overlap_h) < max(24, int(tw * th * 0.18)):
+        return False
+
+    # If the text cluster is pushed far toward one edge of a huge accepted
+    # bubble, it is usually because two adjacent balloons were merged. Keep this
+    # relaxed for tall/narrow vertical dialogue where the source text can sit a
+    # little high or low.
+    rel_x = (tcx - bx1) / float(bw)
+    rel_y = (tcy - by1) / float(bh)
+    if bw >= max(150, tw * 4) and (rel_x < 0.18 or rel_x > 0.82):
+        return False
+    if bh >= max(150, th * 4) and (rel_y < 0.12 or rel_y > 0.88):
+        return False
+
+    return True
+
+
+def _bubble_mask_has_paper_surface(
+    region_image: NDArray,
+    bubble_mask: NDArray,
+) -> bool:
+    """Return True when the accepted bubble mask is mostly paper-like."""
+    if region_image.size == 0 or bubble_mask.size == 0:
+        return False
+    if bubble_mask.shape[:2] != region_image.shape[:2]:
+        return False
+
+    mask = bubble_mask > 0
+    if int(np.sum(mask)) < 120:
+        return False
+
+    gray = cv2.cvtColor(region_image, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(region_image, cv2.COLOR_BGR2HSV)
+    gray_vals = gray[mask]
+    sat_vals = hsv[:, :, 1][mask]
+    if gray_vals.size == 0:
+        return False
+
+    paper = (gray_vals > 190) & (sat_vals < 65)
+    paper_ratio = float(np.mean(paper))
+    mean_sat = float(np.mean(sat_vals))
+    mean_gray = float(np.mean(gray_vals))
+
+    if paper_ratio >= 0.38:
+        return True
+    if paper_ratio >= 0.26 and mean_gray >= 185 and mean_sat < 52:
+        return True
+
+    return False
+
+
+def _text_mask_geometry(
+    region_mask: NDArray | None,
+    w: int,
+    h: int,
+) -> tuple[tuple[int, int, int, int], tuple[float, float]] | None:
+    """Return OCR mask bbox and centroid in local region coordinates."""
+    if region_mask is None or region_mask.shape[:2] != (h, w):
+        return None
+
+    if region_mask.max() > 1:
+        _, binary = cv2.threshold(region_mask, 127, 255, cv2.THRESH_BINARY)
+    else:
+        binary = (region_mask > 0).astype(np.uint8) * 255
+
+    if cv2.countNonZero(binary) < 20:
+        return None
+
+    bbox = _mask_bbox(binary)
+    if bbox is None:
+        return None
+
+    ys, xs = np.where(binary > 0)
+    if xs.size < 20:
+        return None
+
+    return bbox, (float(np.mean(xs)), float(np.mean(ys)))
 
 
 def _shrink_centered_box(
@@ -1868,6 +2159,132 @@ def _prefer_sfx_for_free_text(text: str, box_w: int, box_h: int) -> bool:
     if box_h > box_w * 1.5:
         return False
     return True
+
+
+def _non_bubble_dialogue_has_safe_surface(
+    region_image: NDArray,
+    text: str,
+    box_w: int,
+    box_h: int,
+) -> bool:
+    """Allow no-bubble dialogue only on a likely white lettering surface."""
+    clean = " ".join(text.split())
+    words = re.findall(r"[A-Za-z']+", clean)
+    if len(words) <= 2 and len(clean) <= 18:
+        return True
+    if region_image is None or region_image.size == 0:
+        return False
+    if box_w < 18 or box_h < 18:
+        return False
+
+    gray = cv2.cvtColor(region_image, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(region_image, cv2.COLOR_BGR2HSV)
+    bright = gray > 200
+    low_sat = hsv[:, :, 1] < 45
+    paper = bright & low_sat
+    paper_ratio = float(np.mean(paper)) if paper.size else 0.0
+    mean_brightness = float(np.mean(gray)) if gray.size else 0.0
+
+    # White rectangular narration boxes and missed speech balloons both have a
+    # substantial low-saturation bright surface. Art/background crops do not.
+    if paper_ratio >= 0.36:
+        return True
+    if paper_ratio >= 0.24 and mean_brightness >= 190 and len(words) <= 5:
+        return True
+
+    return False
+
+
+def _non_bubble_dialogue_surface(
+    region_image: NDArray,
+    text: str,
+    box_w: int,
+    box_h: int,
+) -> tuple[int, int, int, int, NDArray] | None:
+    """Find a bright local paper surface for fallback dialogue rendering."""
+    if not _non_bubble_dialogue_has_safe_surface(
+        region_image=region_image,
+        text=text,
+        box_w=box_w,
+        box_h=box_h,
+    ):
+        return None
+    if region_image is None or region_image.size == 0:
+        return None
+
+    h, w = region_image.shape[:2]
+    if h < 18 or w < 18:
+        return None
+
+    gray = cv2.cvtColor(region_image, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(region_image, cv2.COLOR_BGR2HSV)
+    paper = ((gray > 200) & (hsv[:, :, 1] < 48)).astype(np.uint8) * 255
+    paper = cv2.morphologyEx(
+        paper,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+        iterations=2,
+    )
+    paper = cv2.morphologyEx(
+        paper,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        paper,
+        connectivity=8,
+    )
+    if num_labels <= 1:
+        return None
+
+    crop_area = max(1, w * h)
+    cx = w * 0.5
+    cy = h * 0.5
+    best_label = -1
+    best_score = -1e9
+    for label in range(1, num_labels):
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        cw = int(stats[label, cv2.CC_STAT_WIDTH])
+        ch = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        bbox_area = max(1, cw * ch)
+        fill_ratio = area / float(bbox_area)
+        if area < max(180, int(crop_area * 0.055)):
+            continue
+        if cw < 18 or ch < 18:
+            continue
+        if fill_ratio < 0.34:
+            continue
+        comp_cx = x + cw * 0.5
+        comp_cy = y + ch * 0.5
+        center_dist = abs(comp_cx - cx) + abs(comp_cy - cy)
+        score = area * 1.4 + bbox_area * 0.15 - center_dist * 3.0
+        if score > best_score:
+            best_score = score
+            best_label = label
+
+    if best_label < 0:
+        return None
+
+    component = (labels == best_label).astype(np.uint8) * 255
+    bbox = _mask_bbox(component)
+    if bbox is None:
+        return None
+
+    x1, y1, x2, y2 = bbox
+    bw = x2 - x1
+    bh = y2 - y1
+    if bw < 18 or bh < 18:
+        return None
+
+    local_mask = component[y1:y2, x1:x2].copy()
+    if cv2.countNonZero(local_mask) < max(120, int(bw * bh * 0.25)):
+        return None
+
+    return x1, y1, bw, bh, local_mask
 
 
 def _is_low_signal_dialogue_fragment(text: str) -> bool:
