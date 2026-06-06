@@ -86,7 +86,7 @@ def run_translation_pipeline(
         openrouter_api_key=cfg.openrouter_api_key,
         openrouter_model=cfg.openrouter_model,
         openrouter_base_url=cfg.openrouter_base_url,
-        openrouter_max_concurrent_calls=cfg.openrouter_max_concurrent_calls,
+        translation_max_concurrent_calls=cfg.translation_max_concurrent_calls,
         opencode_go_api_key=cfg.opencode_go_api_key,
         opencode_go_model=cfg.opencode_go_model,
         opencode_go_api_style=cfg.opencode_go_api_style,

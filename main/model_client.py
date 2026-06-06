@@ -19,7 +19,7 @@ from .config import settings
 logger = logging.getLogger(__name__)
 
 _TRANSLATION_CALL_SEMAPHORE = BoundedSemaphore(
-    value=max(1, int(getattr(settings, "openrouter_max_concurrent_calls", 1)))
+    value=max(1, int(getattr(settings, "translation_max_concurrent_calls", 1)))
 )
 _TRANSLATION_CALL_COUNTER = count(1)
 _TRANSLATION_LOCK_WAIT_POLL_SEC = 2.0
