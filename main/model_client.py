@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from itertools import count
 import logging
+import re
 from threading import BoundedSemaphore
 import time
 
@@ -18,6 +19,7 @@ from .config import settings
 
 logger = logging.getLogger(__name__)
 
+_THINKING_BLOCK_RE = re.compile(r"<think(?:ing)?>.*?</think(?:ing)?>", re.DOTALL | re.I)
 _TRANSLATION_CALL_SEMAPHORE = BoundedSemaphore(
     value=max(1, int(getattr(settings, "translation_max_concurrent_calls", 1)))
 )
@@ -25,7 +27,15 @@ _TRANSLATION_CALL_COUNTER = count(1)
 _TRANSLATION_LOCK_WAIT_POLL_SEC = 2.0
 _TRANSLATION_LOCK_WAIT_LOG_EVERY_SEC = 20.0
 _TRANSLATION_HTTP_TIMEOUT = httpx.Timeout(connect=15.0, read=120.0, write=30.0, pool=15.0)
-_OPENCODE_GO_ANTHROPIC_MODELS = {"minimax-m2.7", "qwen3.5-plus", "qwen3.6-plus"}
+_OPENCODE_GO_OPENAI_REASONING_DISABLED_MODELS = {
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "glm-5",
+    "glm-5.1",
+    "mimo-v2.5",
+    "mimo-v2.5-pro",
+}
+_OPENCODE_GO_OPENAI_THINKING_DISABLED_MODELS = {"kimi-k2.5", "kimi-k2.6"}
 
 
 def call_translation_model(
@@ -152,6 +162,7 @@ def _call_opencode_go(
 ) -> str:
     """Make a single API call to OpenCode Go."""
     model_id = _opencode_go_model_id(model)
+    _raise_if_unsupported_reasoning_model(model_id)
     api_style = _opencode_go_api_style(model_id)
     if api_style == "anthropic":
         return _call_opencode_go_anthropic(
@@ -190,14 +201,8 @@ def _call_opencode_go_openai(
         ],
         "temperature": 0.3,
         "max_tokens": 4096,
-        "reasoning": {
-            "effort": "none",
-        },
-        "thinking": {
-            "type": "disabled",
-        },
-        "include_reasoning": False,
     }
+    payload.update(_opencode_go_openai_reasoning_options(model))
 
     call_id = next(_TRANSLATION_CALL_COUNTER)
     call_started_at = time.monotonic()
@@ -295,6 +300,7 @@ def _call_opencode_go_anthropic(
         "temperature": 0.3,
         "max_tokens": 4096,
     }
+    payload.update(_opencode_go_anthropic_reasoning_options(model))
 
     call_id = next(_TRANSLATION_CALL_COUNTER)
     call_started_at = time.monotonic()
@@ -383,9 +389,51 @@ def _opencode_go_api_style(model: str) -> str:
         raise RuntimeError("OPENCODE_GO_API_STYLE must be auto, openai, or anthropic")
 
     model_id = _opencode_go_model_id(model).lower()
-    if model_id in _OPENCODE_GO_ANTHROPIC_MODELS:
+    if _is_opencode_go_qwen_anthropic_model(model_id):
         return "anthropic"
     return "openai"
+
+
+def _raise_if_unsupported_reasoning_model(model: str) -> None:
+    """Reject OpenCode Go models that currently force reasoning tokens."""
+    model_id = _opencode_go_model_id(model).lower()
+    if model_id.startswith("minimax-"):
+        raise ValueError(
+            f"OpenCode Go model '{model_id}' is not supported for translation because "
+            "it currently uses mandatory reasoning tokens. Use a non-MiniMax model such "
+            "as deepseek-v4-flash, kimi-k2.6, mimo-v2.5, or qwen3.6-plus."
+        )
+
+
+def _opencode_go_openai_reasoning_options(model: str) -> dict[str, object]:
+    """Return model-specific reasoning controls for OpenCode Go OpenAI-style APIs."""
+    model_id = _opencode_go_model_id(model).lower()
+    if model_id in _OPENCODE_GO_OPENAI_REASONING_DISABLED_MODELS:
+        return {
+            "reasoning": {"effort": "none"},
+            "thinking": {"type": "disabled"},
+            "include_reasoning": False,
+        }
+    if model_id in _OPENCODE_GO_OPENAI_THINKING_DISABLED_MODELS:
+        return {
+            "thinking": {"type": "disabled"},
+        }
+    return {}
+
+
+def _opencode_go_anthropic_reasoning_options(model: str) -> dict[str, object]:
+    """Return model-specific reasoning controls for OpenCode Go Anthropic-style APIs."""
+    model_id = _opencode_go_model_id(model).lower()
+    if _is_opencode_go_qwen_anthropic_model(model_id):
+        return {
+            "thinking": {"type": "disabled"},
+        }
+    return {}
+
+
+def _is_opencode_go_qwen_anthropic_model(model_id: str) -> bool:
+    """Return True for OpenCode Go Qwen models that use Anthropic style."""
+    return model_id.startswith("qwen") and model_id.endswith(("-plus", "-max"))
 
 
 def _acquire_translation_lock(provider: str, call_id: int) -> float:
@@ -428,7 +476,7 @@ def _coerce_openai_content(content: object) -> str:
             if isinstance(text_value, str) and text_value.strip():
                 parts.append(text_value.strip())
                 break
-    return "\n".join(parts)
+    return _strip_inline_reasoning("\n".join(parts))
 
 
 def _coerce_anthropic_content(content: object) -> str:
@@ -451,4 +499,9 @@ def _coerce_anthropic_content(content: object) -> str:
             if isinstance(text_value, str) and text_value.strip():
                 parts.append(text_value.strip())
                 break
-    return "\n".join(parts)
+    return _strip_inline_reasoning("\n".join(parts))
+
+
+def _strip_inline_reasoning(text: str) -> str:
+    """Remove reasoning blocks that some providers place in the visible content."""
+    return _THINKING_BLOCK_RE.sub("", text).strip()
