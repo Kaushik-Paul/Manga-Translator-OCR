@@ -82,13 +82,23 @@ def run_translation_pipeline(
 
     # Config override pointing output to the translated dir
     translate_cfg = Settings(
+        use_openrouter=cfg.use_openrouter,
         openrouter_api_key=cfg.openrouter_api_key,
-        translation_model=cfg.translation_model,
+        openrouter_model=cfg.openrouter_model,
+        openrouter_base_url=cfg.openrouter_base_url,
+        openrouter_max_concurrent_calls=cfg.openrouter_max_concurrent_calls,
+        opencode_go_api_key=cfg.opencode_go_api_key,
+        opencode_go_model=cfg.opencode_go_model,
+        opencode_go_api_style=cfg.opencode_go_api_style,
+        opencode_go_openai_base_url=cfg.opencode_go_openai_base_url,
+        opencode_go_anthropic_base_url=cfg.opencode_go_anthropic_base_url,
         source_lang=cfg.source_lang,
         use_modal=cfg.use_modal,
         use_mangaocr_cpu=cfg.use_mangaocr_cpu,
         use_detection_model=cfg.use_detection_model,
         modal_max_parallel_pages=cfg.modal_max_parallel_pages,
+        local_max_parallel_pages=cfg.local_max_parallel_pages,
+        gradio_action_password=cfg.gradio_action_password,
         output_dir=translated_dir,
     )
 

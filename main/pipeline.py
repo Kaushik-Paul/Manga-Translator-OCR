@@ -180,7 +180,7 @@ def translate_page(
     translated_texts = translate_texts(
         source_texts,
         source_lang=cfg.source_lang,
-        model=cfg.translation_model,
+        model=cfg.active_translation_model,
         constraints=constraints,
         session_id=session_id,
     )

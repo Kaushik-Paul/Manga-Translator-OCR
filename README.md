@@ -67,8 +67,17 @@ uv sync
 Create a `.env` file in the root directory to configure the pipeline:
 
 ```env
-# Required for LLM translations
+# Required for LLM translations.
+# OpenCode Go is the default provider. Set USE_OPENROUTER=true to use OpenRouter.
+OPENCODE_GO_API_KEY="your-opencode-go-api-key-here"
+OPENCODE_GO_MODEL="deepseek-v4-flash"
+USE_OPENROUTER="false"
 OPENROUTER_API_KEY="your-openrouter-api-key-here"
+OPENROUTER_MODEL="deepseek/deepseek-chat"
+
+# Optional: auto, openai, or anthropic. Auto handles MiniMax/Qwen Anthropic-style
+# OpenCode Go models and OpenAI-compatible models like deepseek-v4-flash.
+OPENCODE_GO_API_STYLE="auto"
 
 # Optional: Enable Modal OCR offloading
 USE_MODAL="false"
@@ -81,7 +90,7 @@ USE_MANGAOCR_CPU="false"
 # Optional: Hugging Face token (helps authenticated/faster model downloads)
 HF_TOKEN="hf_xxx"
 
-# Optional: Max parallel OpenRouter requests (set to 1 to fully serialize)
+# Optional: Max parallel LLM translation requests (set to 1 to fully serialize)
 OPENROUTER_MAX_CONCURRENT_CALLS="3"
 
 # Optional: Parallel pages when running locally (USE_MODAL=false).
@@ -90,9 +99,6 @@ LOCAL_MAX_PARALLEL_PAGES="2"
 
 # Optional (only when USE_MODAL=true): max parallel pages per batch
 MODAL_MAX_PARALLEL_PAGES="2"
-
-# Optional: Override the translation model
-TRANSLATION_MODEL="qwen/qwen3-235b-a22b-2507"
 
 # Optional but recommended for Gradio abuse protection:
 # required to run "Translate Selected" and to open the download link
