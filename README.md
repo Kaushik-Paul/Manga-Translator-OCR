@@ -22,7 +22,7 @@ This project wouldn't be possible without the incredible work from the open-sour
 
 * **Robust Speech Bubble Detection**: Powered by `comic-text-detector` to accurately find text regions, even in complex panels.
 * **Cutting-Edge Japanese OCR**: Utilizes `manga-ocr` to handle vertical text, furigana, and varied manga fonts with incredibly high accuracy.
-* **Smart LLM Translations**: Context-aware translations powered by your choice of LLM (via OpenRouter)! Defaulting to powerful models like Qwen (`qwen/qwen3-235b-a22b-2507`) or Mistral to preserve the tone and nuance of the original Japanese.
+* **Smart LLM Translations**: Context-aware translations powered by OpenCode Go by default, with OpenRouter still available as an opt-in provider. The translation client disables reasoning where the provider supports it so output tokens stay focused on translated text.
 * **Seamless Inpainting & Rendering**: Dynamically removes original Japanese text from the image and smartly renders the translated English text to fit perfectly inside the speech bubbles.
 * **Parallel Page Processing**: Processes multiple pages concurrently out of the box — overlapping I/O-bound API calls with CPU-bound detection/OCR for faster batch translations, even without a local GPU.
 * **Cloud GPU Acceleration**: Need more speed? Toggle Modal.com integration to offload OCR and Detection to remote GPUs and process entire chapters in parallel!
@@ -105,6 +105,25 @@ MODAL_MAX_PARALLEL_PAGES="2"
 GRADIO_ACTION_PASSWORD="change-this-password"
 ```
 
+### OpenCode Go Model Support
+
+OpenCode Go is the default translation provider. Set `USE_OPENROUTER="true"` only when you want to route translation calls through OpenRouter instead.
+
+Recommended OpenCode Go models:
+
+| Model | API style | Reasoning handling |
+| --- | --- | --- |
+| `deepseek-v4-flash` | OpenAI-compatible | Sends `reasoning: {"effort": "none"}`, `thinking: {"type": "disabled"}`, and `include_reasoning: false` |
+| `deepseek-v4-pro` | OpenAI-compatible | Same as DeepSeek Flash |
+| `glm-5`, `glm-5.1` | OpenAI-compatible | Same reasoning-disable payload |
+| `mimo-v2.5`, `mimo-v2.5-pro` | OpenAI-compatible | Same reasoning-disable payload |
+| `kimi-k2.5`, `kimi-k2.6` | OpenAI-compatible | Sends only `thinking: {"type": "disabled"}` because Kimi rejects `reasoning` / `include_reasoning` |
+| `qwen*-plus`, `qwen*-max` | Anthropic-compatible | Uses `/messages` and sends `thinking: {"type": "disabled"}` |
+
+MiniMax models are intentionally blocked for translation because OpenCode Go currently forces reasoning tokens for `minimax-*` models. This includes models such as `minimax-m2.5`, `minimax-m2.7`, `minimax-m3`, and `minimax-max`.
+
+`OPENROUTER_MODEL` is used only when `USE_OPENROUTER="true"`. `TRANSLATION_MODEL` is no longer used; configure `OPENCODE_GO_MODEL` or `OPENROUTER_MODEL` instead.
+
 ---
 
 ## ☁️ Deployments
@@ -145,7 +164,7 @@ To host the app completely on Hugging Face Spaces, use the bundled deploy helper
    uv run python -m main.scripts.deploy_space --dry-run
    ```
 
-2. **Configure Secrets**: In your new HF Space's settings tab, specify your environment variables (like `OPENROUTER_API_KEY`, etc.).
+2. **Configure Secrets**: In your new HF Space's settings tab, specify your environment variables, especially `OPENCODE_GO_API_KEY` for the default provider or `OPENROUTER_API_KEY` when `USE_OPENROUTER="true"`.
 
 3. **Upload Heavy Assets**: Since `weights` and `fonts` are intentionally skipped by the safe deploy command, use our bundled upload script to sync these heavy assets automatically up to HF without straining your Git history.
 
@@ -196,8 +215,10 @@ uv run python -m main.cli --input ./raw_manga_chapter/ --output output/translate
 **Change the LLM dynamically:**
 
 ```bash
-uv run python -m main.cli --input page.png --model mistralai/mistral-large-latest
+uv run python -m main.cli --input page.png --model kimi-k2.6
 ```
+
+`--model` overrides the active provider's model: use OpenCode Go model IDs when `USE_OPENROUTER="false"` and OpenRouter model IDs when `USE_OPENROUTER="true"`.
 
 ---
 
@@ -205,7 +226,7 @@ uv run python -m main.cli --input page.png --model mistralai/mistral-large-lates
 
 1. **Detection**: `comic-text-detector` analyzes the image and creates precise masks for every speech bubble and text block.
 2. **Text Extraction (OCR)**: The masked regions are passed to `manga-ocr` (either locally or optionally distributed via Modal) to extract raw Japanese text.
-3. **Translation**: The extracted Japanese text is sent to an LLM via OpenRouter, where it is translated into natural-sounding English.
+3. **Translation**: The extracted Japanese text is sent to the active LLM provider: OpenCode Go by default, or OpenRouter when `USE_OPENROUTER="true"`.
 4. **Inpainting**: The original Japanese text is erased from the background image using advanced inpainting techniques.
 5. **Rendering**: The translated English text is algorithmically fitted, word-wrapped, and rendered back onto the clean image bubbles.
 
