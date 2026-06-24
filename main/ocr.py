@@ -82,22 +82,24 @@ class MangaOCREngine(OCREngine):
             if env_source:
                 candidate = Path(env_source).expanduser()
                 model_source = str(candidate) if candidate.exists() else env_source
-                logger.info(
+                logger.debug(
                     "Loading manga-ocr model from %s: %s",
                     _MANGA_OCR_MODEL_ENV,
                     model_source,
                 )
             elif _LOCAL_MANGA_OCR_MODEL_DIR.is_dir():
                 model_source = str(_LOCAL_MANGA_OCR_MODEL_DIR)
-                logger.info("Loading manga-ocr model from bundled weights: %s", model_source)
+                logger.debug(
+                    "Loading manga-ocr model from bundled weights: %s", model_source
+                )
             else:
                 model_source = "kha-white/manga-ocr-base"
-                logger.info(
+                logger.debug(
                     "Loading manga-ocr model from Hugging Face repo: %s", model_source
                 )
 
             self._model = MangaOcr(pretrained_model_name_or_path=model_source)
-            logger.info("manga-ocr model loaded.")
+            logger.debug("manga-ocr model loaded.")
 
     def _run_manga_ocr(self, image: NDArray) -> str:
         """Run manga-ocr on a BGR image crop."""
@@ -248,7 +250,7 @@ class ModalOCREngine(MangaOCREngine):
                 return
             import modal
 
-            logger.info(
+            logger.debug(
                 "Connecting to Modal %s OCR service (%s.%s)...",
                 self._runtime_label,
                 _MODAL_OCR_APP_NAME,
@@ -256,7 +258,7 @@ class ModalOCREngine(MangaOCREngine):
             )
             MangaOCRCls = modal.Cls.from_name(_MODAL_OCR_APP_NAME, self._modal_cls_name)
             self._modal_ocr = MangaOCRCls()
-            logger.info(
+            logger.debug(
                 "Connected to Modal %s OCR service.",
                 self._runtime_label,
             )
@@ -359,13 +361,13 @@ def get_ocr_engine(lang: str = "ja") -> OCREngine:
 
     if settings.use_modal:
         if settings.use_mangaocr_cpu:
-            logger.info("Using Modal CPU OCR engine.")
+            logger.debug("Using Modal CPU OCR engine.")
             return ModalCPUOCREngine()
 
-        logger.info("Using Modal GPU OCR engine.")
+        logger.debug("Using Modal GPU OCR engine.")
         return ModalOCREngine()
 
-    logger.info("Using local CPU OCR engine.")
+    logger.debug("Using local CPU OCR engine.")
     return MangaOCREngine()
 
 

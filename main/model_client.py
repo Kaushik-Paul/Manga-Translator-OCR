@@ -92,11 +92,11 @@ def _call_openrouter(
 
     call_id = next(_TRANSLATION_CALL_COUNTER)
     call_started_at = time.monotonic()
-    logger.info("Calling OpenRouter API #%d (model: %s)...", call_id, model)
+    logger.debug("Calling OpenRouter API #%d (model: %s)...", call_id, model)
     slot_wait_sec = _acquire_translation_lock("OpenRouter", call_id)
 
     try:
-        logger.info(
+        logger.debug(
             "OpenRouter API #%d slot acquired (wait %.2fs).", call_id, slot_wait_sec
         )
         try:
@@ -145,7 +145,7 @@ def _call_openrouter(
     text = _coerce_openai_content(message.get("content", "")).strip()
     if not text:
         raise ValueError("OpenRouter returned empty translation content.")
-    logger.info(
+    logger.debug(
         "Translation received from OpenRouter API #%d (%d chars, %.2fs total).",
         call_id,
         len(text),
@@ -206,7 +206,7 @@ def _call_opencode_go_openai(
 
     call_id = next(_TRANSLATION_CALL_COUNTER)
     call_started_at = time.monotonic()
-    logger.info(
+    logger.debug(
         "Calling OpenCode Go API #%d (model: %s, style: openai)...",
         call_id,
         model,
@@ -214,7 +214,7 @@ def _call_opencode_go_openai(
     slot_wait_sec = _acquire_translation_lock("OpenCode Go", call_id)
 
     try:
-        logger.info(
+        logger.debug(
             "OpenCode Go API #%d slot acquired (wait %.2fs).",
             call_id,
             slot_wait_sec,
@@ -266,7 +266,7 @@ def _call_opencode_go_openai(
     text = _coerce_openai_content(message.get("content", "")).strip()
     if not text:
         raise ValueError("OpenCode Go returned empty translation content.")
-    logger.info(
+    logger.debug(
         "Translation received from OpenCode Go API #%d (%d chars, %.2fs total).",
         call_id,
         len(text),
@@ -304,7 +304,7 @@ def _call_opencode_go_anthropic(
 
     call_id = next(_TRANSLATION_CALL_COUNTER)
     call_started_at = time.monotonic()
-    logger.info(
+    logger.debug(
         "Calling OpenCode Go API #%d (model: %s, style: anthropic)...",
         call_id,
         model,
@@ -312,7 +312,7 @@ def _call_opencode_go_anthropic(
     slot_wait_sec = _acquire_translation_lock("OpenCode Go", call_id)
 
     try:
-        logger.info(
+        logger.debug(
             "OpenCode Go API #%d slot acquired (wait %.2fs).",
             call_id,
             slot_wait_sec,
@@ -359,7 +359,7 @@ def _call_opencode_go_anthropic(
     text = _coerce_anthropic_content(data.get("content", "")).strip()
     if not text:
         raise ValueError("OpenCode Go returned empty translation content.")
-    logger.info(
+    logger.debug(
         "Translation received from OpenCode Go API #%d (%d chars, %.2fs total).",
         call_id,
         len(text),

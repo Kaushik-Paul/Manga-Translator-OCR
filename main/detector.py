@@ -137,7 +137,7 @@ class ComicTextDetector:
             if self._session is not None:
                 return
 
-            logger.info("Loading comic-text-detector ONNX model...")
+            logger.debug("Loading comic-text-detector ONNX model...")
 
             import onnxruntime as ort
 
@@ -149,14 +149,14 @@ class ComicTextDetector:
                         f"{_MODEL_PATH_ENV} points to a missing file: {env_candidate}"
                     )
                 model_path = str(env_candidate)
-                logger.info(
+                logger.debug(
                     "Using detector model from %s: %s",
                     _MODEL_PATH_ENV,
                     model_path,
                 )
             elif _LOCAL_MODEL_PATH.is_file():
                 model_path = str(_LOCAL_MODEL_PATH)
-                logger.info("Using bundled detector model: %s", model_path)
+                logger.debug("Using bundled detector model: %s", model_path)
             else:
                 from huggingface_hub import hf_hub_download
 
@@ -164,7 +164,7 @@ class ComicTextDetector:
                     repo_id=_MODEL_REPO,
                     filename=_MODEL_FILE,
                 )
-                logger.info("Detector model downloaded to: %s", model_path)
+                logger.debug("Detector model downloaded to: %s", model_path)
 
             # Create ONNX Runtime session (CPU only)
             sess_options = ort.SessionOptions()
@@ -174,7 +174,7 @@ class ComicTextDetector:
                 sess_options=sess_options,
                 providers=["CPUExecutionProvider"],
             )
-            logger.info("comic-text-detector model loaded (CPU).")
+            logger.debug("comic-text-detector model loaded (CPU).")
 
     def detect(
         self,
@@ -222,7 +222,7 @@ class ComicTextDetector:
         # Sort in manga reading order
         regions = _sort_manga_order(regions, page_width=w)
 
-        logger.info(
+        logger.debug(
             "Detected %d text regions using comic-text-detector.", len(regions)
         )
         return regions, text_mask
@@ -741,10 +741,10 @@ class ModalTextDetector(ComicTextDetector):
                 return
             import modal
 
-            logger.info("Connecting to Modal comic-text-detector service...")
+            logger.debug("Connecting to Modal comic-text-detector service...")
             DetectorCls = modal.Cls.from_name(_MODAL_DETECTOR_APP, _MODAL_DETECTOR_CLASS)
             self._modal_detector = DetectorCls()
-            logger.info("Connected to Modal comic-text-detector service.")
+            logger.debug("Connected to Modal comic-text-detector service.")
 
     @staticmethod
     def _encode_png(image: NDArray) -> bytes:
@@ -798,7 +798,9 @@ class ModalTextDetector(ComicTextDetector):
             image, text_mask, min_area=min_area, padding=padding
         )
         regions = _sort_manga_order(regions, page_width=w)
-        logger.info("Detected %d text regions using Modal comic-text-detector.", len(regions))
+        logger.debug(
+            "Detected %d text regions using Modal comic-text-detector.", len(regions)
+        )
         return regions, text_mask
 
     def _ensure_model(self) -> None:
@@ -811,10 +813,10 @@ def get_text_detector() -> ComicTextDetector:
     from .config import settings
 
     if settings.use_detection_model:
-        logger.info("Using Modal comic-text-detector service.")
+        logger.debug("Using Modal comic-text-detector service.")
         return ModalTextDetector()
 
-    logger.info("Using local comic-text-detector model.")
+    logger.debug("Using local comic-text-detector model.")
     return ComicTextDetector()
 
 

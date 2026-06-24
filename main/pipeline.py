@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import logging
 from pathlib import Path
 import re
+import time
 
 import cv2
 import numpy as np
@@ -69,21 +70,21 @@ def translate_page(
     if not image_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
 
-    logger.info("=" * 60)
-    logger.info("Processing: %s", image_path.name)
-    logger.info("=" * 60)
+    logger.debug("=" * 60)
+    logger.debug("Processing: %s", image_path.name)
+    logger.debug("=" * 60)
 
     # 1. Load image
     image = cv2.imread(str(image_path))
     if image is None:
         raise ValueError(f"Failed to load image: {image_path}")
-    logger.info("Image loaded: %dx%d", image.shape[1], image.shape[0])
+    logger.debug("Image loaded: %dx%d", image.shape[1], image.shape[0])
 
     # 2. Detect text regions using ML model
-    logger.info("Step 1/4: Detecting text regions (ML model)...")
+    logger.debug("Step 1/4: Detecting text regions (ML model)...")
     regions, text_mask = detect_text_regions(image)
     regions = _merge_overlapping_detected_regions(regions, image, text_mask)
-    logger.info("Found %d text regions.", len(regions))
+    logger.debug("Found %d text regions.", len(regions))
 
     if not regions:
         logger.warning("No text regions detected. Saving original image.")
@@ -93,7 +94,7 @@ def translate_page(
         return out
 
     # 3. OCR - extract text from each region
-    logger.info("Step 2/4: Extracting text (OCR, lang=%s)...", cfg.source_lang)
+    logger.debug("Step 2/4: Extracting text (OCR, lang=%s)...", cfg.source_lang)
     ocr_engine = get_ocr_engine(cfg.source_lang)
     units: list[RenderTextUnit] = []
     inpaint_region_indices: set[int] = set()
@@ -103,7 +104,7 @@ def translate_page(
     for region_idx, region in enumerate(regions):
         ocr_regions = _split_region_for_ocr(region)
         if len(ocr_regions) >= 2:
-            logger.info(
+            logger.debug(
                 "  Region %d split into %d OCR sub-regions.",
                 region_idx + 1,
                 len(ocr_regions),
@@ -121,8 +122,11 @@ def translate_page(
         from concurrent.futures import ThreadPoolExecutor
 
         max_workers = min(3, len(all_ocr_tasks))
-        logger.info("  Running OCR in parallel (%d workers, %d sub-regions)...",
-                     max_workers, len(all_ocr_tasks))
+        logger.debug(
+            "  Running OCR in parallel (%d workers, %d sub-regions)...",
+            max_workers,
+            len(all_ocr_tasks),
+        )
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             ocr_results = list(pool.map(_ocr_one, all_ocr_tasks))
     else:
@@ -148,7 +152,7 @@ def translate_page(
             )
         )
         inpaint_region_indices.add(region_idx)
-        logger.info(
+        logger.debug(
             "  Region %d.%d [%s]: '%s'",
             region_idx + 1,
             sub_idx,
@@ -171,7 +175,7 @@ def translate_page(
     )
 
     # 4. Translate
-    logger.info("Step 3/4: Translating %d text segments...", len(units))
+    logger.debug("Step 3/4: Translating %d text segments...", len(units))
     source_texts = [unit.source_text for unit in units]
     constraints = [
         _build_translation_constraint(unit)
@@ -209,7 +213,7 @@ def translate_page(
     }
 
     for i, (src, tgt) in enumerate(zip(source_texts, translated_texts)):
-        logger.info("  [%d] %s → %s", i + 1, src[:40], tgt[:60])
+        logger.debug("  [%d] %s → %s", i + 1, src[:40], tgt[:60])
     skipped_units = len(renderable_unit_mask) - sum(renderable_unit_mask)
     if skipped_units > 0:
         logger.warning(
@@ -222,7 +226,7 @@ def translate_page(
         )
 
     # 5. Detect original text colours *before* inpainting erases them.
-    logger.info("Step 4/5: Detecting original text colours...")
+    logger.debug("Step 4/5: Detecting original text colours...")
     for unit, can_render in zip(units, renderable_unit_mask):
         if not can_render:
             continue
@@ -232,7 +236,7 @@ def translate_page(
             region_mask=region.mask,
         )
         if unit.text_color is not None:
-            logger.info(
+            logger.debug(
                 "  Region at (%d,%d): detected colour RGB%s",
                 region.x,
                 region.y,
@@ -240,7 +244,7 @@ def translate_page(
             )
 
     # 6. Inpaint original text, then render translated text
-    logger.info("Step 5/5: Inpainting and rendering translated text...")
+    logger.debug("Step 5/5: Inpainting and rendering translated text...")
     result = image.copy()
 
     # Count how many renderable units each parent region has.
@@ -323,8 +327,8 @@ def translate_page(
     out = _resolve_output_path(image_path, output_path, cfg)
     out.parent.mkdir(parents=True, exist_ok=True)
     _save_image(out, result)
-    logger.info("Saved translated image: %s", out)
-    logger.info("=" * 60)
+    logger.debug("Saved translated image: %s", out)
+    logger.debug("=" * 60)
 
     return out
 
@@ -380,13 +384,22 @@ def translate_images(
     results: list[Path] = []
     tasks = list(enumerate(files, start=1))
     job_session_id = str(uuid.uuid4())
-    logger.info("Translation job session ID: %s", job_session_id)
+    logger.debug("Translation job session ID: %s", job_session_id)
 
     def _translate_one(task: tuple[int, Path]) -> tuple[Path | None, Exception | None]:
         i, img_path = task
-        logger.info("\n[%d/%d] Processing %s...", i, total, img_path.name)
+        started_at = time.monotonic()
+        logger.info("Page %d/%d started: %s", i, total, img_path.name)
         try:
             out = translate_page(img_path, config=cfg, session_id=job_session_id)
+            logger.info(
+                "Page %d/%d finished: %s -> %s (%.1fs)",
+                i,
+                total,
+                img_path.name,
+                out,
+                time.monotonic() - started_at,
+            )
             return out, None
         except Exception as e:
             return None, e
