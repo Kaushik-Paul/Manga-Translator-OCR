@@ -193,10 +193,19 @@ def translate_page(
         _is_renderable_unit(unit, text)
         for unit, text in zip(units, translated_texts)
     ]
+    inpaintable_unit_mask = [
+        can_render or _should_inpaint_unit_without_render(unit, text)
+        for unit, text, can_render in zip(units, translated_texts, renderable_unit_mask)
+    ]
     renderable_region_indices = {
         unit.parent_region_index
         for unit, can_render in zip(units, renderable_unit_mask)
         if can_render
+    }
+    inpaintable_region_indices = {
+        unit.parent_region_index
+        for unit, should_inpaint in zip(units, inpaintable_unit_mask)
+        if should_inpaint
     }
 
     for i, (src, tgt) in enumerate(zip(source_texts, translated_texts)):
@@ -239,61 +248,39 @@ def translate_page(
     # we must NOT expand each sub-region to the full parent bubble —
     # otherwise all sub-translations overlap in the same bubble.
     parent_renderable_counts: dict[int, int] = {}
+    parent_unit_counts: dict[int, int] = {}
     for unit, can_render in zip(units, renderable_unit_mask):
+        parent_unit_counts[unit.parent_region_index] = (
+            parent_unit_counts.get(unit.parent_region_index, 0) + 1
+        )
         if can_render:
             parent_renderable_counts[unit.parent_region_index] = (
                 parent_renderable_counts.get(unit.parent_region_index, 0) + 1
             )
 
-    # First pass: inpaint only text that has a renderable replacement.
-    # For split parents, do not erase skipped siblings (usually SFX/noise).
-    for region_idx in sorted(renderable_region_indices):
+    # First pass: inpaint renderable text, plus skipped text only when it is on
+    # a safe paper-like surface. For split parents, erase only the selected
+    # child masks so an accepted dialogue line cannot wipe nearby skipped SFX.
+    for region_idx in sorted(inpaintable_region_indices):
         region = regions[region_idx]
-        if parent_renderable_counts.get(region_idx, 0) > 1:
-            combined_mask = np.zeros((region.h, region.w), dtype=np.uint8)
-            for unit, can_render in zip(units, renderable_unit_mask):
+        if parent_unit_counts.get(region_idx, 0) > 1:
+            for unit, should_inpaint in zip(units, inpaintable_unit_mask):
                 if unit.parent_region_index != region_idx:
                     continue
-                should_inpaint = can_render or (
-                    _context_region_has_bright_bubble(unit.context_region or unit.region)
-                )
                 if not should_inpaint:
                     continue
                 if unit.region.mask is None:
                     continue
                 if unit.region.mask.shape[:2] != (unit.region.h, unit.region.w):
                     continue
-                offset_x = unit.region.x - region.x
-                offset_y = unit.region.y - region.y
-                if offset_x < 0 or offset_y < 0:
-                    continue
-                if offset_x + unit.region.w > region.w:
-                    continue
-                if offset_y + unit.region.h > region.h:
-                    continue
-                mask = unit.region.mask.astype(np.uint8)
-                if mask.max() <= 1:
-                    mask = (mask > 0).astype(np.uint8) * 255
-                combined_mask[
-                    offset_y : offset_y + unit.region.h,
-                    offset_x : offset_x + unit.region.w,
-                ] = np.maximum(
-                    combined_mask[
-                        offset_y : offset_y + unit.region.h,
-                        offset_x : offset_x + unit.region.w,
-                    ],
-                    mask,
+                result = inpaint_text_region(
+                    result,
+                    unit.region.x,
+                    unit.region.y,
+                    unit.region.w,
+                    unit.region.h,
+                    unit.region.mask,
                 )
-            if cv2.countNonZero(combined_mask) == 0:
-                continue
-            result = inpaint_text_region(
-                result,
-                region.x,
-                region.y,
-                region.w,
-                region.h,
-                combined_mask,
-            )
             continue
 
         result = inpaint_text_region(
@@ -1662,6 +1649,41 @@ def _is_large_nonbubble_translation_mismatch(unit: RenderTextUnit, translated: s
         return True
 
     return False
+
+
+def _should_inpaint_unit_without_render(unit: RenderTextUnit, translated: str) -> bool:
+    """Erase skipped source text only when the local surface is safe paper.
+
+    This handles cases where OCR/translation produces an unusable English
+    replacement but the original Japanese sits in a clean balloon/narration box.
+    Large non-bubble decorative text is intentionally preserved; inpainting that
+    without a good replacement produces obvious smears.
+    """
+    source_compact = "".join(unit.source_text.split())
+    script_total, _, _, _ = _script_profile(source_compact)
+    if script_total == 0:
+        return False
+
+    clean_translation = " ".join(translated.split())
+    if clean_translation and _is_large_nonbubble_translation_mismatch(unit, clean_translation):
+        return False
+
+    region = unit.context_region or unit.region
+    region_area = max(1, region.w * region.h)
+    source_area = max(1, unit.region.w * unit.region.h)
+
+    has_safe_surface = _context_region_has_bright_bubble(unit.region) or (
+        region_area <= 180_000 and _context_region_has_bright_bubble(region)
+    )
+    if not has_safe_surface:
+        return False
+
+    if unit.style_hint == "dialogue":
+        return True
+
+    # SFX in white burst balloons or small paper callouts should be removed
+    # when the replacement is unusable. Coloured/background SFX remains intact.
+    return source_area < 36_000 or region_area < 70_000
 
 
 def _is_compact_sfx_render(text: str) -> bool:
