@@ -30,7 +30,7 @@ def setup_logging(verbose: bool = False) -> None:
         "httpx", "httpcore", "h2", "hpack",
         "PIL", "transformers", "torch",
         "modal", "grpc", "grpclib",
-        "urllib3", "onnxruntime",
+        "urllib3", "onnxruntime", "asyncio",
     ):
         logging.getLogger(lib).setLevel(logging.WARNING)
 

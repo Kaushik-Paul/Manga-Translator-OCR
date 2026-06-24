@@ -170,7 +170,7 @@ def translate_texts(
             repair_candidates.append((mapped_idx, orig_idx, src_text))
 
     if repair_candidates:
-        logger.info(
+        logger.debug(
             "Repair pass needed for %d/%d segments: %s",
             len(repair_candidates),
             len(indexed_texts),
