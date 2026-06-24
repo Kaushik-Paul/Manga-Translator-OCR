@@ -334,19 +334,117 @@ def inpaint_text_region(
                 gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
             )
 
-    # Dilate mask to cover text edges, anti-aliasing, and surrounding halo
-    # Japanese text often has ink bleed that needs a larger dilation radius
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    mask = cv2.dilate(mask, kernel, iterations=3)
+    mask = _complete_inpaint_mask(region, mask)
 
     # Ensure mask is uint8
     mask = mask.astype(np.uint8)
 
-    # Inpaint using Telea algorithm (better for text removal)
-    inpainted = cv2.inpaint(region, mask, inpaintRadius=10, flags=cv2.INPAINT_TELEA)
+    paper_fill = _paper_fill_color(region, mask)
+    if paper_fill is not None:
+        # Speech bubbles and narration boxes are cleaner when the detected text
+        # is painted back to the local paper colour before a small inpaint pass.
+        # Telea alone tends to leave grey/black ink shadows in large glyph holes.
+        cleaned = region.copy()
+        cleaned[mask > 0] = paper_fill
+        inpainted = cv2.inpaint(cleaned, mask, inpaintRadius=2, flags=cv2.INPAINT_TELEA)
+    else:
+        # Non-paper art/background needs true inpainting, but keep the radius
+        # bounded so large decorative text does not smear the surrounding art.
+        radius = int(np.clip(round(min(w, h) * 0.025), 3, 8))
+        inpainted = cv2.inpaint(region, mask, inpaintRadius=radius, flags=cv2.INPAINT_TELEA)
     result[y : y + h, x : x + w] = inpainted
 
     return result
+
+
+def _complete_inpaint_mask(region: NDArray, mask: NDArray) -> NDArray:
+    """Expand a detector text mask enough to remove antialiasing and ink halos."""
+    h, w = mask.shape[:2]
+    if h <= 0 or w <= 0:
+        return mask.astype(np.uint8)
+
+    binary = mask.astype(np.uint8)
+    if binary.max() > 1:
+        _, binary = cv2.threshold(binary, 127, 255, cv2.THRESH_BINARY)
+    else:
+        binary = (binary > 0).astype(np.uint8) * 255
+
+    if cv2.countNonZero(binary) == 0:
+        return binary
+
+    bbox = _mask_bbox(binary)
+    if bbox is None:
+        return binary
+    x1, y1, x2, y2 = bbox
+    text_span = max(1, min(x2 - x1, y2 - y1))
+
+    close_k = _odd(int(np.clip(round(text_span * 0.035), 3, 9)))
+    binary = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k)),
+        iterations=1,
+    )
+
+    dilate_k = _odd(int(np.clip(round(text_span * 0.13), 5, 21)))
+    expanded = cv2.dilate(
+        binary,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_k, dilate_k)),
+        iterations=1,
+    )
+
+    paper_color = _paper_fill_color(region, expanded)
+    if paper_color is None:
+        return expanded
+
+    # If a detector mask misses antialiased outlines around the glyph, capture
+    # nearby pixels whose colour differs from the local paper surface.
+    near_k = _odd(int(np.clip(round(text_span * 0.28), 9, 39)))
+    near_text = cv2.dilate(
+        binary,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (near_k, near_k)),
+        iterations=1,
+    )
+    diff = np.linalg.norm(region.astype(np.int16) - paper_color.astype(np.int16), axis=2)
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    ink_like = ((diff > 34) | (gray < 185)).astype(np.uint8) * 255
+    halo = cv2.bitwise_and(near_text, ink_like)
+    completed = cv2.bitwise_or(expanded, halo)
+
+    return cv2.morphologyEx(
+        completed,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+
+
+def _paper_fill_color(region: NDArray, mask: NDArray) -> np.ndarray | None:
+    """Return a local BGR paper colour for bright low-saturation text surfaces."""
+    if region is None or region.size == 0 or len(region.shape) != 3:
+        return None
+    if mask.shape[:2] != region.shape[:2]:
+        return None
+
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+    outside = mask == 0
+    paper = outside & (gray >= 188) & (hsv[:, :, 1] <= 70)
+    paper_count = int(np.sum(paper))
+    area = max(1, region.shape[0] * region.shape[1])
+    if paper_count < max(80, int(area * 0.05)):
+        return None
+
+    paper_ratio = paper_count / float(area)
+    mean_gray = float(np.mean(gray[paper]))
+    mean_sat = float(np.mean(hsv[:, :, 1][paper]))
+    if paper_ratio < 0.18 and mean_gray < 222:
+        return None
+    if mean_sat > 58:
+        return None
+
+    fill = np.median(region[paper].astype(np.float32), axis=0)
+    return np.clip(fill.round(), 0, 255).astype(np.uint8)
 
 
 def render_text_on_image(
@@ -550,7 +648,10 @@ def render_text_on_image(
     # Strip characters the selected font can't render (prevents □ tofu boxes).
     text = _sanitize_for_font(text, font_file)
 
-    text_padding = max(1, padding - 4) if text_style == "dialogue" else max(1, padding - 4)
+    if text_style == "dialogue":
+        text_padding = max(4, int(round(min(box_w, box_h) * 0.05)), padding - 1)
+    else:
+        text_padding = max(1, padding - 4)
     avail_w = box_w - 2 * text_padding
     avail_h = box_h - 2 * text_padding
     # If the clip mask is already box-sized (from expanded bubble search),
@@ -1541,7 +1642,7 @@ def _prepare_bubble_render_mask(mask: NDArray) -> NDArray | None:
     if comp_area < 180:
         return None
 
-    k = _odd(max(3, int(round(np.sqrt(comp_area) / 70))))
+    k = _odd(max(5, int(round(np.sqrt(comp_area) / 52))))
     eroded = cv2.erode(
         mask.astype(np.uint8),
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)),
