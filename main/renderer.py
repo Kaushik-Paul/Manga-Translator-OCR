@@ -929,6 +929,26 @@ def render_text_on_image(
     total_text_height = (
         sum(lh for _, lh, _, _ in line_metrics) + (len(lines) - 1) * line_spacing
     )
+    if total_text_height > avail_h and text_style == "dialogue":
+        shortened = _fit_shortened_dialogue_to_box(
+            draw=draw,
+            text=text,
+            font_path=font_file,
+            avail_w=avail_w,
+            avail_h=avail_h,
+            min_size=_DIALOGUE_MIN_SIZE,
+            max_size=getattr(font, "size", _DIALOGUE_MIN_SIZE),
+            max_lines=_DIALOGUE_MAX_LINES,
+        )
+        if shortened is None:
+            return _skip_render("dialogue taller than box")
+        font, lines, line_spacing, line_metrics, text = shortened
+        stroke_width = _stroke_width_for_font(font)
+        total_text_height = (
+            sum(lh for _, lh, _, _ in line_metrics) + (len(lines) - 1) * line_spacing
+        )
+    elif total_text_height > avail_h:
+        return _skip_render("text taller than box")
 
     # Center vertically
     start_y = box_y + text_padding + max(0, (avail_h - total_text_height) // 2)
@@ -2807,6 +2827,34 @@ def _max_line_width(
     return max(widths) if widths else 0
 
 
+def _line_metrics(
+    *,
+    draw: ImageDraw.ImageDraw,
+    lines: list[str],
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    stroke_width: int = 0,
+) -> list[tuple[int, int, int, int]]:
+    """Return rendered line width, height, and glyph offsets."""
+    metrics: list[tuple[int, int, int, int]] = []
+    for line in lines:
+        left, top, right, bottom = draw.textbbox(
+            (0, 0),
+            line,
+            font=font,
+            anchor="lt",
+            stroke_width=stroke_width,
+        )
+        metrics.append(
+            (
+                max(0, int(right - left)),
+                max(0, int(bottom - top)),
+                int(left),
+                int(top),
+            )
+        )
+    return metrics
+
+
 def _text_layout_height(
     *,
     draw: ImageDraw.ImageDraw,
@@ -3117,6 +3165,79 @@ def _fit_shortened_dialogue_to_bubble_mask(
     return None
 
 
+def _fit_shortened_dialogue_to_box(
+    *,
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font_path: str | None,
+    avail_w: int,
+    avail_h: int,
+    min_size: int,
+    max_size: int,
+    max_lines: int,
+) -> tuple[
+    ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    list[str],
+    int,
+    list[tuple[int, int, int, int]],
+    str,
+] | None:
+    """Find a shortened dialogue layout that genuinely fits a rectangular box."""
+    clean = " ".join(text.replace("\r", " ").replace("\n", " ").split())
+    if not clean:
+        return None
+
+    words = clean.split()
+    candidates: list[str] = [clean]
+    seen = {clean}
+    for max_words in range(min(len(words) - 1, 12), 1, -1):
+        candidate = _compress_dialogue_for_tiny_box(clean, max_words=max_words)
+        if candidate and candidate not in seen:
+            candidates.append(candidate)
+            seen.add(candidate)
+    for max_words in range(min(len(words) - 1, 10), 1, -1):
+        candidate = _truncate_dialogue_at_word_boundary(clean, max_words=max_words)
+        if candidate and candidate not in seen:
+            candidates.append(candidate)
+            seen.add(candidate)
+    for candidate in _narrow_dialogue_rescue_candidates(clean):
+        if candidate and candidate not in seen:
+            candidates.append(candidate)
+            seen.add(candidate)
+
+    for candidate in candidates:
+        font, lines, line_spacing = _fit_text_to_box(
+            draw=draw,
+            text=candidate,
+            max_w=avail_w,
+            max_h=avail_h,
+            font_path=font_path,
+            style="dialogue",
+            min_size=min_size,
+            max_size=max(min_size, max_size),
+        )
+        if not lines or len(lines) > max_lines:
+            continue
+        if getattr(font, "size", 0) < min_size:
+            continue
+        stroke_width = _stroke_width_for_font(font)
+        metrics = _line_metrics(
+            draw=draw,
+            lines=lines,
+            font=font,
+            stroke_width=stroke_width,
+        )
+        if _layout_fits_rect(
+            line_metrics=metrics,
+            line_spacing=line_spacing,
+            avail_w=avail_w,
+            avail_h=avail_h,
+        ):
+            return font, lines, line_spacing, metrics, candidate
+
+    return None
+
+
 def _fit_relaxed_spill_dialogue_to_bubble_mask(
     *,
     draw: ImageDraw.ImageDraw,
@@ -3253,8 +3374,11 @@ def _layout_fits_bubble_mask(
     if mask.size == 0:
         return True
 
+    h, _ = mask.shape[:2]
     current_y = int(start_y)
     for line_w, line_h, _, _ in line_metrics:
+        if current_y < 0 or current_y + line_h > h:
+            return False
         span = _mask_band_span(mask=mask, y=current_y, line_h=line_h, line_w=line_w)
         if span is None:
             return False
@@ -3264,6 +3388,22 @@ def _layout_fits_bubble_mask(
         current_y += int(line_h + line_spacing)
 
     return True
+
+
+def _layout_fits_rect(
+    *,
+    line_metrics: list[tuple[int, int, int, int]],
+    line_spacing: int,
+    avail_w: int,
+    avail_h: int,
+) -> bool:
+    """Return True when every rendered line fits within a rectangular text area."""
+    if not line_metrics:
+        return False
+    max_w = max(line_w for line_w, _, _, _ in line_metrics)
+    total_h = sum(line_h for _, line_h, _, _ in line_metrics)
+    total_h += max(0, len(line_metrics) - 1) * line_spacing
+    return max_w <= avail_w + 1 and total_h <= avail_h
 
 
 def _cap_span_around_center(
