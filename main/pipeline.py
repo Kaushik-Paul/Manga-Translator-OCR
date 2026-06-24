@@ -1608,7 +1608,60 @@ def _is_renderable_unit(unit: RenderTextUnit, text: str) -> bool:
     if unit.style_hint == "dialogue" and _is_short_nonbubble_dialogue_noise(unit, cleaned):
         return False
 
+    if _is_large_nonbubble_translation_mismatch(unit, cleaned):
+        return False
+
     return True
+
+
+def _is_large_nonbubble_translation_mismatch(unit: RenderTextUnit, translated: str) -> bool:
+    """Avoid destroying large decorative/source blocks for tiny bad replacements.
+
+    A common OCR failure on cover/title/SFX overlays is that a large Japanese
+    block is recognized as a small interjection. Rendering that tiny fragment
+    after inpainting the whole source block looks worse than preserving the
+    original. This gate is deliberately limited to non-bubble regions.
+    """
+    clean_translation = " ".join(translated.split())
+    if not clean_translation:
+        return True
+
+    region = unit.context_region or unit.region
+    region_area = max(1, region.w * region.h)
+    if region_area < 42_000:
+        return False
+    if _context_region_has_bright_bubble(unit.region) or _context_region_has_bright_bubble(region):
+        return False
+
+    source_compact = "".join(unit.source_text.split())
+    if len(source_compact) < 8:
+        return False
+
+    script_total, kana_count, kanji_count, _ = _script_profile(source_compact)
+    if script_total < 8:
+        return False
+
+    translated_words = re.findall(r"[A-Za-z0-9']+", clean_translation)
+    translated_alpha_len = sum(len(word) for word in translated_words)
+    source_is_semantic_block = kanji_count >= 2 or len(source_compact) >= 14
+    if source_is_semantic_block and region_area >= 70_000:
+        return True
+
+    replacement_is_tiny = (
+        len(translated_words) <= 2
+        and translated_alpha_len <= 14
+        and not any(ch in clean_translation for ch in ".?!")
+    )
+    if source_is_semantic_block and replacement_is_tiny:
+        return True
+
+    # Large kana-only effects can still be valid SFX, but if OCR translated a
+    # long effect block to a one-word whisper, preserve the original rather than
+    # leaving a half-erased page.
+    if kanji_count == 0 and kana_count >= 10 and translated_alpha_len <= 8:
+        return True
+
+    return False
 
 
 def _is_compact_sfx_render(text: str) -> bool:
