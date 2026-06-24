@@ -689,6 +689,14 @@ def render_text_on_image(
     if avail_w <= 10 or avail_h <= 10:
         return _skip_render("no available text area")
 
+    dialogue_min_size = _dialogue_min_font_size(
+        box_w=box_w,
+        box_h=box_h,
+        avail_w=avail_w,
+        avail_h=avail_h,
+        bubble_used=bubble_used,
+    )
+
     # Determine outline color from background brightness (original logic).
     region = result[box_y : box_y + box_h, box_x : box_x + box_w]
     gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
@@ -723,7 +731,7 @@ def render_text_on_image(
         max_h=avail_h,
         font_path=font_file,
         style=text_style,
-        min_size=10 if text_style == "sfx" else 12,
+        min_size=10 if text_style == "sfx" else dialogue_min_size,
         max_size_cap=max_size_cap,
     )
     stroke_width = _stroke_width_for_font(font)
@@ -768,7 +776,7 @@ def render_text_on_image(
 
     # Enforce minimum readable font size (12px) AND a dynamic max line count for dialogue.
     # Tall narrow bubbles need more lines; cap based on available height.
-    _DIALOGUE_MIN_SIZE = 12
+    _DIALOGUE_MIN_SIZE = dialogue_min_size
     if box_h > box_w * 3:
         _DIALOGUE_MAX_LINES = 11
     elif box_h > box_w * 2:
@@ -1094,6 +1102,8 @@ def render_text_on_image(
             )
             if masked_rel_x is not None:
                 line_x = box_x + masked_rel_x
+            elif text_style == "dialogue":
+                return _skip_render("dialogue line cannot be placed in mask")
 
         # Draw outline for readability (stroke)
         target_draw.text(
@@ -1111,8 +1121,15 @@ def render_text_on_image(
     if clip_dialogue_to_mask and text_layer is not None:
         alpha = np.array(text_layer.getchannel("A"), dtype=np.uint8)
         clip = np.zeros_like(alpha)
+        clip_mask = (box_clip_mask > 0).astype(np.uint8) * 255
+        if min(box_w, box_h) >= 28:
+            clip_mask = cv2.dilate(
+                clip_mask,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                iterations=1,
+            )
         clip[box_y : box_y + box_h, box_x : box_x + box_w] = (
-            (box_clip_mask > 0).astype(np.uint8) * 255
+            clip_mask
         )
         alpha = np.minimum(alpha, clip)
         text_layer.putalpha(Image.fromarray(alpha))
@@ -2205,6 +2222,31 @@ def _fit_text_to_box(
     return font, lines, spacing
 
 
+def _dialogue_min_font_size(
+    *,
+    box_w: int,
+    box_h: int,
+    avail_w: int,
+    avail_h: int,
+    bubble_used: bool,
+) -> int:
+    """Return a readable minimum dialogue size for the available text box."""
+    area = max(1, int(avail_w * avail_h))
+    min_dim = min(avail_w, avail_h)
+
+    if min_dim < 38 or area < 2200:
+        return 12
+    if box_w < 52 and box_h > box_w * 1.8:
+        return 12
+    if area >= 34_000 and min_dim >= 78:
+        return 15
+    if area >= 14_000 and min_dim >= 54:
+        return 14
+    if bubble_used and area >= 7_000 and min_dim >= 44:
+        return 13
+    return 12
+
+
 def _fit_narrow_dialogue_rescue(
     *,
     draw: ImageDraw.ImageDraw,
@@ -2480,22 +2522,12 @@ def _non_bubble_dialogue_has_safe_surface(
     if box_w < 18 or box_h < 18:
         return False
 
-    gray = cv2.cvtColor(region_image, cv2.COLOR_BGR2GRAY)
-    hsv = cv2.cvtColor(region_image, cv2.COLOR_BGR2HSV)
-    bright = gray > 200
-    low_sat = hsv[:, :, 1] < 45
-    paper = bright & low_sat
-    paper_ratio = float(np.mean(paper)) if paper.size else 0.0
-    mean_brightness = float(np.mean(gray)) if gray.size else 0.0
-
-    # White rectangular narration boxes and missed speech balloons both have a
-    # substantial low-saturation bright surface. Art/background crops do not.
-    if paper_ratio >= 0.36:
-        return True
-    if paper_ratio >= 0.24 and mean_brightness >= 190 and len(words) <= 5:
-        return True
-
-    return False
+    return _non_bubble_dialogue_surface(
+        region_image=region_image,
+        text=text,
+        box_w=box_w,
+        box_h=box_h,
+    ) is not None
 
 
 def _non_bubble_dialogue_surface(
@@ -2600,7 +2632,9 @@ def _non_bubble_dialogue_surface(
 
     if best_label < 0:
         return None
-    if best_edge_large and best_mean_gray < 232:
+    if best_edge_large and (
+        best_mean_gray < 245 or best_fill_ratio < 0.82
+    ):
         return None
     if word_count > 2:
         area_ratio = best_area / float(crop_area)
