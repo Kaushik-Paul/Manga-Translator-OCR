@@ -197,10 +197,9 @@ def translate_page(
         _is_renderable_unit(unit, text)
         for unit, text in zip(units, translated_texts)
     ]
-    inpaintable_unit_mask = [
-        can_render or _should_inpaint_unit_without_render(unit, text)
-        for unit, text, can_render in zip(units, translated_texts, renderable_unit_mask)
-    ]
+    # Never erase text unless we have a replacement that passed the renderability
+    # gate. A preserved source bubble is preferable to an empty inpainted bubble.
+    inpaintable_unit_mask = list(renderable_unit_mask)
     renderable_region_indices = {
         unit.parent_region_index
         for unit, can_render in zip(units, renderable_unit_mask)
@@ -262,9 +261,9 @@ def translate_page(
                 parent_renderable_counts.get(unit.parent_region_index, 0) + 1
             )
 
-    # First pass: inpaint renderable text, plus skipped text only when it is on
-    # a safe paper-like surface. For split parents, erase only the selected
-    # child masks so an accepted dialogue line cannot wipe nearby skipped SFX.
+    # First pass: inpaint only text units with renderable replacements. For split
+    # parents, erase only selected child masks so one accepted dialogue line
+    # cannot wipe nearby skipped SFX or dialogue.
     for region_idx in sorted(inpaintable_region_indices):
         region = regions[region_idx]
         if parent_unit_counts.get(region_idx, 0) > 1:
@@ -310,7 +309,7 @@ def translate_page(
                     unit_region=unit.region,
                     context_region=region,
                 )
-            result = render_text_on_image(
+            rendered_result, did_render = render_text_on_image(
                 result,
                 translated,
                 region.x,
@@ -321,7 +320,16 @@ def translate_page(
                 style_hint=unit.style_hint,
                 text_color=unit.text_color,
                 allow_bubble_expansion=True,
+                return_status=True,
             )
+            if did_render:
+                result = rendered_result
+            else:
+                result = _restore_unit_source_text(
+                    result=result,
+                    original=image,
+                    unit=unit,
+                )
 
     # 6. Save output
     out = _resolve_output_path(image_path, output_path, cfg)
@@ -502,6 +510,51 @@ def _save_image(output_path: Path, image_bgr: np.ndarray) -> None:
         cv2.imwrite(str(output_path), image_bgr)
 
 
+def _restore_unit_source_text(
+    result: np.ndarray,
+    original: np.ndarray,
+    unit: RenderTextUnit,
+) -> np.ndarray:
+    """Restore original glyph pixels if rendering a translated unit failed."""
+    region = unit.region
+    img_h, img_w = result.shape[:2]
+    x1 = max(0, int(region.x))
+    y1 = max(0, int(region.y))
+    x2 = min(img_w, int(region.x + region.w))
+    y2 = min(img_h, int(region.y + region.h))
+    if x2 <= x1 or y2 <= y1:
+        return result
+
+    restored = result.copy()
+    dst = restored[y1:y2, x1:x2]
+    src = original[y1:y2, x1:x2]
+    mask = region.mask
+    if mask is None or mask.shape[:2] != (region.h, region.w):
+        dst[:, :] = src
+        return restored
+
+    local_x1 = x1 - region.x
+    local_y1 = y1 - region.y
+    local_x2 = local_x1 + (x2 - x1)
+    local_y2 = local_y1 + (y2 - y1)
+    local_mask = mask[local_y1:local_y2, local_x1:local_x2].astype(np.uint8)
+    if local_mask.max() > 1:
+        _, local_mask = cv2.threshold(local_mask, 127, 255, cv2.THRESH_BINARY)
+    else:
+        local_mask = (local_mask > 0).astype(np.uint8) * 255
+    if cv2.countNonZero(local_mask) == 0:
+        dst[:, :] = src
+        return restored
+
+    local_mask = cv2.dilate(
+        local_mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+    dst[local_mask > 0] = src[local_mask > 0]
+    return restored
+
+
 def _select_render_context_region(
     unit_region: TextRegion,
     parent_region: TextRegion,
@@ -597,6 +650,7 @@ def _assign_render_context_regions(
                 sibling_regions=sibling_regions,
                 image=image,
                 text_mask=text_mask,
+                style_hint=unit.style_hint,
             )
 
 
@@ -632,6 +686,7 @@ def _build_local_render_context_region(
     sibling_regions: list[TextRegion],
     image: np.ndarray,
     text_mask: np.ndarray,
+    style_hint: str,
 ) -> TextRegion:
     """Expand a split OCR unit into a local, sibling-aware render context."""
     img_h, img_w = image.shape[:2]
@@ -708,6 +763,25 @@ def _build_local_render_context_region(
         y2 = min(parent_y2, y1 + min_h)
         y1 = max(parent_y1, y2 - min_h)
 
+    if style_hint == "dialogue" and unit_region.h > unit_region.w * 1.35:
+        current_w = x2 - x1
+        target_w = min(
+            parent_region.w,
+            max(
+                current_w,
+                96,
+                unit_region.w + min(140, int(unit_region.h * 0.42)),
+            ),
+        )
+        if target_w > current_w:
+            half = int(target_w // 2)
+            candidate_x1 = max(parent_x1, int(round(ucx)) - half)
+            candidate_x2 = min(parent_x2, candidate_x1 + int(target_w))
+            candidate_x1 = max(parent_x1, candidate_x2 - int(target_w))
+            candidate = image[int(y1) : int(y2), int(candidate_x1) : int(candidate_x2)]
+            if _crop_has_neutral_dialogue_surface(candidate):
+                x1, x2 = candidate_x1, candidate_x2
+
     if x2 <= x1 or y2 <= y1:
         return unit_region
 
@@ -719,6 +793,20 @@ def _build_local_render_context_region(
         cropped=image[int(y1) : int(y2), int(x1) : int(x2)].copy(),
         mask=text_mask[int(y1) : int(y2), int(x1) : int(x2)].copy(),
     )
+
+
+def _crop_has_neutral_dialogue_surface(crop: np.ndarray) -> bool:
+    """Return True for white/grey speech-balloon-like local crops."""
+    if crop is None or crop.size == 0:
+        return False
+    if crop.shape[0] < 24 or crop.shape[1] < 24:
+        return False
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    neutral_ratio = float(np.mean(hsv[:, :, 1] < 85))
+    median_sat = float(np.median(hsv[:, :, 1]))
+    mean_gray = float(np.mean(gray))
+    return neutral_ratio >= 0.72 and median_sat <= 70 and mean_gray >= 115
 
 
 def _build_translation_constraint(unit: RenderTextUnit) -> TranslationConstraint:
@@ -1456,8 +1544,11 @@ def _infer_unit_style(source_text: str, w: int, h: int) -> str:
     script_total, kana_count, kanji_count, punct_count = _script_profile(clean)
     char_count = len(clean)
     has_sentence_punct = any(c in clean for c in "。！？?!")
+    has_dialogue_comma = any(c in clean for c in "、,")
 
     if has_sentence_punct or kanji_count > 0 or kana_count >= 2:
+        if has_dialogue_comma and kana_count >= 3:
+            return "dialogue"
         if has_sentence_punct and kana_count >= 4:
             return "dialogue"
         if _is_effect_like_source(clean, kana_count=kana_count, kanji_count=kanji_count):
@@ -1580,11 +1671,27 @@ def _is_renderable_unit(unit: RenderTextUnit, text: str) -> bool:
     if unit.style_hint == "sfx":
         src_clean = unit.source_text.strip()
         src_compact = "".join(src_clean.split())
-        script_total, kana_count, kanji_count, _ = _script_profile(src_compact)
+        script_total, kana_count, kanji_count, punct_count = _script_profile(src_compact)
         meaningful_chars = len(src_compact)
+        context = unit.context_region or unit.region
+        bubble_interjection = (
+            kana_count >= 1
+            and punct_count >= 2
+            and re.search(r"[A-Za-z]", cleaned) is not None
+            and (
+                _context_region_has_bright_bubble(unit.region)
+                or _context_region_has_bright_bubble(context)
+                or _crop_has_neutral_dialogue_surface(unit.region.cropped)
+                or _crop_has_neutral_dialogue_surface(context.cropped)
+            )
+        )
         if script_total == 0:
             return False
-        if meaningful_chars >= 3 and (script_total / float(meaningful_chars)) < 0.50:
+        if (
+            meaningful_chars >= 3
+            and (script_total / float(meaningful_chars)) < 0.50
+            and not bubble_interjection
+        ):
             return False
         if (kana_count + kanji_count) < 2 and re.search(r"[A-Za-z0-9]", src_compact):
             return False
@@ -1602,7 +1709,10 @@ def _is_renderable_unit(unit: RenderTextUnit, text: str) -> bool:
             return False
         if not _is_compact_sfx_render(cleaned):
             return False
-        if not _is_effect_like_source(src_compact, kana_count=kana_count, kanji_count=kanji_count):
+        if (
+            not bubble_interjection
+            and not _is_effect_like_source(src_compact, kana_count=kana_count, kanji_count=kanji_count)
+        ):
             return False
 
     if unit.style_hint == "dialogue" and _is_short_nonbubble_dialogue_noise(unit, cleaned):
@@ -1662,41 +1772,6 @@ def _is_large_nonbubble_translation_mismatch(unit: RenderTextUnit, translated: s
         return True
 
     return False
-
-
-def _should_inpaint_unit_without_render(unit: RenderTextUnit, translated: str) -> bool:
-    """Erase skipped source text only when the local surface is safe paper.
-
-    This handles cases where OCR/translation produces an unusable English
-    replacement but the original Japanese sits in a clean balloon/narration box.
-    Large non-bubble decorative text is intentionally preserved; inpainting that
-    without a good replacement produces obvious smears.
-    """
-    source_compact = "".join(unit.source_text.split())
-    script_total, _, _, _ = _script_profile(source_compact)
-    if script_total == 0:
-        return False
-
-    clean_translation = " ".join(translated.split())
-    if clean_translation and _is_large_nonbubble_translation_mismatch(unit, clean_translation):
-        return False
-
-    region = unit.context_region or unit.region
-    region_area = max(1, region.w * region.h)
-    source_area = max(1, unit.region.w * unit.region.h)
-
-    has_safe_surface = _context_region_has_bright_bubble(unit.region) or (
-        region_area <= 180_000 and _context_region_has_bright_bubble(region)
-    )
-    if not has_safe_surface:
-        return False
-
-    if unit.style_hint == "dialogue":
-        return True
-
-    # SFX in white burst balloons or small paper callouts should be removed
-    # when the replacement is unusable. Coloured/background SFX remains intact.
-    return source_area < 36_000 or region_area < 70_000
 
 
 def _is_compact_sfx_render(text: str) -> bool:
