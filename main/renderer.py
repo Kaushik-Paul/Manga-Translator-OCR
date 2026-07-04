@@ -460,7 +460,8 @@ def render_text_on_image(
     padding: int = 4,
     text_color: tuple[int, int, int] | None = None,
     allow_bubble_expansion: bool = True,
-) -> NDArray:
+    return_status: bool = False,
+) -> NDArray | tuple[NDArray, bool]:
     """
     Render translated text within a bounding box on the image.
 
@@ -477,11 +478,15 @@ def render_text_on_image(
     Returns:
         Modified image with text rendered.
     """
+    def _return(rendered_image: NDArray, did_render: bool) -> NDArray | tuple[NDArray, bool]:
+        if return_status:
+            return rendered_image, did_render
+        return rendered_image
+
     if not text.strip():
-        return image
+        return _return(image, False)
 
     result = image.copy()
-    pre_render = result.copy()
     if style_hint in {"dialogue", "sfx"}:
         text_style = style_hint
     else:
@@ -584,10 +589,11 @@ def render_text_on_image(
             box_h,
             " ".join(text.split())[:80],
         )
-        return image
+        return _return(image, False)
 
     non_bubble_dialogue = text_style == "dialogue" and not bubble_used
     forced_box_clip_mask: NDArray | None = None
+    mask_anchored_dialogue_box = False
     if non_bubble_dialogue:
         # Non-bubble regions are often noisy merged text; force compact phrasing.
         text = _tighten_non_bubble_dialogue(text=text, box_w=box_w, box_h=box_h)
@@ -604,12 +610,25 @@ def render_text_on_image(
                 box_h=box_h,
             )
             if surface is None:
-                return _skip_render("no safe non-bubble surface")
-            local_x, local_y, local_w, local_h, forced_box_clip_mask = surface
-            box_x += local_x
-            box_y += local_y
-            box_w = local_w
-            box_h = local_h
+                if not _is_neutral_mask_anchored_dialogue_box(
+                    region_image=result[box_y : box_y + box_h, box_x : box_x + box_w],
+                    region_mask=region_mask,
+                    search_x=search_x,
+                    search_y=search_y,
+                    box_x=box_x,
+                    box_y=box_y,
+                    box_w=box_w,
+                    box_h=box_h,
+                    text=text,
+                ):
+                    return _skip_render("no safe non-bubble surface")
+                mask_anchored_dialogue_box = True
+            else:
+                local_x, local_y, local_w, local_h, forced_box_clip_mask = surface
+                box_x += local_x
+                box_y += local_y
+                box_w = local_w
+                box_h = local_h
     if _is_punctuation_only(text):
         return _skip_render("punctuation-only")
 
@@ -622,6 +641,7 @@ def render_text_on_image(
     if (
         non_bubble_dialogue
         and forced_box_clip_mask is None
+        and not mask_anchored_dialogue_box
         and not _non_bubble_dialogue_has_safe_surface(
             region_image=result[box_y : box_y + box_h, box_x : box_x + box_w],
             text=text,
@@ -722,7 +742,7 @@ def render_text_on_image(
 
     # Auto-size font to fit
     max_size_cap = None
-    if non_bubble_dialogue:
+    if non_bubble_dialogue and not mask_anchored_dialogue_box:
         max_size_cap = max(14, min(24, int(min(avail_w, avail_h) * 0.42)))
     font, lines, line_spacing = _fit_text_to_box(
         draw=draw,
@@ -1078,20 +1098,48 @@ def render_text_on_image(
                     max_lines=_DIALOGUE_MAX_LINES,
                 )
                 if relaxed_layout is None:
-                    return _skip_render("dialogue does not fit bubble mask")
-                (
-                    font,
-                    lines,
-                    line_spacing,
-                    line_metrics,
-                    local_start_y,
-                    text,
-                    box_clip_mask,
-                ) = relaxed_layout
+                    rect_layout = _fit_shortened_dialogue_to_box(
+                        draw=draw,
+                        text=text,
+                        font_path=font_file,
+                        avail_w=avail_w,
+                        avail_h=avail_h,
+                        min_size=_DIALOGUE_MIN_SIZE,
+                        max_size=getattr(font, "size", _DIALOGUE_MIN_SIZE),
+                        max_lines=_DIALOGUE_MAX_LINES,
+                    )
+                    if rect_layout is None:
+                        return _skip_render("dialogue does not fit bubble mask")
+                    font, lines, line_spacing, line_metrics, text = rect_layout
+                    stroke_width = _stroke_width_for_font(font)
+                    total_text_height = (
+                        sum(lh for _, lh, _, _ in line_metrics)
+                        + (len(lines) - 1) * line_spacing
+                    )
+                    start_y = box_y + text_padding + max(
+                        0, (avail_h - total_text_height) // 2
+                    )
+                    box_clip_mask = None
+                    logger.debug(
+                        "Dialogue constraints: falling back to rectangular bubble box, lines=%d",
+                        len(lines),
+                    )
+                else:
+                    (
+                        font,
+                        lines,
+                        line_spacing,
+                        line_metrics,
+                        local_start_y,
+                        text,
+                        box_clip_mask,
+                    ) = relaxed_layout
+                    stroke_width = _stroke_width_for_font(font)
+                    start_y = box_y + local_start_y
             else:
                 font, lines, line_spacing, line_metrics, local_start_y, text = shortened_layout
-            stroke_width = _stroke_width_for_font(font)
-            start_y = box_y + local_start_y
+                stroke_width = _stroke_width_for_font(font)
+                start_y = box_y + local_start_y
 
     # Draw each line centered horizontally
     clip_dialogue_to_mask = box_clip_mask is not None and text_style == "dialogue"
@@ -1143,9 +1191,13 @@ def render_text_on_image(
         clip = np.zeros_like(alpha)
         clip_mask = (box_clip_mask > 0).astype(np.uint8) * 255
         if min(box_w, box_h) >= 28:
+            clip_pad = int(np.clip(stroke_width + 2, 3, 9))
             clip_mask = cv2.dilate(
                 clip_mask,
-                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE,
+                    (clip_pad * 2 + 1, clip_pad * 2 + 1),
+                ),
                 iterations=1,
             )
         clip[box_y : box_y + box_h, box_x : box_x + box_w] = (
@@ -1157,7 +1209,7 @@ def render_text_on_image(
 
     # Convert back to BGR
     rendered = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-    return rendered
+    return _return(rendered, True)
 
 
 def _infer_text_style(text: str, w: int, h: int) -> str:
@@ -1235,6 +1287,21 @@ def _resolve_dialogue_box(
         default_box=default_box,
     )
 
+    def _fallback_result() -> tuple[int, int, int, int, bool, NDArray | None]:
+        expanded_fallback_box = _expanded_neutral_dialogue_fallback_box(
+            x=x,
+            y=y,
+            w=w,
+            h=h,
+            region_mask=region_mask,
+            region_image=region_image,
+            default_box=default_box,
+            translated_text=translated_text,
+        )
+        if expanded_fallback_box is not None:
+            return (*expanded_fallback_box, True, None)
+        return (*fallback_box, False, None)
+
     center_anchor = (w // 2, h // 2)
     mask_anchor = _mask_centroid(region_mask, w, h)
     anchors: list[tuple[int, int]] = [center_anchor]
@@ -1274,44 +1341,44 @@ def _resolve_dialogue_box(
                 continue
             break
         if bubble_mask is None:
-            return (*fallback_box, False, None)
+            return _fallback_result()
 
     bubble_mask = _isolate_bubble_lobe_near_text(
         bubble_mask=bubble_mask,
         region_mask=region_mask,
     )
     if bubble_mask is None:
-        return (*fallback_box, False, None)
+        return _fallback_result()
 
     bubble_bbox = _mask_bbox(bubble_mask)
     if bubble_bbox is None:
-        return (*fallback_box, False, None)
+        return _fallback_result()
     bx1, by1, bx2, by2 = bubble_bbox
     bx, by, bw, bh = bx1, by1, (bx2 - bx1), (by2 - by1)
     bubble_area = bw * bh
     region_area = max(1, w * h)
     if bubble_area < int(region_area * 0.16):
-        return (*fallback_box, False, None)
+        return _fallback_result()
     if bubble_area > int(region_area * 0.99):
-        return (*fallback_box, False, None)
+        return _fallback_result()
     if not _bubble_mask_is_plausible_for_text(
         bubble_mask=bubble_mask,
         region_mask=region_mask,
     ):
-        return (*fallback_box, False, None)
+        return _fallback_result()
     if not _bubble_mask_has_paper_surface(
         region_image=region_image,
         bubble_mask=bubble_mask,
     ):
-        return (*fallback_box, False, None)
+        return _fallback_result()
 
     bubble_render_mask = _prepare_bubble_render_mask(bubble_mask)
     if bubble_render_mask is None:
-        return (*fallback_box, False, None)
+        return _fallback_result()
 
     fit_bbox = _mask_bbox(bubble_render_mask)
     if fit_bbox is None:
-        return (*fallback_box, False, None)
+        return _fallback_result()
     x1, y1, x2, y2 = fit_bbox
     # The mask is already eroded; we don't need additional aggressive shrinkage.
     shrink_ratio = 0.00
@@ -1321,7 +1388,7 @@ def _resolve_dialogue_box(
     min_w = max(20, int(w * 0.20))
     min_h = max(18, int(h * 0.20))
     if fit_w < min_w or fit_h < min_h:
-        return (*fallback_box, False, None)
+        return _fallback_result()
 
     # For longer dialogue, avoid overly tight boxes.
     if len(translated_text.strip()) >= 18:
@@ -1329,7 +1396,21 @@ def _resolve_dialogue_box(
         min_long_w = max(min_w, int(w * min_long_w_ratio))
         min_long_h = max(min_h, int(h * 0.38))
         if fit_w < min_long_w or fit_h < min_long_h:
-            return (*fallback_box, False, None)
+            return _fallback_result()
+
+    if fit_w < 58 and re.search(r"[A-Za-z0-9]{3,}", translated_text):
+        expanded_fallback_box = _expanded_neutral_dialogue_fallback_box(
+            x=x,
+            y=y,
+            w=w,
+            h=h,
+            region_mask=region_mask,
+            region_image=region_image,
+            default_box=default_box,
+            translated_text=translated_text,
+        )
+        if expanded_fallback_box is not None:
+            return (*expanded_fallback_box, True, None)
 
     return (x + x1, y + y1, fit_w, fit_h, True, bubble_render_mask)
 
@@ -1396,6 +1477,93 @@ def _dialogue_fallback_box_from_mask(
         return default_box
 
     return (x + lx1, y + ly1, fw, fh)
+
+
+def _expanded_neutral_dialogue_fallback_box(
+    *,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    region_mask: NDArray | None,
+    region_image: NDArray,
+    default_box: tuple[int, int, int, int],
+    translated_text: str,
+) -> tuple[int, int, int, int] | None:
+    """Use the expanded search box for narrow vertical dialogue on paper."""
+    if region_mask is None or region_mask.shape[:2] != (h, w):
+        return None
+    if w < 72 or w > 420 or h < 120:
+        return None
+
+    if region_mask.max() > 1:
+        _, binary = cv2.threshold(region_mask.astype(np.uint8), 127, 255, cv2.THRESH_BINARY)
+    else:
+        binary = (region_mask > 0).astype(np.uint8) * 255
+    if cv2.countNonZero(binary) < 20:
+        return None
+
+    bbox = _mask_bbox(binary)
+    if bbox is None:
+        return None
+    bx1, by1, bx2, by2 = bbox
+    glyph_w = max(1, bx2 - bx1)
+    glyph_h = max(1, by2 - by1)
+    if glyph_h < glyph_w * 1.30:
+        return None
+    if w < max(72, int(glyph_w * 1.30)):
+        return None
+
+    glyph_cx = (bx1 + bx2) // 2
+    glyph_cy = (by1 + by2) // 2
+    target_w = min(
+        w,
+        max(
+            96,
+            min(180, int(glyph_w * 1.85)),
+            min(170, int(glyph_h * 0.48)),
+        ),
+    )
+    target_h = min(
+        h,
+        max(
+            120,
+            int(glyph_h * 1.16),
+            min(h, int(target_w * 2.2)),
+        ),
+    )
+    local_x = max(0, int(glyph_cx - target_w // 2))
+    local_y = max(0, int(glyph_cy - target_h // 2))
+    local_x = min(local_x, max(0, w - target_w))
+    local_y = min(local_y, max(0, h - target_h))
+    box_x = x + local_x
+    box_y = y + local_y
+    box_w = int(target_w)
+    box_h = int(target_h)
+
+    _, _, default_w, _ = default_box
+    if default_w <= 190:
+        box_x, box_y, box_w, box_h = default_box
+
+    local_x = box_x - x
+    local_y = box_y - y
+    if local_x < 0 or local_y < 0 or local_x + box_w > w or local_y + box_h > h:
+        return None
+
+    if not _is_neutral_mask_anchored_dialogue_box(
+        region_image=region_image[local_y : local_y + box_h, local_x : local_x + box_w],
+        region_mask=region_mask,
+        search_x=x,
+        search_y=y,
+        box_x=box_x,
+        box_y=box_y,
+        box_w=box_w,
+        box_h=box_h,
+        text=translated_text,
+    ):
+        return None
+
+    return (box_x, box_y, box_w, box_h)
 
 
 def _resolve_sfx_box(
@@ -2363,6 +2531,14 @@ def _narrow_dialogue_rescue_candidates(text: str) -> list[str]:
 
     add(normalized)
 
+    if len(words) == 1 and re.search(r"([A-Za-z])\1{2,}", words[0]):
+        softened = re.sub(r"([A-Za-z])\1{2,}", r"\1\1", normalized)
+        compact = re.sub(r"([A-Za-z])\1+", r"\1", normalized)
+        add(softened)
+        add(softened.rstrip(".!?"))
+        add(compact)
+        add(compact.rstrip(".!?"))
+
     max_words = min(8, len(words))
     for count in range(max_words, 0, -1):
         add(_truncate_dialogue_at_word_boundary(normalized, max_words=count))
@@ -2548,6 +2724,126 @@ def _non_bubble_dialogue_has_safe_surface(
         box_w=box_w,
         box_h=box_h,
     ) is not None
+
+
+def _is_neutral_mask_anchored_dialogue_box(
+    *,
+    region_image: NDArray,
+    region_mask: NDArray | None,
+    search_x: int,
+    search_y: int,
+    box_x: int,
+    box_y: int,
+    box_w: int,
+    box_h: int,
+    text: str,
+) -> bool:
+    """Allow fallback dialogue rendering on grey/white balloon interiors."""
+    clean = " ".join(text.split())
+    if not clean or not re.search(r"[A-Za-z0-9]", clean):
+        return False
+    if region_image is None or region_image.size == 0:
+        return False
+    if box_w < 28 or box_h < 28 or box_w * box_h < 1200:
+        return False
+    if region_mask is None:
+        return False
+
+    mask_h, mask_w = region_mask.shape[:2]
+    lx1 = int(box_x - search_x)
+    ly1 = int(box_y - search_y)
+    lx2 = lx1 + int(box_w)
+    ly2 = ly1 + int(box_h)
+    if lx1 < 0 or ly1 < 0 or lx2 > mask_w or ly2 > mask_h:
+        return False
+
+    local_mask = region_mask[ly1:ly2, lx1:lx2].astype(np.uint8)
+    if local_mask.max() > 1:
+        _, local_mask = cv2.threshold(local_mask, 127, 255, cv2.THRESH_BINARY)
+    else:
+        local_mask = (local_mask > 0).astype(np.uint8) * 255
+    if cv2.countNonZero(local_mask) < max(24, int(box_w * box_h * 0.004)):
+        return False
+
+    neutral_ratio, median_sat, median_gray, mean_gray = _neutral_surface_stats(
+        region_image,
+    )
+
+    # White and grey speech balloons are low-saturation surfaces. This rejects
+    # skin/clothes/background art while allowing darker grey night-scene bubbles.
+    whole_box_is_neutral = (
+        neutral_ratio >= 0.86
+        and median_sat <= 55
+        and median_gray >= 125
+        and mean_gray >= 115
+    )
+    if whole_box_is_neutral:
+        return True
+
+    near_mask = _mask_neighborhood_sample(local_mask, box_w=box_w, box_h=box_h)
+    if near_mask is None:
+        return False
+    neutral_ratio, median_sat, median_gray, mean_gray = _neutral_surface_stats(
+        region_image,
+        sample_mask=near_mask,
+    )
+    return (
+        neutral_ratio >= 0.78
+        and median_sat <= 65
+        and median_gray >= 135
+        and mean_gray >= 125
+    )
+
+
+def _neutral_surface_stats(
+    region_image: NDArray,
+    sample_mask: NDArray | None = None,
+) -> tuple[float, float, float, float]:
+    gray = cv2.cvtColor(region_image, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(region_image, cv2.COLOR_BGR2HSV)
+    if sample_mask is not None and sample_mask.shape[:2] == gray.shape[:2]:
+        sample = sample_mask > 0
+        if np.any(sample):
+            sat_values = hsv[:, :, 1][sample]
+            gray_values = gray[sample]
+            neutral_ratio = float(np.mean(sat_values < 80))
+            return (
+                neutral_ratio,
+                float(np.median(sat_values)),
+                float(np.median(gray_values)),
+                float(np.mean(gray_values)),
+            )
+
+    neutral = hsv[:, :, 1] < 80
+    return (
+        float(np.mean(neutral)),
+        float(np.median(hsv[:, :, 1])),
+        float(np.median(gray)),
+        float(np.mean(gray)),
+    )
+
+
+def _mask_neighborhood_sample(
+    local_mask: NDArray,
+    *,
+    box_w: int,
+    box_h: int,
+) -> NDArray | None:
+    if local_mask.size == 0:
+        return None
+    radius = int(np.clip(min(box_w, box_h) * 0.16, 8, 26))
+    kernel_size = radius * 2 + 1
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (kernel_size, kernel_size),
+    )
+    expanded = cv2.dilate(local_mask, kernel, iterations=1)
+    sample = cv2.subtract(expanded, local_mask)
+    if cv2.countNonZero(sample) < max(80, int(box_w * box_h * 0.015)):
+        sample = expanded
+    if cv2.countNonZero(sample) < 40:
+        return None
+    return sample
 
 
 def _non_bubble_dialogue_surface(
