@@ -988,6 +988,10 @@ def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:
             region_w=region.w,
             region_h=region.h,
         )
+    merged_boxes = _merge_same_surface_vertical_ocr_boxes(
+        merged_boxes,
+        region=region,
+    )
     merged_boxes = [
         b
         for b in merged_boxes
@@ -1129,6 +1133,24 @@ def _split_bright_bubble_text_groups(
         if len(members) < 2 and area < 6000:
             continue
 
+        if _should_keep_bright_component_as_one_group(
+            component_box=(cx1, cy1, cx2, cy2),
+            component_area=area,
+            region_w=region.w,
+            region_h=region.h,
+            members=members,
+        ):
+            gx1 = min(item[0] for item in members)
+            gy1 = min(item[1] for item in members)
+            gx2 = max(item[2] for item in members)
+            gy2 = max(item[3] for item in members)
+            if (gx2 - gx1) >= 12 and (gy2 - gy1) >= 12:
+                bubble_groups.append((gx1, gy1, gx2, gy2))
+                for idx, box in enumerate(boxes):
+                    if box in members:
+                        used.add(idx)
+                continue
+
         lobe_groups = _split_bright_component_into_text_lobes(
             component_mask=(labels == label).astype(np.uint8) * 255,
             component_box=(cx1, cy1, cx2, cy2),
@@ -1162,6 +1184,160 @@ def _split_bright_bubble_text_groups(
 
     remaining = [box for idx, box in enumerate(boxes) if idx not in used]
     return bubble_groups, remaining
+
+
+def _merge_same_surface_vertical_ocr_boxes(
+    boxes: list[tuple[int, int, int, int]],
+    region: TextRegion,
+) -> list[tuple[int, int, int, int]]:
+    """Merge vertical OCR columns that sit on one bright bubble/narration surface."""
+    if len(boxes) < 2 or region.cropped is None or region.cropped.size == 0:
+        return boxes
+
+    gray = cv2.cvtColor(region.cropped, cv2.COLOR_BGR2GRAY)
+    bright_threshold = int(np.clip(np.percentile(gray, 82), 205, 235))
+    _, bright = cv2.threshold(gray, bright_threshold, 255, cv2.THRESH_BINARY)
+    bright = cv2.morphologyEx(
+        bright,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
+        iterations=2,
+    )
+    bright = cv2.morphologyEx(
+        bright,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        bright,
+        connectivity=8,
+    )
+    if num_labels <= 1:
+        return boxes
+
+    used: set[int] = set()
+    merged: list[tuple[int, int, int, int]] = []
+    region_area = max(1, region.w * region.h)
+
+    for label in range(1, num_labels):
+        cx1 = int(stats[label, cv2.CC_STAT_LEFT])
+        cy1 = int(stats[label, cv2.CC_STAT_TOP])
+        cw = int(stats[label, cv2.CC_STAT_WIDTH])
+        ch = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < max(900, int(region_area * 0.004)):
+            continue
+        if cw < 42 or ch < 42:
+            continue
+        cx2, cy2 = cx1 + cw, cy1 + ch
+
+        member_indices: list[int] = []
+        members: list[tuple[int, int, int, int]] = []
+        for idx, box in enumerate(boxes):
+            if idx in used:
+                continue
+            bx1, by1, bx2, by2 = box
+            bcx = (bx1 + bx2) * 0.5
+            bcy = (by1 + by2) * 0.5
+            ix1, iy1 = max(cx1, bx1), max(cy1, by1)
+            ix2, iy2 = min(cx2, bx2), min(cy2, by2)
+            overlap = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            box_area = max(1, (bx2 - bx1) * (by2 - by1))
+            center_inside = cx1 - 3 <= bcx <= cx2 + 3 and cy1 - 3 <= bcy <= cy2 + 3
+            if center_inside or overlap >= int(box_area * 0.30):
+                member_indices.append(idx)
+                members.append(box)
+
+        if not _should_keep_bright_component_as_one_group(
+            component_box=(cx1, cy1, cx2, cy2),
+            component_area=area,
+            region_w=region.w,
+            region_h=region.h,
+            members=members,
+        ):
+            continue
+
+        gx1 = min(item[0] for item in members)
+        gy1 = min(item[1] for item in members)
+        gx2 = max(item[2] for item in members)
+        gy2 = max(item[3] for item in members)
+        if (gx2 - gx1) < 12 or (gy2 - gy1) < 12:
+            continue
+        merged.append((gx1, gy1, gx2, gy2))
+        used.update(member_indices)
+
+    merged.extend(box for idx, box in enumerate(boxes) if idx not in used)
+    return merged
+
+
+def _should_keep_bright_component_as_one_group(
+    *,
+    component_box: tuple[int, int, int, int],
+    component_area: int,
+    region_w: int,
+    region_h: int,
+    members: list[tuple[int, int, int, int]],
+) -> bool:
+    """Return True when text boxes are columns in one bright text surface."""
+    if len(members) < 2:
+        return False
+
+    cx1, cy1, cx2, cy2 = component_box
+    cw = max(1, cx2 - cx1)
+    ch = max(1, cy2 - cy1)
+    bbox_area = max(1, cw * ch)
+    fill_ratio = component_area / float(bbox_area)
+    region_area = max(1, region_w * region_h)
+    if fill_ratio < 0.42:
+        return False
+
+    vertical_members = [
+        box
+        for box in members
+        if _looks_like_vertical_text_box(box)
+    ]
+    if len(vertical_members) < 2:
+        return False
+
+    if bbox_area > int(region_area * 0.92) and fill_ratio < 0.74:
+        return False
+    if bbox_area > int(region_area * 0.92) and ch > cw * 1.65:
+        center_ys = [(box[1] + box[3]) * 0.5 for box in vertical_members]
+        if center_ys and (max(center_ys) - min(center_ys)) > ch * 0.55:
+            return False
+
+    sorted_members = sorted(vertical_members, key=lambda b: (b[0] + b[2]) * 0.5)
+    max_allowed_gap = max(34, min(72, int(min(cw, ch) * 0.18)))
+    close_pairs = 0
+    for left, right in zip(sorted_members, sorted_members[1:]):
+        x_gap = max(0, right[0] - left[2])
+        y_overlap = max(0, min(left[3], right[3]) - max(left[1], right[1]))
+        min_h = max(1, min(left[3] - left[1], right[3] - right[1]))
+        if x_gap <= max_allowed_gap and y_overlap >= int(min_h * 0.20):
+            close_pairs += 1
+
+    clean_rect_surface = fill_ratio >= 0.74 and bbox_area >= int(region_area * 0.12)
+    if clean_rect_surface and len(sorted_members) >= 3 and close_pairs >= 1:
+        return True
+
+    if len(sorted_members) >= 3:
+        return close_pairs >= max(1, len(sorted_members) - 2)
+
+    if close_pairs == 0:
+        return False
+
+    clean_rect_surface = fill_ratio >= 0.62 and bbox_area >= int(region_area * 0.12)
+    tall_shared_surface = ch >= max(90, cw * 0.80) and fill_ratio >= 0.50
+    return clean_rect_surface or tall_shared_surface
+
+
+def _looks_like_vertical_text_box(box: tuple[int, int, int, int]) -> bool:
+    x1, y1, x2, y2 = box
+    w = max(1, x2 - x1)
+    h = max(1, y2 - y1)
+    return h >= 28 and (h >= w * 1.18 or (w <= 78 and h >= 70))
 
 
 def _split_bright_component_into_text_lobes(
@@ -1551,12 +1727,26 @@ def _infer_unit_style(source_text: str, w: int, h: int) -> str:
             return "dialogue"
         if has_sentence_punct and kana_count >= 4:
             return "dialogue"
+        if _is_elongated_kana_dialogue_like(clean, kana_count=kana_count):
+            return "dialogue"
         if _is_effect_like_source(clean, kana_count=kana_count, kanji_count=kanji_count):
             return "sfx"
         return "dialogue"
     if script_total == 0 or char_count <= 2:
         return "sfx"
     return "dialogue"
+
+
+def _is_elongated_kana_dialogue_like(clean: str, kana_count: int) -> bool:
+    """Keep short elongated kana phrases in bubbles from being treated as SFX."""
+    if kana_count < 4:
+        return False
+    if not any(ch in clean for ch in "ー〜～"):
+        return False
+    kana = "".join(ch for ch in clean if _is_kana_char(ch))
+    if re.search(r"([\u3040-\u30ff])\1{1,}", kana):
+        return False
+    return True
 
 
 def _is_effect_like_source(clean: str, kana_count: int, kanji_count: int) -> bool:
