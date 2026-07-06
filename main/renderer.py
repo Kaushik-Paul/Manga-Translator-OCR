@@ -612,7 +612,7 @@ def render_text_on_image(
             if surface is None:
                 if not _is_neutral_mask_anchored_dialogue_box(
                     region_image=result[box_y : box_y + box_h, box_x : box_x + box_w],
-                    region_mask=region_mask,
+                    region_mask=search_region_mask,
                     search_x=search_x,
                     search_y=search_y,
                     box_x=box_x,
@@ -2774,10 +2774,16 @@ def _is_neutral_mask_anchored_dialogue_box(
     whole_box_is_neutral = (
         neutral_ratio >= 0.86
         and median_sat <= 55
-        and median_gray >= 125
-        and mean_gray >= 115
+        and median_gray >= 115
+        and mean_gray >= 105
     )
-    if whole_box_is_neutral:
+    dark_neutral_balloon = (
+        neutral_ratio >= 0.78
+        and median_sat <= 70
+        and median_gray <= 95
+        and mean_gray <= 110
+    )
+    if whole_box_is_neutral or dark_neutral_balloon:
         return True
 
     near_mask = _mask_neighborhood_sample(local_mask, box_w=box_w, box_h=box_h)
@@ -2790,8 +2796,8 @@ def _is_neutral_mask_anchored_dialogue_box(
     return (
         neutral_ratio >= 0.78
         and median_sat <= 65
-        and median_gray >= 135
-        and mean_gray >= 125
+        and median_gray >= 115
+        and mean_gray >= 105
     )
 
 

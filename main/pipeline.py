@@ -84,6 +84,7 @@ def translate_page(
     logger.debug("Step 1/4: Detecting text regions (ML model)...")
     regions, text_mask = detect_text_regions(image)
     regions = _merge_overlapping_detected_regions(regions, image, text_mask)
+    regions = _merge_same_surface_detected_regions(regions, image, text_mask)
     logger.debug("Found %d text regions.", len(regions))
 
     if not regions:
@@ -992,6 +993,10 @@ def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:
         merged_boxes,
         region=region,
     )
+    merged_boxes = _merge_same_surface_horizontal_ocr_boxes(
+        merged_boxes,
+        region=region,
+    )
     merged_boxes = [
         b
         for b in merged_boxes
@@ -1270,6 +1275,91 @@ def _merge_same_surface_vertical_ocr_boxes(
 
     merged.extend(box for idx, box in enumerate(boxes) if idx not in used)
     return merged
+
+
+def _merge_same_surface_horizontal_ocr_boxes(
+    boxes: list[tuple[int, int, int, int]],
+    region: TextRegion,
+) -> list[tuple[int, int, int, int]]:
+    """Merge row-aligned OCR fragments on one balloon surface."""
+    if len(boxes) < 3 or region.cropped is None or region.cropped.size == 0:
+        return boxes
+    if not _crop_has_neutral_dialogue_surface(region.cropped):
+        return boxes
+
+    sorted_boxes = sorted(boxes, key=lambda b: (b[1] + b[3]) * 0.5)
+    rows: list[list[tuple[int, int, int, int]]] = []
+    for box in sorted_boxes:
+        cy = (box[1] + box[3]) * 0.5
+        h = box[3] - box[1]
+        if not rows:
+            rows.append([box])
+            continue
+        row = rows[-1]
+        row_cys = [(b[1] + b[3]) * 0.5 for b in row]
+        row_h = float(np.median([b[3] - b[1] for b in row] + [h]))
+        if abs(cy - float(np.median(row_cys))) <= max(18, min(70, int(row_h * 0.58))):
+            row.append(box)
+        else:
+            rows.append([box])
+
+    used: set[tuple[int, int, int, int]] = set()
+    merged: list[tuple[int, int, int, int]] = []
+    for row in rows:
+        row = sorted(row, key=lambda b: b[0])
+        cluster: list[tuple[int, int, int, int]] = []
+        for box in row:
+            if not cluster:
+                cluster = [box]
+                continue
+            prev = cluster[-1]
+            x_gap = max(0, box[0] - prev[2])
+            heights = [b[3] - b[1] for b in cluster] + [box[3] - box[1]]
+            median_h = float(np.median(heights))
+            max_gap_cap = 340 if region.w >= 600 else 220
+            max_gap = max(34, min(max_gap_cap, int(median_h * 3.0)))
+            if x_gap <= max_gap:
+                cluster.append(box)
+                continue
+            _append_horizontal_ocr_cluster(cluster, merged, used, region)
+            cluster = [box]
+        _append_horizontal_ocr_cluster(cluster, merged, used, region)
+
+    merged.extend(box for box in boxes if box not in used)
+    return merged
+
+
+def _append_horizontal_ocr_cluster(
+    cluster: list[tuple[int, int, int, int]],
+    merged: list[tuple[int, int, int, int]],
+    used: set[tuple[int, int, int, int]],
+    region: TextRegion,
+) -> None:
+    if len(cluster) < 3:
+        return
+    x1 = min(b[0] for b in cluster)
+    y1 = min(b[1] for b in cluster)
+    x2 = max(b[2] for b in cluster)
+    y2 = max(b[3] for b in cluster)
+    w = x2 - x1
+    h = y2 - y1
+    if w < max(90, int(region.w * 0.24)):
+        return
+    if h > max(150, int(region.h * 0.88)):
+        return
+    center_ys = [(b[1] + b[3]) * 0.5 for b in cluster]
+    median_h = float(np.median([b[3] - b[1] for b in cluster]))
+    if (max(center_ys) - min(center_ys)) > max(34, median_h * 0.80):
+        return
+    largest_member = max((b[2] - b[0]) * (b[3] - b[1]) for b in cluster)
+    union_area = max(1, w * h)
+    if largest_member / float(union_area) > 0.55:
+        return
+    crop = region.cropped[y1:y2, x1:x2]
+    if not _crop_has_neutral_dialogue_surface(crop):
+        return
+    merged.append((x1, y1, x2, y2))
+    used.update(cluster)
 
 
 def _should_keep_bright_component_as_one_group(
@@ -2195,9 +2285,26 @@ def _merge_overlapping_detected_regions(
             return False
         y_overlap = max(0, min(a.y + a.h, b.y + b.h) - max(a.y, b.y))
         min_h = min(a.h, b.h)
-        if y_overlap < int(min_h * 0.25):
+        if y_overlap < int(min_h * 0.42):
             return False
-        return True
+        acy = a.y + a.h * 0.5
+        bcy = b.y + b.h * 0.5
+        if abs(acy - bcy) > max(90, min_h * 0.70):
+            return False
+        a_crop = image[a.y : a.y + a.h, a.x : a.x + a.w]
+        b_crop = image[b.y : b.y + b.h, b.x : b.x + b.w]
+        if not (
+            _crop_has_neutral_dialogue_surface(a_crop)
+            and _crop_has_neutral_dialogue_surface(b_crop)
+        ):
+            return False
+        ux1 = max(0, min(a.x, b.x))
+        uy1 = max(0, min(a.y, b.y))
+        ux2 = min(image.shape[1], max(a.x + a.w, b.x + b.w))
+        uy2 = min(image.shape[0], max(a.y + a.h, b.y + b.h))
+        if ux2 <= ux1 or uy2 <= uy1:
+            return False
+        return _crop_has_neutral_dialogue_surface(image[uy1:uy2, ux1:ux2])
 
     merged = regions.copy()
     changed = True
@@ -2246,3 +2353,233 @@ def _merge_overlapping_detected_regions(
         merged = next_regions
 
     return merged
+
+
+def _merge_same_surface_detected_regions(
+    regions: list[TextRegion],
+    image: np.ndarray,
+    text_mask: np.ndarray,
+) -> list[TextRegion]:
+    """Merge detector fragments that are one phrase on the same bright surface."""
+    if len(regions) < 2 or image is None or image.size == 0:
+        return regions
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    paper = ((gray > 200) & (hsv[:, :, 1] < 90)).astype(np.uint8) * 255
+    paper = cv2.morphologyEx(
+        paper,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)),
+        iterations=2,
+    )
+    paper = cv2.morphologyEx(
+        paper,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        paper,
+        connectivity=8,
+    )
+    if num_labels <= 1:
+        return regions
+
+    page_area = max(1, image.shape[0] * image.shape[1])
+    by_label: dict[int, list[int]] = {}
+    for idx, region in enumerate(regions):
+        cx = int(np.clip(region.x + region.w * 0.5, 0, image.shape[1] - 1))
+        cy = int(np.clip(region.y + region.h * 0.5, 0, image.shape[0] - 1))
+        label = int(labels[cy, cx])
+        if label <= 0:
+            label = _dominant_paper_label_for_region(
+                labels=labels,
+                region=region,
+                stats=stats,
+                page_area=page_area,
+            )
+        if label <= 0:
+            continue
+        component_area = int(stats[label, cv2.CC_STAT_AREA])
+        if component_area < 2500:
+            continue
+        by_label.setdefault(label, []).append(idx)
+
+    if not by_label:
+        return regions
+
+    clusters: list[list[int]] = []
+    consumed: set[int] = set()
+    for label, indices in by_label.items():
+        if len(indices) < 2:
+            continue
+        members = [regions[i] for i in indices]
+        row_clusters = _cluster_same_surface_row_regions(members, indices)
+        for cluster in row_clusters:
+            if len(cluster) < 2:
+                continue
+            if not _detected_region_cluster_should_merge(
+                [regions[i] for i in cluster],
+                image=image,
+            ):
+                continue
+            clusters.append(cluster)
+            consumed.update(cluster)
+
+    if not clusters:
+        return regions
+
+    merged_regions: list[TextRegion] = []
+    for cluster in clusters:
+        x1 = max(0, min(regions[i].x for i in cluster))
+        y1 = max(0, min(regions[i].y for i in cluster))
+        x2 = min(image.shape[1], max(regions[i].x + regions[i].w for i in cluster))
+        y2 = min(image.shape[0], max(regions[i].y + regions[i].h for i in cluster))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        merged_regions.append(
+            TextRegion(
+                x=x1,
+                y=y1,
+                w=x2 - x1,
+                h=y2 - y1,
+                cropped=image[y1:y2, x1:x2].copy(),
+                mask=text_mask[y1:y2, x1:x2].copy(),
+            )
+        )
+
+    for idx, region in enumerate(regions):
+        if idx in consumed:
+            continue
+        merged_regions.append(region)
+
+    return sorted(merged_regions, key=lambda r: (r.y, r.x))
+
+
+def _dominant_paper_label_for_region(
+    *,
+    labels: np.ndarray,
+    region: TextRegion,
+    stats: np.ndarray,
+    page_area: int,
+) -> int:
+    x1 = max(0, region.x)
+    y1 = max(0, region.y)
+    x2 = min(labels.shape[1], region.x + region.w)
+    y2 = min(labels.shape[0], region.y + region.h)
+    if x2 <= x1 or y2 <= y1:
+        return 0
+    crop = labels[y1:y2, x1:x2]
+    values, counts = np.unique(crop[crop > 0], return_counts=True)
+    if values.size == 0:
+        return 0
+    order = np.argsort(counts)[::-1]
+    for pos in order:
+        label = int(values[pos])
+        component_area = int(stats[label, cv2.CC_STAT_AREA])
+        if component_area >= 2500:
+            return label
+    return 0
+
+
+def _cluster_same_surface_row_regions(
+    members: list[TextRegion],
+    indices: list[int],
+) -> list[list[int]]:
+    paired = sorted(
+        zip(indices, members),
+        key=lambda item: item[1].y + item[1].h * 0.5,
+    )
+    row_groups: list[list[tuple[int, TextRegion]]] = []
+    current_row: list[tuple[int, TextRegion]] = []
+    for idx, region in paired:
+        cy = region.y + region.h * 0.5
+        if not current_row:
+            current_row = [(idx, region)]
+            continue
+        row_cys = [r.y + r.h * 0.5 for _, r in current_row]
+        row_heights = [r.h for _, r in current_row] + [region.h]
+        median_h = float(np.median(row_heights))
+        if abs(cy - float(np.median(row_cys))) <= max(50, min(135, int(median_h * 0.75))):
+            current_row.append((idx, region))
+            continue
+        row_groups.append(current_row)
+        current_row = [(idx, region)]
+    if current_row:
+        row_groups.append(current_row)
+
+    clusters: list[list[int]] = []
+    for row in row_groups:
+        row = sorted(row, key=lambda item: item[1].x)
+        current: list[int] = []
+        current_regions: list[TextRegion] = []
+
+        for idx, region in row:
+            if not current:
+                current = [idx]
+                current_regions = [region]
+                continue
+
+            prev = current_regions[-1]
+            x_gap = max(0, region.x - (prev.x + prev.w))
+            heights = [r.h for r in current_regions] + [region.h]
+            median_h = float(np.median(heights))
+            center_ys = [r.y + r.h * 0.5 for r in current_regions] + [region.y + region.h * 0.5]
+            y_spread = max(center_ys) - min(center_ys)
+            max_gap = max(95, min(280, int(median_h * 2.25)))
+            max_y_spread = max(45, min(140, int(median_h * 0.85)))
+            if x_gap <= max_gap and y_spread <= max_y_spread:
+                current.append(idx)
+                current_regions.append(region)
+                continue
+
+            clusters.append(current)
+            current = [idx]
+            current_regions = [region]
+
+        if current:
+            clusters.append(current)
+    return clusters
+
+
+def _detected_region_cluster_should_merge(
+    members: list[TextRegion],
+    image: np.ndarray,
+) -> bool:
+    if len(members) < 3:
+        return False
+    if max(r.h for r in members) > 260:
+        return False
+    if max(r.w * r.h for r in members) > 50_000:
+        return False
+    x1 = max(0, min(r.x for r in members))
+    y1 = max(0, min(r.y for r in members))
+    x2 = min(image.shape[1], max(r.x + r.w for r in members))
+    y2 = min(image.shape[0], max(r.y + r.h for r in members))
+    if x2 <= x1 or y2 <= y1:
+        return False
+
+    union_w = x2 - x1
+    union_h = y2 - y1
+    if union_w < 80 or union_h < 35:
+        return False
+    if union_h > max(260, union_w * 1.15):
+        return False
+
+    crop = image[y1:y2, x1:x2]
+    if not _crop_has_neutral_dialogue_surface(crop):
+        return False
+
+    member_area = sum(max(1, r.w * r.h) for r in members)
+    union_area = max(1, union_w * union_h)
+    if member_area / float(union_area) > 0.78:
+        return False
+
+    center_ys = [r.y + r.h * 0.5 for r in members]
+    median_h = float(np.median([r.h for r in members]))
+    if (max(center_ys) - min(center_ys)) > max(55, median_h * 0.90):
+        return False
+
+    return True
