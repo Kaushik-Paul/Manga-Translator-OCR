@@ -205,20 +205,23 @@ class MangaOCREngine(OCREngine):
     def extract_text(self, image: NDArray, region_mask: NDArray | None = None) -> str:
         crop = self._crop_with_mask(image, region_mask)
         base = self._run_manga_ocr(crop)
-        if not base:
-            return ""
-
         area = crop.shape[0] * crop.shape[1]
-        should_refine = area >= 50000 or self._is_noisy_text(base)
+        # An empty first pass is not evidence that a detector region contains no
+        # text.  Thin, coloured and outlined manga lettering is exactly where
+        # manga-ocr benefits most from upscaling/contrast variants.  The old
+        # early return silently dropped those regions before translation.
+        should_refine = not base or area >= 50000 or self._is_noisy_text(base)
         if not should_refine:
             return base.strip()
 
-        candidates = [base]
+        candidates = [base] if base else []
         for variant in self._build_preprocess_variants(crop):
             text = self._run_manga_ocr(variant)
             if text:
                 candidates.append(text)
 
+        if not candidates:
+            return ""
         best = max(candidates, key=self._score_candidate)
         return best.strip()
 
@@ -297,11 +300,8 @@ class ModalOCREngine(MangaOCREngine):
         self._ensure_modal()
         crop = self._crop_with_mask(image, region_mask)
         base = self._run_manga_ocr(crop)
-        if not base:
-            return ""
-
         area = crop.shape[0] * crop.shape[1]
-        should_refine = area >= 50000 or self._is_noisy_text(base)
+        should_refine = not base or area >= 50000 or self._is_noisy_text(base)
         if not should_refine:
             return base.strip()
 
@@ -315,12 +315,14 @@ class ModalOCREngine(MangaOCREngine):
             logger.warning("Modal OCR .map() failed, returning base text: %s", e)
             return base.strip()
 
-        candidates = [base]
+        candidates = [base] if base else []
         for text in results:
             t = text.strip() if text else ""
             if t:
                 candidates.append(t)
 
+        if not candidates:
+            return ""
         best = max(candidates, key=self._score_candidate)
         return best.strip()
 

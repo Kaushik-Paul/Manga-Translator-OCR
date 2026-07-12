@@ -138,8 +138,10 @@ def translate_page(
     else:
         ocr_results = [_ocr_one(t) for t in all_ocr_tasks]
 
+    empty_ocr_units = 0
     for region_idx, sub_idx, ocr_region, text in ocr_results:
         if not text:
+            empty_ocr_units += 1
             continue
 
         style_hint = _infer_unit_style(text, ocr_region.w, ocr_region.h)
@@ -164,6 +166,13 @@ def translate_page(
             sub_idx,
             style_hint,
             text[:80],
+        )
+
+    if empty_ocr_units:
+        logger.warning(
+            "OCR returned no text for %d of %d detected unit(s).",
+            empty_ocr_units,
+            len(ocr_results),
         )
 
     if not units:
@@ -264,6 +273,8 @@ def translate_page(
 
     # Second pass: render translated text onto the cleaned image
     rendered_pixel_mask = np.zeros(result.shape[:2], dtype=np.uint8)
+    rendered_units = 0
+    failed_render_units = 0
     for unit, translated, can_render in zip(units, translated_texts, renderable_unit_mask):
         if can_render:
             # If multiple renderable units share a parent, keep each in its own
@@ -289,16 +300,29 @@ def translate_page(
                 return_status=True,
             )
             if did_render:
+                rendered_units += 1
                 changed = np.any(rendered_result != result, axis=2)
                 rendered_pixel_mask[changed] = 255
                 result = rendered_result
             else:
+                failed_render_units += 1
                 result = _restore_unit_source_text(
                     result=result,
                     original=image,
                     unit=unit,
                     protected_mask=rendered_pixel_mask,
                 )
+
+    logger.info(
+        "Page coverage: detected=%d, OCR=%d, rendered=%d, "
+        "OCR-empty=%d, render-failed=%d, filtered=%d.",
+        len(all_ocr_tasks),
+        len(units),
+        rendered_units,
+        empty_ocr_units,
+        failed_render_units,
+        skipped_units,
+    )
 
     # 6. Save output
     out = _resolve_output_path(image_path, output_path, cfg)
@@ -1897,74 +1921,22 @@ def _strip_cjk_chars(text: str) -> str:
 
 
 def _is_renderable_unit(unit: RenderTextUnit, text: str) -> bool:
-    """
-    Return True if a translated unit should be rendered on-page.
-
-    Combines basic text checks with context-aware filtering for SFX
-    fragments — tiny regions with single-character source/translated text
-    that are typically noise from individual Japanese characters detected
-    as separate regions.
-    """
+    """Render every translated Japanese unit except clear OCR/API noise."""
     if not _is_renderable_translation(text):
         return False
 
-    cleaned = text.strip()
-    region = unit.region
-    area = max(1, region.w * region.h)
-
-    if unit.style_hint == "sfx":
-        src_clean = unit.source_text.strip()
-        src_compact = "".join(src_clean.split())
-        script_total, kana_count, kanji_count, punct_count = _script_profile(src_compact)
-        meaningful_chars = len(src_compact)
-        context = unit.context_region or unit.region
-        bubble_interjection = (
-            kana_count >= 1
-            and punct_count >= 2
-            and re.search(r"[A-Za-z]", cleaned) is not None
-            and (
-                _context_region_has_bright_bubble(unit.region)
-                or _context_region_has_bright_bubble(context)
-                or _crop_has_neutral_dialogue_surface(unit.region.cropped)
-                or _crop_has_neutral_dialogue_surface(context.cropped)
-            )
-        )
-        if script_total == 0:
-            return False
-        if (
-            meaningful_chars >= 3
-            and (script_total / float(meaningful_chars)) < 0.50
-            and not bubble_interjection
-        ):
-            return False
-        if (kana_count + kanji_count) < 2 and re.search(r"[A-Za-z0-9]", src_compact):
-            return False
-
-        # Skip very short SFX translations in small regions (fragment noise).
-        if len(cleaned) <= 2 and area < 4000:
-            return False
-        # Skip single-character source text in small SFX regions — these are
-        # individual Japanese characters (e.g. 'お', 'ん') that shouldn't be
-        # rendered as separate tiny SFX.
-        if len(src_clean) <= 1 and area < 8000:
-            return False
-        # Skip numeric/symbol-only SFX (e.g. "13", "1/", "1:")
-        if re.fullmatch(r'[\d\s/.:;,!?\-()]+', cleaned):
-            return False
-        if not _is_compact_sfx_render(cleaned):
-            return False
-        if (
-            not bubble_interjection
-            and not _is_effect_like_source(src_compact, kana_count=kana_count, kanji_count=kanji_count)
-        ):
-            return False
-
-    if unit.style_hint == "dialogue" and _is_short_nonbubble_dialogue_noise(unit, cleaned):
+    _, kana_count, kanji_count, _ = _script_profile(unit.source_text)
+    if (kana_count + kanji_count) == 0:
+        # The Japanese pipeline occasionally OCRs panel marks or Latin sound
+        # lettering (for example "K,") as a text unit.  This narrow check avoids
+        # replacing non-Japanese artwork while retaining even one-character
+        # kana/kanji effects.
         return False
 
-    if _is_large_nonbubble_translation_mismatch(unit, cleaned):
-        return False
-
+    # Detection and OCR are the ownership signal.  Do not silently discard
+    # short/kana-only text, multi-word SFX, or narration printed on artwork:
+    # translating those regions is a core requirement.  Rendering safety is
+    # handled by the renderer and failed draws restore the original pixels.
     return True
 
 

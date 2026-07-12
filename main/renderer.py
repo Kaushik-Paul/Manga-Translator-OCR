@@ -2825,7 +2825,10 @@ def _is_mask_anchored_art_dialogue_box(
     source_h = max(1, sy2 - sy1)
     # Stay close to the original lettering lane; broad panel detections are not
     # safe direct-to-art placements.
-    if box_w > max(90, int(source_w * 2.25)):
+    # Vertical Japanese occupies a much narrower lane than wrapped English.
+    # Permit moderate horizontal growth for direct-to-art narration while
+    # retaining a hard cap so a panel-wide detector box can never qualify.
+    if box_w > max(90, min(190, int(source_w * 3.75))):
         return False
     if box_h > max(80, int(source_h * 2.10)):
         return False
@@ -2836,14 +2839,17 @@ def _is_mask_anchored_art_dialogue_box(
     sample = near_mask > 0 if near_mask is not None else np.ones(gray.shape, dtype=bool)
     if not np.any(sample):
         return False
-    median_sat = float(np.median(hsv[:, :, 1][sample]))
-    mean_gray = float(np.mean(gray[sample]))
-    bright_neutral_ratio = float(
-        np.mean((gray[sample] >= 185) & (hsv[:, :, 1][sample] <= 28))
+    # Reject genuinely white balloon/paper interiors, not pale beige/grey art.
+    # The broader old test (gray >= 185, saturation <= 28) classified walls,
+    # skies and lightly coloured panels as white paper, so valid narration on
+    # those surfaces was restored as Japanese.  Placement is still constrained
+    # to a bounded multiple of the detected source glyph lane above.
+    white_paper_ratio = float(
+        np.mean((gray[sample] >= 242) & (hsv[:, :, 1][sample] <= 16))
     )
-    if bright_neutral_ratio >= 0.62:
+    if white_paper_ratio >= 0.72:
         return False
-    return median_sat >= 30 or mean_gray < 165
+    return True
 
 
 def _neutral_surface_stats(

@@ -179,7 +179,7 @@ class ComicTextDetector:
     def detect(
         self,
         image: NDArray,
-        text_threshold: float = 0.25,
+        text_threshold: float = 0.15,
         min_area: int = 30,
         padding: int = 5,
     ) -> tuple[list[TextRegion], NDArray]:
@@ -774,7 +774,7 @@ class ModalTextDetector(ComicTextDetector):
     def detect(
         self,
         image: NDArray,
-        text_threshold: float = 0.25,
+        text_threshold: float = 0.15,
         min_area: int = 30,
         padding: int = 5,
     ) -> tuple[list[TextRegion], NDArray]:
