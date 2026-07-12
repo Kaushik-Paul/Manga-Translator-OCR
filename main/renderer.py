@@ -313,28 +313,7 @@ def inpaint_text_region(
     result = image.copy()
     region = result[y : y + h, x : x + w]
 
-    if region_mask is not None and region_mask.shape[:2] == (h, w):
-        # Use the ML-provided mask directly — much more accurate
-        mask = region_mask.copy()
-        # Ensure binary
-        if mask.max() > 1:
-            _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
-        else:
-            mask = (mask > 0).astype(np.uint8) * 255
-    else:
-        # Fallback: create mask from threshold
-        gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-        mean_brightness = np.mean(gray)
-        if mean_brightness > 127:
-            _, mask = cv2.threshold(
-                gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-            )
-        else:
-            _, mask = cv2.threshold(
-                gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-            )
-
-    mask = _complete_inpaint_mask(region, mask)
+    mask = build_inpaint_mask(region, region_mask)
 
     # Ensure mask is uint8
     mask = mask.astype(np.uint8)
@@ -355,6 +334,37 @@ def inpaint_text_region(
     result[y : y + h, x : x + w] = inpainted
 
     return result
+
+
+def build_inpaint_mask(
+    region_image: NDArray,
+    region_mask: NDArray | None,
+) -> NDArray:
+    """Return the exact mask used to erase a detected text region.
+
+    Keeping this operation reusable is important: if rendering is rejected, the
+    pipeline must restore every pixel that inpainting touched.  Restoring only
+    the raw detector mask leaves white/blurred halos around the source glyphs.
+    """
+    h, w = region_image.shape[:2]
+    if region_mask is not None and region_mask.shape[:2] == (h, w):
+        mask = region_mask.copy()
+        if mask.max() > 1:
+            _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+        else:
+            mask = (mask > 0).astype(np.uint8) * 255
+    else:
+        gray = cv2.cvtColor(region_image, cv2.COLOR_BGR2GRAY)
+        if float(np.mean(gray)) > 127:
+            _, mask = cv2.threshold(
+                gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+            )
+        else:
+            _, mask = cv2.threshold(
+                gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+
+    return _complete_inpaint_mask(region_image, mask).astype(np.uint8)
 
 
 def _complete_inpaint_mask(region: NDArray, mask: NDArray) -> NDArray:
@@ -603,14 +613,28 @@ def render_text_on_image(
             text_style = "sfx"
             non_bubble_dialogue = False
         else:
+            surface_anchor_mask = _crop_source_mask_to_box(
+                region_mask=search_region_mask,
+                region_x=search_x,
+                region_y=search_y,
+                box_x=box_x,
+                box_y=box_y,
+                box_w=box_w,
+                box_h=box_h,
+            )
             surface = _non_bubble_dialogue_surface(
                 region_image=result[box_y : box_y + box_h, box_x : box_x + box_w],
                 text=text,
                 box_w=box_w,
                 box_h=box_h,
+                anchor_mask=surface_anchor_mask,
             )
             if surface is None:
-                if not _is_neutral_mask_anchored_dialogue_box(
+                # A maskless neutral fallback cannot prove where a balloon
+                # ends; drawing into that rectangle is the main source of text
+                # spilling across balloon outlines. Direct-to-art narration is
+                # a separate, source-anchored case and remains supported.
+                if not _is_mask_anchored_art_dialogue_box(
                     region_image=result[box_y : box_y + box_h, box_x : box_x + box_w],
                     region_mask=search_region_mask,
                     search_x=search_x,
@@ -1085,57 +1109,12 @@ def render_text_on_image(
                 max_lines=_DIALOGUE_MAX_LINES,
             )
             if shortened_layout is None:
-                relaxed_layout = _fit_relaxed_spill_dialogue_to_bubble_mask(
-                    draw=draw,
-                    text=text,
-                    font_path=font_file,
-                    avail_w=avail_w,
-                    avail_h=avail_h,
-                    mask=box_clip_mask,
-                    text_padding=text_padding,
-                    min_size=_DIALOGUE_MIN_SIZE,
-                    max_size=getattr(font, "size", _DIALOGUE_MIN_SIZE),
-                    max_lines=_DIALOGUE_MAX_LINES,
-                )
-                if relaxed_layout is None:
-                    rect_layout = _fit_shortened_dialogue_to_box(
-                        draw=draw,
-                        text=text,
-                        font_path=font_file,
-                        avail_w=avail_w,
-                        avail_h=avail_h,
-                        min_size=_DIALOGUE_MIN_SIZE,
-                        max_size=getattr(font, "size", _DIALOGUE_MIN_SIZE),
-                        max_lines=_DIALOGUE_MAX_LINES,
-                    )
-                    if rect_layout is None:
-                        return _skip_render("dialogue does not fit bubble mask")
-                    font, lines, line_spacing, line_metrics, text = rect_layout
-                    stroke_width = _stroke_width_for_font(font)
-                    total_text_height = (
-                        sum(lh for _, lh, _, _ in line_metrics)
-                        + (len(lines) - 1) * line_spacing
-                    )
-                    start_y = box_y + text_padding + max(
-                        0, (avail_h - total_text_height) // 2
-                    )
-                    box_clip_mask = None
-                    logger.debug(
-                        "Dialogue constraints: falling back to rectangular bubble box, lines=%d",
-                        len(lines),
-                    )
-                else:
-                    (
-                        font,
-                        lines,
-                        line_spacing,
-                        line_metrics,
-                        local_start_y,
-                        text,
-                        box_clip_mask,
-                    ) = relaxed_layout
-                    stroke_width = _stroke_width_for_font(font)
-                    start_y = box_y + local_start_y
+                # Never trade balloon ownership for readability.  A dilated mask
+                # or rectangular fallback visibly spills into artwork and can
+                # overlap adjacent dialogue.  The caller restores the Japanese
+                # glyphs if even the shortened, minimum-readable layout cannot
+                # fit the actual balloon.
+                return _skip_render("dialogue does not fit bubble mask")
             else:
                 font, lines, line_spacing, line_metrics, local_start_y, text = shortened_layout
                 stroke_width = _stroke_width_for_font(font)
@@ -1190,16 +1169,6 @@ def render_text_on_image(
         alpha = np.array(text_layer.getchannel("A"), dtype=np.uint8)
         clip = np.zeros_like(alpha)
         clip_mask = (box_clip_mask > 0).astype(np.uint8) * 255
-        if min(box_w, box_h) >= 28:
-            clip_pad = int(np.clip(stroke_width + 2, 3, 9))
-            clip_mask = cv2.dilate(
-                clip_mask,
-                cv2.getStructuringElement(
-                    cv2.MORPH_ELLIPSE,
-                    (clip_pad * 2 + 1, clip_pad * 2 + 1),
-                ),
-                iterations=1,
-            )
         clip[box_y : box_y + box_h, box_x : box_x + box_w] = (
             clip_mask
         )
@@ -1299,14 +1268,22 @@ def _resolve_dialogue_box(
             translated_text=translated_text,
         )
         if expanded_fallback_box is not None:
-            return (*expanded_fallback_box, True, None)
+            # Geometry expansion alone does not prove that we found a speech
+            # balloon.  Keep this maskless result on the guarded non-bubble path
+            # so it must obtain a safe surface before any text is drawn.
+            return (*expanded_fallback_box, False, None)
         return (*fallback_box, False, None)
 
-    center_anchor = (w // 2, h // 2)
     mask_anchor = _mask_centroid(region_mask, w, h)
-    anchors: list[tuple[int, int]] = [center_anchor]
-    if mask_anchor is not None and mask_anchor != center_anchor:
+    center_anchor = (w // 2, h // 2)
+    # Expanded render contexts can contain more than one balloon.  The glyph
+    # centroid identifies the balloon that owns this translation; the context
+    # centre is only a fallback when the detector mask is unavailable.
+    anchors: list[tuple[int, int]] = []
+    if mask_anchor is not None:
         anchors.append(mask_anchor)
+    if center_anchor not in anchors:
+        anchors.append(center_anchor)
 
     bubble_mask = None
     for anchor in anchors:
@@ -1410,7 +1387,7 @@ def _resolve_dialogue_box(
             translated_text=translated_text,
         )
         if expanded_fallback_box is not None:
-            return (*expanded_fallback_box, True, None)
+            return (*expanded_fallback_box, False, None)
 
     return (x + x1, y + y1, fit_w, fit_h, True, bubble_render_mask)
 
@@ -2801,6 +2778,74 @@ def _is_neutral_mask_anchored_dialogue_box(
     )
 
 
+def _is_mask_anchored_art_dialogue_box(
+    *,
+    region_image: NDArray,
+    region_mask: NDArray | None,
+    search_x: int,
+    search_y: int,
+    box_x: int,
+    box_y: int,
+    box_w: int,
+    box_h: int,
+    text: str,
+) -> bool:
+    """Allow narration printed directly on art, anchored to its source glyphs.
+
+    This path deliberately rejects paper-like crops. A missed white/grey speech
+    balloon must produce an explicit surface mask; otherwise it is preserved.
+    That separation lets free-standing narration/SFX be translated without
+    reopening rectangular spill around speech balloons.
+    """
+    clean = " ".join(text.split())
+    if not clean or not re.search(r"[A-Za-z0-9]", clean):
+        return False
+    if region_image is None or region_image.size == 0 or region_mask is None:
+        return False
+    if box_w < 24 or box_h < 20 or box_w * box_h < 700:
+        return False
+
+    mask_h, mask_w = region_mask.shape[:2]
+    lx1 = int(box_x - search_x)
+    ly1 = int(box_y - search_y)
+    lx2 = lx1 + int(box_w)
+    ly2 = ly1 + int(box_h)
+    if lx1 < 0 or ly1 < 0 or lx2 > mask_w or ly2 > mask_h:
+        return False
+
+    local_mask = region_mask[ly1:ly2, lx1:lx2].astype(np.uint8)
+    binary = (local_mask > 0).astype(np.uint8) * 255
+    if cv2.countNonZero(binary) < max(24, int(box_w * box_h * 0.004)):
+        return False
+    bbox = _mask_bbox(binary)
+    if bbox is None:
+        return False
+    sx1, sy1, sx2, sy2 = bbox
+    source_w = max(1, sx2 - sx1)
+    source_h = max(1, sy2 - sy1)
+    # Stay close to the original lettering lane; broad panel detections are not
+    # safe direct-to-art placements.
+    if box_w > max(90, int(source_w * 2.25)):
+        return False
+    if box_h > max(80, int(source_h * 2.10)):
+        return False
+
+    gray = cv2.cvtColor(region_image, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(region_image, cv2.COLOR_BGR2HSV)
+    near_mask = _mask_neighborhood_sample(binary, box_w=box_w, box_h=box_h)
+    sample = near_mask > 0 if near_mask is not None else np.ones(gray.shape, dtype=bool)
+    if not np.any(sample):
+        return False
+    median_sat = float(np.median(hsv[:, :, 1][sample]))
+    mean_gray = float(np.mean(gray[sample]))
+    bright_neutral_ratio = float(
+        np.mean((gray[sample] >= 185) & (hsv[:, :, 1][sample] <= 28))
+    )
+    if bright_neutral_ratio >= 0.62:
+        return False
+    return median_sat >= 30 or mean_gray < 165
+
+
 def _neutral_surface_stats(
     region_image: NDArray,
     sample_mask: NDArray | None = None,
@@ -2857,6 +2902,7 @@ def _non_bubble_dialogue_surface(
     text: str,
     box_w: int,
     box_h: int,
+    anchor_mask: NDArray | None = None,
 ) -> tuple[int, int, int, int, NDArray] | None:
     """Find a bright local paper surface for fallback dialogue rendering."""
     if region_image is None or region_image.size == 0:
@@ -2877,6 +2923,7 @@ def _non_bubble_dialogue_surface(
         hsv=hsv,
         crop_area=crop_area,
         word_count=word_count,
+        anchor_mask=anchor_mask,
     )
     if high_confidence_surface is not None:
         return high_confidence_surface
@@ -2911,6 +2958,11 @@ def _non_bubble_dialogue_surface(
     best_area = 0
     best_bbox_area = 0
     best_fill_ratio = 0.0
+    anchor_sample, min_anchor_overlap = _prepare_surface_anchor_mask(
+        anchor_mask,
+        width=w,
+        height=h,
+    )
     for label in range(1, num_labels):
         x = int(stats[label, cv2.CC_STAT_LEFT])
         y = int(stats[label, cv2.CC_STAT_TOP])
@@ -2930,11 +2982,23 @@ def _non_bubble_dialogue_surface(
         edge_touches += int((y + ch) >= h - 1)
         edge_large = edge_touches >= 2 and bbox_area > int(crop_area * 0.45)
         comp_mask = labels == label
+        anchor_overlap = (
+            int(np.count_nonzero(comp_mask & anchor_sample))
+            if anchor_sample is not None
+            else 0
+        )
+        if anchor_sample is not None and anchor_overlap < min_anchor_overlap:
+            continue
         comp_mean_gray = float(np.mean(gray[comp_mask])) if np.any(comp_mask) else 0.0
         comp_cx = x + cw * 0.5
         comp_cy = y + ch * 0.5
         center_dist = abs(comp_cx - cx) + abs(comp_cy - cy)
-        score = area * 1.4 + bbox_area * 0.15 - center_dist * 3.0
+        score = (
+            area * 1.4
+            + bbox_area * 0.15
+            - center_dist * 3.0
+            + anchor_overlap * 25.0
+        )
         if edge_large:
             # Pale skin/walls often pass the low-saturation paper test. True
             # narration boxes are usually near-white, so only heavily penalize
@@ -2997,6 +3061,7 @@ def _bright_rect_dialogue_surface(
     hsv: NDArray,
     crop_area: int,
     word_count: int,
+    anchor_mask: NDArray | None = None,
 ) -> tuple[int, int, int, int, NDArray] | None:
     """Find a clean white narration/bubble surface before broader paper fill."""
     h, w = gray.shape[:2]
@@ -3018,6 +3083,11 @@ def _bright_rect_dialogue_surface(
     cy = h * 0.5
     best_label = -1
     best_score = -1e9
+    anchor_sample, min_anchor_overlap = _prepare_surface_anchor_mask(
+        anchor_mask,
+        width=w,
+        height=h,
+    )
     for label in range(1, num_labels):
         x = int(stats[label, cv2.CC_STAT_LEFT])
         y = int(stats[label, cv2.CC_STAT_TOP])
@@ -3031,6 +3101,13 @@ def _bright_rect_dialogue_surface(
             continue
         fill_ratio = area / float(bbox_area)
         comp_mask = labels == label
+        anchor_overlap = (
+            int(np.count_nonzero(comp_mask & anchor_sample))
+            if anchor_sample is not None
+            else 0
+        )
+        if anchor_sample is not None and anchor_overlap < min_anchor_overlap:
+            continue
         comp_mean_gray = float(np.mean(gray[comp_mask])) if np.any(comp_mask) else 0.0
         if comp_mean_gray < 238:
             continue
@@ -3059,7 +3136,12 @@ def _bright_rect_dialogue_surface(
         if is_clean_rect and edge_touches >= 2 and bbox_area > int(crop_area * 0.62):
             continue
         center_dist = abs((x + cw * 0.5) - cx) + abs((y + ch * 0.5) - cy)
-        score = area * 1.4 + fill_ratio * 2000.0 - center_dist * 5.0
+        score = (
+            area * 1.4
+            + fill_ratio * 2000.0
+            - center_dist * 5.0
+            + anchor_overlap * 25.0
+        )
         if score > best_score:
             best_score = score
             best_label = label
@@ -3077,6 +3159,58 @@ def _bright_rect_dialogue_surface(
     if bw < 18 or bh < 18:
         return None
     return x1, y1, bw, bh, component[y1:y2, x1:x2].copy()
+
+
+def _crop_source_mask_to_box(
+    *,
+    region_mask: NDArray | None,
+    region_x: int,
+    region_y: int,
+    box_x: int,
+    box_y: int,
+    box_w: int,
+    box_h: int,
+) -> NDArray | None:
+    """Crop a region-local OCR mask into a page-space render box."""
+    if region_mask is None:
+        return None
+    local_x = int(box_x - region_x)
+    local_y = int(box_y - region_y)
+    if local_x < 0 or local_y < 0:
+        return None
+    if local_x + box_w > region_mask.shape[1]:
+        return None
+    if local_y + box_h > region_mask.shape[0]:
+        return None
+    cropped = region_mask[local_y : local_y + box_h, local_x : local_x + box_w]
+    if cropped.shape[:2] != (box_h, box_w):
+        return None
+    return cropped.astype(np.uint8).copy()
+
+
+def _prepare_surface_anchor_mask(
+    anchor_mask: NDArray | None,
+    *,
+    width: int,
+    height: int,
+) -> tuple[NDArray | None, int]:
+    """Prepare a tolerant OCR-mask neighborhood for surface ownership."""
+    if anchor_mask is None or anchor_mask.shape[:2] != (height, width):
+        return None, 0
+    binary = (anchor_mask > 0).astype(np.uint8) * 255
+    count = cv2.countNonZero(binary)
+    if count < 20:
+        return None, 0
+    radius = int(np.clip(min(width, height) * 0.035, 3, 9))
+    sample = cv2.dilate(
+        binary,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (radius * 2 + 1, radius * 2 + 1),
+        ),
+        iterations=1,
+    ) > 0
+    return sample, max(8, int(count * 0.04))
 
 
 def _is_low_signal_dialogue_fragment(text: str) -> bool:
@@ -3536,101 +3670,6 @@ def _fit_shortened_dialogue_to_box(
             avail_h=avail_h,
         ):
             return font, lines, line_spacing, metrics, candidate
-
-    return None
-
-
-def _fit_relaxed_spill_dialogue_to_bubble_mask(
-    *,
-    draw: ImageDraw.ImageDraw,
-    text: str,
-    font_path: str | None,
-    avail_w: int,
-    avail_h: int,
-    mask: NDArray,
-    text_padding: int,
-    min_size: int,
-    max_size: int,
-    max_lines: int,
-) -> tuple[
-    ImageFont.FreeTypeFont | ImageFont.ImageFont,
-    list[str],
-    int,
-    list[tuple[int, int, int, int]],
-    int,
-    str,
-    NDArray,
-] | None:
-    """Last-resort readable dialogue fit with a tiny controlled mask overflow."""
-    clean = " ".join(text.replace("\r", " ").replace("\n", " ").split())
-    if not clean or mask.size == 0:
-        return None
-
-    # Keep this as an emergency path for awkward speech balloons. Normal
-    # medium/large rectangular bubbles should keep the strict no-spill behavior.
-    min_dim = min(avail_w, avail_h)
-    max_dim = max(avail_w, avail_h)
-    aspect = max_dim / float(max(1, min_dim))
-    area = avail_w * avail_h
-    if min_dim > 120 and aspect < 1.45 and area > 22000:
-        return None
-
-    spill_px = int(np.clip(round(min_dim * 0.10), 3, 10))
-    if aspect >= 2.0:
-        spill_px = min(12, spill_px + 2)
-    kernel_size = spill_px * 2 + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    relaxed_mask = cv2.dilate((mask > 0).astype(np.uint8) * 255, kernel, iterations=1)
-
-    words = clean.split()
-    candidates: list[str] = []
-    seen: set[str] = set()
-
-    def add_candidate(candidate: str) -> None:
-        candidate = " ".join(candidate.split()).strip()
-        if candidate and candidate not in seen:
-            candidates.append(candidate)
-            seen.add(candidate)
-
-    add_candidate(clean)
-    for max_words in range(min(len(words) - 1, 12), 0, -1):
-        add_candidate(_compress_dialogue_for_tiny_box(clean, max_words=max_words))
-    for max_words in range(min(len(words) - 1, 10), 0, -1):
-        add_candidate(_truncate_dialogue_at_word_boundary(clean, max_words=max_words))
-    for candidate in _narrow_dialogue_rescue_candidates(clean):
-        add_candidate(candidate)
-
-    relaxed_max_lines = max_lines + (1 if avail_h >= 80 else 0)
-    for candidate in candidates:
-        layout = _fit_dialogue_to_bubble_mask(
-            draw=draw,
-            text=candidate,
-            font_path=font_path,
-            avail_w=avail_w,
-            avail_h=avail_h,
-            mask=relaxed_mask,
-            text_padding=text_padding,
-            min_size=min_size,
-            max_size=max(min_size, max_size),
-            max_lines=relaxed_max_lines,
-        )
-        if layout is None:
-            continue
-        font, lines, line_spacing, metrics, local_start_y = layout
-        logger.debug(
-            "Dialogue constraints: using controlled spill fallback, spill=%dpx, lines=%d",
-            spill_px,
-            len(lines),
-        )
-        return (
-            font,
-            lines,
-            line_spacing,
-            metrics,
-            local_start_y,
-            candidate,
-            relaxed_mask,
-        )
 
     return None
 

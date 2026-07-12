@@ -20,7 +20,12 @@ from PIL import Image as PILImage
 from .config import Settings, settings
 from .detector import TextRegion, detect_text_regions
 from .ocr import get_ocr_engine
-from .renderer import detect_text_color, inpaint_text_region, render_text_on_image
+from .renderer import (
+    build_inpaint_mask,
+    detect_text_color,
+    inpaint_text_region,
+    render_text_on_image,
+)
 from .translator import TranslationConstraint, translate_texts
 
 import uuid
@@ -206,12 +211,6 @@ def translate_page(
         for unit, can_render in zip(units, renderable_unit_mask)
         if can_render
     }
-    inpaintable_region_indices = {
-        unit.parent_region_index
-        for unit, should_inpaint in zip(units, inpaintable_unit_mask)
-        if should_inpaint
-    }
-
     for i, (src, tgt) in enumerate(zip(source_texts, translated_texts)):
         logger.debug("  [%d] %s → %s", i + 1, src[:40], tgt[:60])
     skipped_units = len(renderable_unit_mask) - sum(renderable_unit_mask)
@@ -247,69 +246,35 @@ def translate_page(
     logger.debug("Step 5/5: Inpainting and rendering translated text...")
     result = image.copy()
 
-    # Count how many renderable units each parent region has.
-    # If a parent has multiple renderable children (split-region case),
-    # we must NOT expand each sub-region to the full parent bubble —
-    # otherwise all sub-translations overlap in the same bubble.
-    parent_renderable_counts: dict[int, int] = {}
-    parent_unit_counts: dict[int, int] = {}
-    for unit, can_render in zip(units, renderable_unit_mask):
-        parent_unit_counts[unit.parent_region_index] = (
-            parent_unit_counts.get(unit.parent_region_index, 0) + 1
-        )
-        if can_render:
-            parent_renderable_counts[unit.parent_region_index] = (
-                parent_renderable_counts.get(unit.parent_region_index, 0) + 1
-            )
-
-    # First pass: inpaint only text units with renderable replacements. For split
-    # parents, erase only selected child masks so one accepted dialogue line
-    # cannot wipe nearby skipped SFX or dialogue.
-    for region_idx in sorted(inpaintable_region_indices):
-        region = regions[region_idx]
-        if parent_unit_counts.get(region_idx, 0) > 1:
-            for unit, should_inpaint in zip(units, inpaintable_unit_mask):
-                if unit.parent_region_index != region_idx:
-                    continue
-                if not should_inpaint:
-                    continue
-                if unit.region.mask is None:
-                    continue
-                if unit.region.mask.shape[:2] != (unit.region.h, unit.region.w):
-                    continue
-                result = inpaint_text_region(
-                    result,
-                    unit.region.x,
-                    unit.region.y,
-                    unit.region.w,
-                    unit.region.h,
-                    unit.region.mask,
-                )
+    # Erase only OCR units that have renderable replacements. A detector parent
+    # may contain Japanese glyphs for which OCR produced no unit; erasing its
+    # entire mask would create blank balloons with no possible replacement.
+    for unit, should_inpaint in zip(units, inpaintable_unit_mask):
+        if not should_inpaint:
             continue
-
+        region = unit.region
         result = inpaint_text_region(
-            result, region.x, region.y, region.w, region.h, region.mask
+            result,
+            region.x,
+            region.y,
+            region.w,
+            region.h,
+            region.mask,
         )
 
     # Second pass: render translated text onto the cleaned image
+    rendered_pixel_mask = np.zeros(result.shape[:2], dtype=np.uint8)
     for unit, translated, can_render in zip(units, translated_texts, renderable_unit_mask):
         if can_render:
             # If multiple renderable units share a parent, keep each in its own
             # local render context to avoid overlapping translations in adjacent
             # bubbles/SFX while still giving the renderer enough surrounding
             # pixels to find the bubble outline.
-            if parent_renderable_counts.get(unit.parent_region_index, 0) > 1:
-                region = unit.context_region or unit.region
-                render_mask = _project_region_mask_into_context(
-                    unit_region=unit.region,
-                    context_region=region,
-                )
-            else:
-                region = unit.context_region or unit.region
-                render_mask = _project_region_mask_into_context(
-                    unit_region=unit.region,
-                    context_region=region,
-                )
+            region = unit.context_region or unit.region
+            render_mask = _project_region_mask_into_context(
+                unit_region=unit.region,
+                context_region=region,
+            )
             rendered_result, did_render = render_text_on_image(
                 result,
                 translated,
@@ -324,12 +289,15 @@ def translate_page(
                 return_status=True,
             )
             if did_render:
+                changed = np.any(rendered_result != result, axis=2)
+                rendered_pixel_mask[changed] = 255
                 result = rendered_result
             else:
                 result = _restore_unit_source_text(
                     result=result,
                     original=image,
                     unit=unit,
+                    protected_mask=rendered_pixel_mask,
                 )
 
     # 6. Save output
@@ -515,8 +483,9 @@ def _restore_unit_source_text(
     result: np.ndarray,
     original: np.ndarray,
     unit: RenderTextUnit,
+    protected_mask: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Restore original glyph pixels if rendering a translated unit failed."""
+    """Restore exactly the pixels erased for a unit whose rendering failed."""
     region = unit.region
     img_h, img_w = result.shape[:2]
     x1 = max(0, int(region.x))
@@ -538,21 +507,16 @@ def _restore_unit_source_text(
     local_y1 = y1 - region.y
     local_x2 = local_x1 + (x2 - x1)
     local_y2 = local_y1 + (y2 - y1)
-    local_mask = mask[local_y1:local_y2, local_x1:local_x2].astype(np.uint8)
-    if local_mask.max() > 1:
-        _, local_mask = cv2.threshold(local_mask, 127, 255, cv2.THRESH_BINARY)
-    else:
-        local_mask = (local_mask > 0).astype(np.uint8) * 255
+    full_mask = build_inpaint_mask(region.cropped, mask)
+    local_mask = full_mask[local_y1:local_y2, local_x1:local_x2]
     if cv2.countNonZero(local_mask) == 0:
         dst[:, :] = src
         return restored
-
-    local_mask = cv2.dilate(
-        local_mask,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
-        iterations=1,
-    )
-    dst[local_mask > 0] = src[local_mask > 0]
+    restore_pixels = local_mask > 0
+    if protected_mask is not None and protected_mask.shape[:2] == result.shape[:2]:
+        protected = protected_mask[y1:y2, x1:x2] > 0
+        restore_pixels &= ~protected
+    dst[restore_pixels] = src[restore_pixels]
     return restored
 
 
@@ -2065,14 +2029,13 @@ def _is_compact_sfx_render(text: str) -> bool:
         return False
 
     letters = "".join(tokens)
-    if len(tokens) > 2 or not (2 <= len(letters) <= 14):
+    if len(tokens) > 3 or not (2 <= len(letters) <= 18):
         return False
 
-    has_separator = any(not ch.isalnum() and not ch.isspace() for ch in clean)
     has_repeated_letter = re.search(r"([A-Za-z])\1", letters) is not None
     if len(tokens) > 1:
-        return has_separator
-    return has_repeated_letter or len(letters) <= 3
+        return True
+    return has_repeated_letter or len(letters) <= 5
 
 
 def _is_short_nonbubble_dialogue_noise(unit: RenderTextUnit, translated: str) -> bool:
@@ -2111,8 +2074,9 @@ def _is_short_nonbubble_dialogue_noise(unit: RenderTextUnit, translated: str) ->
     if (
         kanji_count == 0
         and not source_has_sentence_punct
-        and word_count <= 8
-        and translated_len <= 60
+        and script_total <= 4
+        and word_count <= 3
+        and translated_len <= 20
     ):
         return True
 
@@ -2528,7 +2492,20 @@ def _cluster_same_surface_row_regions(
             median_h = float(np.median(heights))
             center_ys = [r.y + r.h * 0.5 for r in current_regions] + [region.y + region.h * 0.5]
             y_spread = max(center_ys) - min(center_ys)
-            max_gap = max(95, min(280, int(median_h * 2.25)))
+            # Tall detections are normally complete vertical Japanese columns,
+            # not fragments of one horizontal phrase.  A large height-based gap
+            # chained unrelated columns across panels (and sometimes across the
+            # whole page) into one OCR/translation unit.  Only join tall columns
+            # when they are close enough to plausibly share one balloon.
+            tall_pair = (
+                prev.h > prev.w * 1.35
+                or region.h > region.w * 1.35
+            )
+            if tall_pair:
+                median_w = float(np.median([r.w for r in current_regions] + [region.w]))
+                max_gap = max(18, min(70, int(median_w * 0.65)))
+            else:
+                max_gap = max(60, min(180, int(median_h * 1.35)))
             max_y_spread = max(45, min(140, int(median_h * 0.85)))
             if x_gap <= max_gap and y_spread <= max_y_spread:
                 current.append(idx)
