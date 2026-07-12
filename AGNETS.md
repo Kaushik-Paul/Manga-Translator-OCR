@@ -88,6 +88,10 @@ Use factory functions to get the right backend based on config:
 - Image arrays are BGR (OpenCV convention) internally; convert to RGB only for PIL operations
 - All font paths resolved at module load time via `_find_font()` — never hardcode absolute paths
 
+## Testing Policy
+- Do not add new tests while implementing fixes, features, refactors, or any other work in this repository.
+- Do not create test files or add test cases to existing files unless the user explicitly asks for tests in the current task.
+
 # Tech Stack
 
 ## Language & Runtime

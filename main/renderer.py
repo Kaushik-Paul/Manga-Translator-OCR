@@ -630,6 +630,19 @@ def render_text_on_image(
                 anchor_mask=surface_anchor_mask,
             )
             if surface is None:
+                # The stricter paper-surface finder intentionally rejects many
+                # edge-touching components.  A detector-anchored fallback can
+                # still safely recover those missed balloons as long as it
+                # supplies an explicit connected-component clip mask.
+                surface = _mask_anchored_neutral_dialogue_surface(
+                    region_image=result[
+                        box_y : box_y + box_h,
+                        box_x : box_x + box_w,
+                    ],
+                    anchor_mask=surface_anchor_mask,
+                    text=text,
+                )
+            if surface is None:
                 # A maskless neutral fallback cannot prove where a balloon
                 # ends; drawing into that rectangle is the main source of text
                 # spilling across balloon outlines. Direct-to-art narration is
@@ -3058,6 +3071,110 @@ def _non_bubble_dialogue_surface(
     if cv2.countNonZero(local_mask) < max(120, int(bw * bh * 0.25)):
         return None
 
+    return x1, y1, bw, bh, local_mask
+
+
+def _mask_anchored_neutral_dialogue_surface(
+    *,
+    region_image: NDArray,
+    anchor_mask: NDArray | None,
+    text: str,
+) -> tuple[int, int, int, int, NDArray] | None:
+    """Recover a missed white/grey balloon with an explicit safe clip mask."""
+    if region_image is None or region_image.size == 0 or anchor_mask is None:
+        return None
+
+    h, w = region_image.shape[:2]
+    if h < 28 or w < 28 or anchor_mask.shape[:2] != (h, w):
+        return None
+    if not _is_neutral_mask_anchored_dialogue_box(
+        region_image=region_image,
+        region_mask=anchor_mask,
+        search_x=0,
+        search_y=0,
+        box_x=0,
+        box_y=0,
+        box_w=w,
+        box_h=h,
+        text=text,
+    ):
+        return None
+
+    binary_anchor = (anchor_mask > 0).astype(np.uint8) * 255
+    anchor_sample, min_anchor_overlap = _prepare_surface_anchor_mask(
+        binary_anchor,
+        width=w,
+        height=h,
+    )
+    if anchor_sample is None:
+        return None
+
+    gray = cv2.cvtColor(region_image, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(region_image, cv2.COLOR_BGR2HSV)
+    # Use paper-like pixels, not the broader "neutral" definition used for
+    # validation. Pale skin and beige art can be low-saturation too; admitting
+    # them here lets a broken balloon outline merge the clip mask into artwork.
+    neutral = ((hsv[:, :, 1] <= 52) & (gray >= 190)).astype(np.uint8) * 255
+    neutral = cv2.morphologyEx(
+        neutral,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+    neutral = cv2.morphologyEx(
+        neutral,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        neutral,
+        connectivity=8,
+    )
+    best_label = -1
+    best_score = -1
+    crop_area = max(1, w * h)
+    for label in range(1, num_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        cw = int(stats[label, cv2.CC_STAT_WIDTH])
+        ch = int(stats[label, cv2.CC_STAT_HEIGHT])
+        if area < max(240, int(crop_area * 0.045)) or cw < 24 or ch < 24:
+            continue
+        component = labels == label
+        overlap = int(np.count_nonzero(component & anchor_sample))
+        if overlap < min_anchor_overlap:
+            continue
+        # Prefer the surface that owns the source glyphs, then the larger usable
+        # area.  Other pale objects in the render context cannot win without
+        # overlapping the detector anchor.
+        score = overlap * 100 + area
+        if score > best_score:
+            best_score = score
+            best_label = label
+
+    if best_label < 0:
+        return None
+
+    component = (labels == best_label).astype(np.uint8) * 255
+    # Pull lettering a few pixels away from the balloon outline.  Rendering is
+    # clipped to this eroded component even when its bounding box is rectangular.
+    component = cv2.erode(
+        component,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+    bbox = _mask_bbox(component)
+    if bbox is None:
+        return None
+    x1, y1, x2, y2 = bbox
+    bw = x2 - x1
+    bh = y2 - y1
+    if bw < 24 or bh < 24:
+        return None
+    local_mask = component[y1:y2, x1:x2].copy()
+    if cv2.countNonZero(local_mask) < max(180, int(bw * bh * 0.22)):
+        return None
     return x1, y1, bw, bh, local_mask
 
 

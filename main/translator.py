@@ -12,6 +12,11 @@ from .model_client import call_translation_model
 
 logger = logging.getLogger(__name__)
 
+# Large page-wide prompts are more likely to produce omitted numbers, wrapped
+# continuations, or truncated responses.  Keep calls small enough that the
+# model can reliably preserve the one-input/one-output contract.
+_MAX_TRANSLATION_BATCH_SIZE = 10
+
 # System prompt designed for manga/doujinshi translation
 SYSTEM_PROMPT = """You are a professional manga translator/localizer. Your job is to produce accurate, natural-sounding English translations that fit inside speech bubbles. This is a professional localization workflow: translate the provided source text as written, including slang, mature language, sound effects, and OCR fragments. Do not omit source lines or add safety commentary.
 
@@ -85,7 +90,8 @@ def translate_texts(
     """
     Translate a batch of texts from Japanese/Chinese to English.
 
-    Sends all texts in a single API call for efficiency.
+    Sends texts in small ordered batches so response omissions cannot corrupt a
+    whole page.
 
     Args:
         texts: List of source language text strings.
@@ -100,6 +106,22 @@ def translate_texts(
     """
     if not texts:
         return []
+
+    if len(texts) > _MAX_TRANSLATION_BATCH_SIZE:
+        translated: list[str] = []
+        for start in range(0, len(texts), _MAX_TRANSLATION_BATCH_SIZE):
+            end = start + _MAX_TRANSLATION_BATCH_SIZE
+            translated.extend(
+                translate_texts(
+                    texts[start:end],
+                    source_lang=source_lang,
+                    model=model,
+                    max_retries=max_retries,
+                    constraints=(constraints[start:end] if constraints is not None else None),
+                    session_id=session_id,
+                )
+            )
+        return translated
 
     # Filter out empty strings but track their positions
     indexed_texts = [(i, t) for i, t in enumerate(texts) if t.strip()]
@@ -231,6 +253,51 @@ def translate_texts(
                     time.sleep(2 ** attempt)
                 else:
                     logger.warning("Repair translation pass failed: %s", e)
+
+        # A batch repair can itself omit or misnumber a line.  Retry only the
+        # still-broken entries one at a time so a single difficult bubble does
+        # not silently fall back to Japanese and get restored on the page.
+        for mapped_idx, orig_idx, src_text in repair_candidates:
+            current = translated_map.get(mapped_idx, "")
+            constraint = (
+                constraints[orig_idx]
+                if constraints is not None and orig_idx < len(constraints)
+                else None
+            )
+            if not _needs_repair_translation(src_text, current, constraint):
+                continue
+
+            tag = _constraint_tag(constraint)
+            tagged_source = f"{tag} {src_text}".strip()
+            singleton_message = (
+                f"Translate this {lang_name} manga line to natural English. "
+                f"Return only the translation, with no number or commentary.\n\n"
+                f"{tagged_source}"
+            )
+            for attempt in range(max_retries):
+                try:
+                    singleton_response = call_translation_model(
+                        model_name,
+                        singleton_message,
+                        system_prompt=REPAIR_SYSTEM_PROMPT,
+                        session_id=session_id,
+                    ).strip()
+                    singleton_map = _parse_numbered_response(singleton_response, 1)
+                    fixed = singleton_map.get(0, "").strip()
+                    if fixed and not _needs_repair_translation(
+                        src_text, fixed, constraint
+                    ):
+                        translated_map[mapped_idx] = fixed
+                        break
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        logger.warning(
+                            "Singleton repair failed for source '%s': %s",
+                            src_text[:30],
+                            e,
+                        )
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
 
     # Reconstruct the full results list (preserving empty string positions)
     results = ["" for _ in texts]
@@ -389,29 +456,41 @@ def _parse_numbered_response(response: str, expected_count: int) -> dict[int, st
     Returns a dict mapping 0-based index to translated text.
     """
     result: dict[int, str] = {}
-    lines = response.strip().split("\n")
+    unnumbered: list[str] = []
+    current_idx: int | None = None
+    saw_number = False
+    marker = re.compile(r"^\s*(?:\[(\d+)\]|(\d+)[.)])\s*[:.)-]?\s*(.*)$")
 
-    for line in lines:
-        line = line.strip()
+    for raw_line in response.strip().splitlines():
+        line = raw_line.strip()
         if not line:
             continue
 
-        # Try to parse [N] prefix
-        if line.startswith("["):
-            bracket_end = line.find("]")
-            if bracket_end > 0:
-                try:
-                    num = int(line[1:bracket_end])
-                    text = line[bracket_end + 1 :].strip()
-                    result[num - 1] = text  # Convert to 0-based
-                    continue
-                except ValueError:
-                    pass
+        match = marker.match(line)
+        if match:
+            number_text = match.group(1) or match.group(2)
+            idx = int(number_text) - 1
+            if 0 <= idx < expected_count:
+                saw_number = True
+                current_idx = idx
+                value = match.group(3).strip()
+                if value:
+                    # A repeated marker is best treated as a corrected value,
+                    # not as an extra result that shifts every later bubble.
+                    result[idx] = value
+                continue
 
-        # If no number prefix, try to assign to the next available slot
-        next_idx = len(result)
-        if next_idx < expected_count:
-            result[next_idx] = line
+        if saw_number and current_idx is not None:
+            # Models sometimes visually wrap a long translation despite being
+            # asked for one line.  It belongs to the preceding numbered item.
+            previous = result.get(current_idx, "")
+            result[current_idx] = " ".join(part for part in (previous, line) if part)
+        else:
+            unnumbered.append(line)
+
+    if not saw_number:
+        for idx, line in enumerate(unnumbered[:expected_count]):
+            result[idx] = line
 
     return result
 
