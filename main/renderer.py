@@ -630,6 +630,19 @@ def render_text_on_image(
                 anchor_mask=surface_anchor_mask,
             )
             if surface is None:
+                # The stricter paper-surface finder intentionally rejects many
+                # edge-touching components.  A detector-anchored fallback can
+                # still safely recover those missed balloons as long as it
+                # supplies an explicit connected-component clip mask.
+                surface = _mask_anchored_neutral_dialogue_surface(
+                    region_image=result[
+                        box_y : box_y + box_h,
+                        box_x : box_x + box_w,
+                    ],
+                    anchor_mask=surface_anchor_mask,
+                    text=text,
+                )
+            if surface is None:
                 # A maskless neutral fallback cannot prove where a balloon
                 # ends; drawing into that rectangle is the main source of text
                 # spilling across balloon outlines. Direct-to-art narration is
@@ -1133,28 +1146,80 @@ def render_text_on_image(
         fill_color = render_color
         stroke_color = outline_color
 
-    current_y = start_y
-    for i, line in enumerate(lines):
-        lw, lh, left, top = line_metrics[i]
-        line_x = x_anchor + max(0, (avail_w - lw) // 2)
-        if box_clip_mask is not None:
-            local_y = current_y - box_y
-            target_rel_x = line_x - box_x
-            masked_rel_x = _fit_line_x_to_mask(
+    # Compute final per-line draw positions first.  When a bubble clip mask is
+    # active, verify the complete layout pixel-accurately against the mask:
+    # text that would be cut by the mask edge ("hidden inside the bubble") is
+    # refitted smaller/narrower while staying readable, and only skipped when
+    # no readable layout fits.
+    line_positions: list[tuple[int, int]] = []
+    if clip_dialogue_to_mask:
+        line_positions = _place_dialogue_lines_in_mask(
+            lines=lines,
+            line_metrics=line_metrics,
+            line_spacing=line_spacing,
+            start_y=start_y,
+            box_x=box_x,
+            box_y=box_y,
+            x_anchor=x_anchor,
+            avail_w=avail_w,
+            mask=box_clip_mask,
+        ) or []
+        outside_fraction = (
+            _dialogue_text_outside_mask_fraction(
+                positions=line_positions,
+                lines=lines,
+                font=font,
+                stroke_width=stroke_width,
                 mask=box_clip_mask,
-                y=local_y,
-                line_h=lh,
-                line_w=lw,
-                default_x=target_rel_x,
+                box_x=box_x,
+                box_y=box_y,
+                box_w=box_w,
+                box_h=box_h,
             )
-            if masked_rel_x is not None:
-                line_x = box_x + masked_rel_x
-            elif text_style == "dialogue":
-                return _skip_render("dialogue line cannot be placed in mask")
+            if line_positions
+            else 1.0
+        )
+        if outside_fraction > 0.02:
+            refit = _refit_dialogue_inside_mask(
+                draw=draw,
+                text=text,
+                font_path=font_file,
+                avail_w=avail_w,
+                avail_h=avail_h,
+                mask=box_clip_mask,
+                text_padding=text_padding,
+                min_size=_DIALOGUE_MIN_SIZE,
+                start_size=getattr(font, "size", _DIALOGUE_MIN_SIZE),
+                max_lines=_DIALOGUE_MAX_LINES,
+                box_x=box_x,
+                box_y=box_y,
+                x_anchor=x_anchor,
+            )
+            if refit is None:
+                return _skip_render("dialogue clipped by bubble mask")
+            font, lines, line_spacing, line_metrics, start_y, line_positions = refit
+            stroke_width = _stroke_width_for_font(font)
+    else:
+        current_y = start_y
+        for lw, lh, left, top in line_metrics:
+            line_x = x_anchor + max(0, (avail_w - lw) // 2)
+            if box_clip_mask is not None:
+                masked_rel_x = _fit_line_x_to_mask(
+                    mask=box_clip_mask,
+                    y=current_y - box_y,
+                    line_h=lh,
+                    line_w=lw,
+                    default_x=line_x - box_x,
+                )
+                if masked_rel_x is not None:
+                    line_x = box_x + masked_rel_x
+            line_positions.append((int(line_x - left), int(current_y - top)))
+            current_y += lh + line_spacing
 
+    for (draw_x, draw_y), line in zip(line_positions, lines):
         # Draw outline for readability (stroke)
         target_draw.text(
-            (int(line_x - left), int(current_y - top)),
+            (draw_x, draw_y),
             line,
             font=font,
             anchor="lt",
@@ -1162,8 +1227,6 @@ def render_text_on_image(
             stroke_width=stroke_width,
             stroke_fill=stroke_color,
         )
-
-        current_y += lh + line_spacing
 
     if clip_dialogue_to_mask and text_layer is not None:
         alpha = np.array(text_layer.getchannel("A"), dtype=np.uint8)
@@ -1179,6 +1242,163 @@ def render_text_on_image(
     # Convert back to BGR
     rendered = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
     return _return(rendered, True)
+
+
+def _place_dialogue_lines_in_mask(
+    *,
+    lines: list[str],
+    line_metrics: list[tuple[int, int, int, int]],
+    line_spacing: int,
+    start_y: int,
+    box_x: int,
+    box_y: int,
+    x_anchor: int,
+    avail_w: int,
+    mask: NDArray,
+) -> list[tuple[int, int]] | None:
+    """Compute final draw positions for every line inside the bubble mask."""
+    positions: list[tuple[int, int]] = []
+    current_y = start_y
+    for lw, lh, left, top in line_metrics:
+        line_x = x_anchor + max(0, (avail_w - lw) // 2)
+        masked_rel_x = _fit_line_x_to_mask(
+            mask=mask,
+            y=current_y - box_y,
+            line_h=lh,
+            line_w=lw,
+            default_x=line_x - box_x,
+        )
+        if masked_rel_x is None:
+            return None
+        line_x = box_x + masked_rel_x
+        positions.append((int(line_x - left), int(current_y - top)))
+        current_y += lh + line_spacing
+    return positions
+
+
+def _dialogue_text_outside_mask_fraction(
+    *,
+    positions: list[tuple[int, int]],
+    lines: list[str],
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    stroke_width: int,
+    mask: NDArray,
+    box_x: int,
+    box_y: int,
+    box_w: int,
+    box_h: int,
+) -> float:
+    """Dry-run the layout and measure what fraction of text pixels leave the mask."""
+    if mask.shape[:2] != (box_h, box_w):
+        return 1.0
+    layer = Image.new("L", (box_w, box_h), 0)
+    layer_draw = ImageDraw.Draw(layer)
+    for (draw_x, draw_y), line in zip(positions, lines):
+        layer_draw.text(
+            (draw_x - box_x, draw_y - box_y),
+            line,
+            font=font,
+            anchor="lt",
+            fill=255,
+            stroke_width=stroke_width,
+        )
+    alpha = np.array(layer)
+    total = int(np.count_nonzero(alpha))
+    if total == 0:
+        return 1.0
+    outside = int(np.count_nonzero(alpha[mask == 0]))
+    return outside / float(total)
+
+
+def _refit_dialogue_inside_mask(
+    *,
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font_path: str | None,
+    avail_w: int,
+    avail_h: int,
+    mask: NDArray,
+    text_padding: int,
+    min_size: int,
+    start_size: int,
+    max_lines: int,
+    box_x: int,
+    box_y: int,
+    x_anchor: int,
+) -> tuple[
+    ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    list[str],
+    int,
+    list[tuple[int, int, int, int]],
+    int,
+    list[tuple[int, int]],
+] | None:
+    """Find a readable layout whose rendered pixels stay inside the bubble mask.
+
+    Tries progressively smaller font sizes (never below ``min_size``) and
+    modestly narrower wrap widths.  Words are never broken or hyphenated; the
+    text itself is left unchanged.
+    """
+    for width_ratio in (1.0, 0.92, 0.85):
+        wrap_w = max(10, int(avail_w * width_ratio))
+        for size in range(int(start_size), min_size - 1, -1):
+            font, lines, line_spacing = _fit_text_to_box(
+                draw=draw,
+                text=text,
+                max_w=wrap_w,
+                max_h=avail_h,
+                font_path=font_path,
+                style="dialogue",
+                min_size=size,
+                max_size=size,
+            )
+            if not lines or len(lines) > max_lines:
+                continue
+            if getattr(font, "size", 0) < size:
+                continue
+            stroke_width = _stroke_width_for_font(font)
+            metrics = _line_metrics(
+                draw=draw,
+                lines=lines,
+                font=font,
+                stroke_width=stroke_width,
+            )
+            total_h = sum(lh for _, lh, _, _ in metrics) + (
+                len(metrics) - 1
+            ) * line_spacing
+            if total_h > avail_h:
+                continue
+            slack = max(0, int(avail_h - total_h))
+            centered = int(text_padding + slack // 2)
+            for local_start_y in _candidate_mask_start_ys(centered, text_padding, slack):
+                start_y = box_y + local_start_y
+                positions = _place_dialogue_lines_in_mask(
+                    lines=lines,
+                    line_metrics=metrics,
+                    line_spacing=line_spacing,
+                    start_y=start_y,
+                    box_x=box_x,
+                    box_y=box_y,
+                    x_anchor=x_anchor,
+                    avail_w=avail_w,
+                    mask=mask,
+                )
+                if positions is None:
+                    continue
+                outside = _dialogue_text_outside_mask_fraction(
+                    positions=positions,
+                    lines=lines,
+                    font=font,
+                    stroke_width=stroke_width,
+                    mask=mask,
+                    box_x=box_x,
+                    box_y=box_y,
+                    box_w=mask.shape[1],
+                    box_h=mask.shape[0],
+                )
+                if outside <= 0.02:
+                    return font, lines, line_spacing, metrics, start_y, positions
+    return None
 
 
 def _infer_text_style(text: str, w: int, h: int) -> str:
@@ -1272,6 +1492,10 @@ def _resolve_dialogue_box(
             # balloon.  Keep this maskless result on the guarded non-bubble path
             # so it must obtain a safe surface before any text is drawn.
             return (*expanded_fallback_box, False, None)
+        logger.debug(
+            "Dialogue box fallback for region (%d,%d,%d,%d): box=%s text='%s'",
+            x, y, w, h, fallback_box, " ".join(translated_text.split())[:60],
+        )
         return (*fallback_box, False, None)
 
     mask_anchor = _mask_centroid(region_mask, w, h)
@@ -1992,6 +2216,35 @@ def _bubble_mask_is_plausible_for_text(
 
     if not (bx1 - 6 <= tcx <= bx2 + 6 and by1 - 6 <= tcy <= by2 + 6):
         return False
+
+    # Containment: the majority of the OCR glyph pixels must sit inside the
+    # accepted bubble.  Without this, a leaked flood-fill or a neighbouring
+    # balloon is accepted and the translation is drawn far away from the text
+    # it replaces (leaving the real bubble empty).
+    if region_mask.max() > 1:
+        _, text_binary = cv2.threshold(region_mask, 127, 255, cv2.THRESH_BINARY)
+    else:
+        text_binary = (region_mask > 0).astype(np.uint8) * 255
+    text_total = cv2.countNonZero(text_binary)
+    if text_total >= 20:
+        # The flood-filled bubble interior often keeps glyph-shaped holes where
+        # the dark source characters blocked the fill.  Seal those holes before
+        # measuring containment so a correct balloon is not rejected.
+        bubble_bin = (bubble_mask > 0).astype(np.uint8) * 255
+        seal_k = _odd(int(np.clip(round(min(h, w) * 0.08), 5, 21)))
+        bubble_sealed = cv2.morphologyEx(
+            bubble_bin,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (seal_k, seal_k)),
+            iterations=1,
+        )
+        inside = cv2.countNonZero(cv2.bitwise_and(text_binary, bubble_sealed))
+        if inside < int(text_total * 0.35):
+            logger.debug(
+                "Bubble mask rejected: text containment %.2f < 0.35",
+                inside / float(text_total),
+            )
+            return False
 
     overlap_w = max(0, min(tx2, bx2) - max(tx1, bx1))
     overlap_h = max(0, min(ty2, by2) - max(ty1, by1))
@@ -3058,6 +3311,110 @@ def _non_bubble_dialogue_surface(
     if cv2.countNonZero(local_mask) < max(120, int(bw * bh * 0.25)):
         return None
 
+    return x1, y1, bw, bh, local_mask
+
+
+def _mask_anchored_neutral_dialogue_surface(
+    *,
+    region_image: NDArray,
+    anchor_mask: NDArray | None,
+    text: str,
+) -> tuple[int, int, int, int, NDArray] | None:
+    """Recover a missed white/grey balloon with an explicit safe clip mask."""
+    if region_image is None or region_image.size == 0 or anchor_mask is None:
+        return None
+
+    h, w = region_image.shape[:2]
+    if h < 28 or w < 28 or anchor_mask.shape[:2] != (h, w):
+        return None
+    if not _is_neutral_mask_anchored_dialogue_box(
+        region_image=region_image,
+        region_mask=anchor_mask,
+        search_x=0,
+        search_y=0,
+        box_x=0,
+        box_y=0,
+        box_w=w,
+        box_h=h,
+        text=text,
+    ):
+        return None
+
+    binary_anchor = (anchor_mask > 0).astype(np.uint8) * 255
+    anchor_sample, min_anchor_overlap = _prepare_surface_anchor_mask(
+        binary_anchor,
+        width=w,
+        height=h,
+    )
+    if anchor_sample is None:
+        return None
+
+    gray = cv2.cvtColor(region_image, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(region_image, cv2.COLOR_BGR2HSV)
+    # Use paper-like pixels, not the broader "neutral" definition used for
+    # validation. Pale skin and beige art can be low-saturation too; admitting
+    # them here lets a broken balloon outline merge the clip mask into artwork.
+    neutral = ((hsv[:, :, 1] <= 52) & (gray >= 190)).astype(np.uint8) * 255
+    neutral = cv2.morphologyEx(
+        neutral,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+    neutral = cv2.morphologyEx(
+        neutral,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        neutral,
+        connectivity=8,
+    )
+    best_label = -1
+    best_score = -1
+    crop_area = max(1, w * h)
+    for label in range(1, num_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        cw = int(stats[label, cv2.CC_STAT_WIDTH])
+        ch = int(stats[label, cv2.CC_STAT_HEIGHT])
+        if area < max(240, int(crop_area * 0.045)) or cw < 24 or ch < 24:
+            continue
+        component = labels == label
+        overlap = int(np.count_nonzero(component & anchor_sample))
+        if overlap < min_anchor_overlap:
+            continue
+        # Prefer the surface that owns the source glyphs, then the larger usable
+        # area.  Other pale objects in the render context cannot win without
+        # overlapping the detector anchor.
+        score = overlap * 100 + area
+        if score > best_score:
+            best_score = score
+            best_label = label
+
+    if best_label < 0:
+        return None
+
+    component = (labels == best_label).astype(np.uint8) * 255
+    # Pull lettering a few pixels away from the balloon outline.  Rendering is
+    # clipped to this eroded component even when its bounding box is rectangular.
+    component = cv2.erode(
+        component,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+    bbox = _mask_bbox(component)
+    if bbox is None:
+        return None
+    x1, y1, x2, y2 = bbox
+    bw = x2 - x1
+    bh = y2 - y1
+    if bw < 24 or bh < 24:
+        return None
+    local_mask = component[y1:y2, x1:x2].copy()
+    if cv2.countNonZero(local_mask) < max(180, int(bw * bh * 0.22)):
+        return None
     return x1, y1, bw, bh, local_mask
 
 

@@ -299,6 +299,42 @@ def translate_page(
                 allow_bubble_expansion=True,
                 return_status=True,
             )
+            if did_render and _render_collides_with_previous(
+                rendered_result=rendered_result,
+                result=result,
+                rendered_pixel_mask=rendered_pixel_mask,
+            ):
+                # The render context let this translation bleed into a bubble
+                # that already received translated text.  Retry anchored tightly
+                # to the unit's own OCR region so each translation stays inside
+                # its own bubble.
+                logger.debug(
+                    "  Render for unit at (%d,%d) collided with earlier text; "
+                    "retrying with tight region.",
+                    unit.region.x,
+                    unit.region.y,
+                )
+                retry_result, retry_did_render = render_text_on_image(
+                    result,
+                    translated,
+                    unit.region.x,
+                    unit.region.y,
+                    unit.region.w,
+                    unit.region.h,
+                    region_mask=unit.region.mask,
+                    style_hint=unit.style_hint,
+                    text_color=unit.text_color,
+                    allow_bubble_expansion=False,
+                    return_status=True,
+                )
+                if retry_did_render and not _render_collides_with_previous(
+                    rendered_result=retry_result,
+                    result=result,
+                    rendered_pixel_mask=rendered_pixel_mask,
+                ):
+                    rendered_result = retry_result
+                else:
+                    did_render = False
             if did_render:
                 rendered_units += 1
                 changed = np.any(rendered_result != result, axis=2)
@@ -501,6 +537,20 @@ def _save_image(output_path: Path, image_bgr: np.ndarray) -> None:
             )
     else:
         cv2.imwrite(str(output_path), image_bgr)
+
+
+def _render_collides_with_previous(
+    rendered_result: np.ndarray,
+    result: np.ndarray,
+    rendered_pixel_mask: np.ndarray,
+) -> bool:
+    """Return True when newly rendered pixels overlap earlier translations."""
+    changed = np.any(rendered_result != result, axis=2)
+    new_count = int(np.count_nonzero(changed))
+    if new_count == 0:
+        return False
+    overlap = int(np.count_nonzero(changed & (rendered_pixel_mask > 0)))
+    return overlap > max(120, int(new_count * 0.12))
 
 
 def _restore_unit_source_text(
@@ -995,22 +1045,41 @@ def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:
 
     if len(merged_boxes) < 2:
         return [region]
-    max_split_count = 18 if large_mixed_region else 8
+    if large_mixed_region:
+        # Very large (panel/page-sized) regions legitimately contain dozens of
+        # separate text units.  A fixed cap of 18 forced destructive chaining
+        # merges that collapsed distinct bubbles into one giant OCR unit.
+        max_split_count = min(48, max(18, int(region_area // 55_000)))
+    else:
+        max_split_count = 8
     if len(merged_boxes) > max_split_count:
-        merged_boxes = _merge_nearby_boxes(
-            merged_boxes,
-            gap=max(12, int(min(region.w, region.h) * (0.045 if large_mixed_region else 0.20))),
-        )
-    if len(merged_boxes) > max_split_count and large_mixed_region:
-        for factor in (0.07, 0.10, 0.14):
+        # Reduce with the smallest gap that fits the cap.  Starting with a big
+        # gap (and only trying bigger ones) chained unrelated text across the
+        # whole region into a single box, which then fell back to OCR-ing the
+        # entire region at once.
+        if large_mixed_region:
+            gap_factors = (0.02, 0.03, 0.045, 0.06, 0.08, 0.12)
+        else:
+            gap_factors = (0.20,)
+        chosen: list[tuple[int, int, int, int]] | None = None
+        most_granular: list[tuple[int, int, int, int]] | None = None
+        for factor in gap_factors:
             candidate = _merge_nearby_boxes(
                 merged_boxes,
-                gap=max(14, int(min(region.w, region.h) * factor)),
+                gap=max(12, int(min(region.w, region.h) * factor)),
             )
+            if most_granular is None and len(candidate) >= 2:
+                most_granular = candidate
             if 2 <= len(candidate) <= max_split_count:
-                merged_boxes = candidate
+                chosen = candidate
                 break
-    if len(merged_boxes) < 2 or len(merged_boxes) > max_split_count:
+        if chosen is not None:
+            merged_boxes = chosen
+        elif most_granular is not None:
+            # No gap fits the cap; keeping the most granular grouping is still
+            # far better than OCR-ing the whole region as one unit.
+            merged_boxes = most_granular
+    if len(merged_boxes) < 2:
         return [region]
 
     pad = max(2, int(min(region.w, region.h) * 0.03))
@@ -1272,6 +1341,12 @@ def _merge_same_surface_horizontal_ocr_boxes(
     """Merge row-aligned OCR fragments on one balloon surface."""
     if len(boxes) < 3 or region.cropped is None or region.cropped.size == 0:
         return boxes
+    # This pass exists to rejoin fragments of a single phrase inside one
+    # bubble-scale region.  On panel/page-scale regions its generous gap cap
+    # chains distinct neighbouring bubbles into one panel-wide OCR unit, which
+    # then renders one translation across several bubbles.
+    if region.w * region.h > 400_000:
+        return boxes
     if not _crop_has_neutral_dialogue_surface(region.cropped):
         return boxes
 
@@ -1304,8 +1379,8 @@ def _merge_same_surface_horizontal_ocr_boxes(
             x_gap = max(0, box[0] - prev[2])
             heights = [b[3] - b[1] for b in cluster] + [box[3] - box[1]]
             median_h = float(np.median(heights))
-            max_gap_cap = 340 if region.w >= 600 else 220
-            max_gap = max(34, min(max_gap_cap, int(median_h * 3.0)))
+            max_gap_cap = 180 if region.w >= 600 else 140
+            max_gap = max(30, min(max_gap_cap, int(median_h * 1.6)))
             if x_gap <= max_gap:
                 cluster.append(box)
                 continue
