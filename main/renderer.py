@@ -1241,7 +1241,43 @@ def render_text_on_image(
 
     # Convert back to BGR
     rendered = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+
+    # Final placement sanity: dialogue ink must land on a surface that
+    # contrasts with it.  This catches translations spilled onto dark artwork
+    # (black text) or washed into white areas (white text) when no reliable
+    # bubble mask constrained the draw.
+    if text_style == "dialogue" and not _dialogue_render_has_contrast(
+        rendered=rendered,
+        base=image,
+        render_color=render_color,
+    ):
+        return _skip_render("dialogue placed on non-contrasting surface")
+
     return _return(rendered, True)
+
+
+def _dialogue_render_has_contrast(
+    *,
+    rendered: NDArray,
+    base: NDArray,
+    render_color: tuple[int, int, int],
+) -> bool:
+    """Verify drawn dialogue pixels sit on a contrasting background."""
+    changed = np.any(rendered != base, axis=2)
+    if int(np.count_nonzero(changed)) < 40:
+        return True
+
+    base_gray = cv2.cvtColor(base, cv2.COLOR_BGR2GRAY)
+    bg_vals = base_gray[changed]
+    r, g, b = render_color
+    ink_luma = 0.299 * r + 0.587 * g + 0.114 * b
+    if ink_luma < 128:
+        # Dark ink: a meaningful share of the background must be light.
+        bad_fraction = float(np.mean(bg_vals < 120))
+    else:
+        # Light ink: a meaningful share of the background must be dark.
+        bad_fraction = float(np.mean(bg_vals > 140))
+    return bad_fraction <= 0.25
 
 
 def _place_dialogue_lines_in_mask(
@@ -1551,6 +1587,12 @@ def _resolve_dialogue_box(
     if bubble_mask is None:
         return _fallback_result()
 
+    bubble_mask = _trim_bubble_mask_at_outline(
+        bubble_mask=bubble_mask,
+        region_mask=region_mask,
+        region_image=region_image,
+    )
+
     bubble_bbox = _mask_bbox(bubble_mask)
     if bubble_bbox is None:
         return _fallback_result()
@@ -1570,6 +1612,11 @@ def _resolve_dialogue_box(
     if not _bubble_mask_has_paper_surface(
         region_image=region_image,
         bubble_mask=bubble_mask,
+    ):
+        return _fallback_result()
+    if not _bubble_mask_is_context_bounded(
+        bubble_mask=bubble_mask,
+        region_mask=region_mask,
     ):
         return _fallback_result()
 
@@ -1904,93 +1951,172 @@ def _extract_bubble_mask(
             iterations=1,
         )
 
-    seed = _find_fill_seed(
+    seeds = _find_fill_seeds(
         blurred,
         flood_mask,
         (ax, ay),
         blocked_mask=blocked_seed_mask,
+        max_seeds=4,
     )
-    if seed is None:
+    if not seeds:
         return None
-    sx, sy = seed
 
-    fill_src = blurred.copy()
     diff = int(np.clip(np.std(blurred) * 0.30, 8, 24))
     flags = 4 | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
-    area, _, _, _ = cv2.floodFill(
-        fill_src,
-        flood_mask,
-        (sx, sy),
-        255,
-        loDiff=diff,
-        upDiff=diff,
-        flags=flags,
-    )
     min_area = max(220, int(h * w * 0.02))
-    if area < min_area:
-        return None
-
-    filled = (flood_mask[1:-1, 1:-1] == 255).astype(np.uint8) * 255
-    if filled[sy, sx] == 0:
-        return None
-
-    # Keep only the connected component containing the seed.
-    num_labels, labels, _, _ = cv2.connectedComponentsWithStats(filled, connectivity=8)
-    label = int(labels[sy, sx])
-    if label <= 0 or label >= num_labels:
-        return None
-
-    component = (labels == label).astype(np.uint8) * 255
-    comp_area = cv2.countNonZero(component)
-    if comp_area < min_area:
-        return None
-    # Reject near-full fills, but be less aggressive for narrow regions that
-    # are genuinely mostly bubble interior.
-    area_ratio = comp_area / float(max(1, h * w))
-    if area_ratio > 0.98:
-        return None
-    if area_ratio > 0.94 and min(h, w) < 80:
-        return None
-
-    # Very dark, huge fills are often panel/background leakage.
-    mean_val = float(np.mean(gray[component > 0])) if comp_area > 0 else 0.0
-    if mean_val < 95 and comp_area > int(h * w * 0.55):
-        return None
-    # Reject colorful large fills (skin/clothes/panel background) that are not
-    # speech bubbles. Bubbles are typically low-saturation interiors.
     hsv = cv2.cvtColor(region_image, cv2.COLOR_BGR2HSV)
-    sat_vals = hsv[:, :, 1][component > 0]
-    if sat_vals.size > 0:
-        mean_sat = float(np.mean(sat_vals))
-        bright_ratio = float(np.mean(gray[component > 0] > 185))
-        if mean_sat > 52 and comp_area > int(h * w * 0.12):
-            return None
-        if mean_sat > 42 and bright_ratio < 0.35 and comp_area > int(h * w * 0.18):
-            return None
 
-    k = _odd(max(3, int(round(np.sqrt(comp_area) / 30))))
-    component = cv2.morphologyEx(
-        component,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)),
-        iterations=1,
-    )
-    component = cv2.morphologyEx(
-        component,
-        cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
-        iterations=1,
-    )
-    return component
+    best_component: NDArray | None = None
+    best_score = -1e9
+    for sx, sy in seeds:
+        # Rebuild the edge-barrier mask per seed: floodFill mutates it.
+        seed_flood_mask = flood_mask.copy()
+        fill_src = blurred.copy()
+        area, _, _, _ = cv2.floodFill(
+            fill_src,
+            seed_flood_mask,
+            (sx, sy),
+            255,
+            loDiff=diff,
+            upDiff=diff,
+            flags=flags,
+        )
+        if area < min_area:
+            continue
+
+        filled = (seed_flood_mask[1:-1, 1:-1] == 255).astype(np.uint8) * 255
+        if filled[sy, sx] == 0:
+            continue
+
+        # Keep only the connected component containing the seed.
+        num_labels, labels, _, _ = cv2.connectedComponentsWithStats(filled, connectivity=8)
+        label = int(labels[sy, sx])
+        if label <= 0 or label >= num_labels:
+            continue
+
+        component = (labels == label).astype(np.uint8) * 255
+        comp_area = cv2.countNonZero(component)
+        if comp_area < min_area:
+            continue
+        # Reject near-full fills, but be less aggressive for narrow regions that
+        # are genuinely mostly bubble interior.
+        area_ratio = comp_area / float(max(1, h * w))
+        if area_ratio > 0.98:
+            continue
+        if area_ratio > 0.94 and min(h, w) < 80:
+            continue
+
+        # Very dark, huge fills are often panel/background leakage.
+        mean_val = float(np.mean(gray[component > 0])) if comp_area > 0 else 0.0
+        if mean_val < 95 and comp_area > int(h * w * 0.55):
+            continue
+        # Reject colorful large fills (skin/clothes/panel background) that are not
+        # speech bubbles. Bubbles are typically low-saturation interiors.
+        sat_vals = hsv[:, :, 1][component > 0]
+        if sat_vals.size > 0:
+            mean_sat = float(np.mean(sat_vals))
+            bright_ratio = float(np.mean(gray[component > 0] > 185))
+            if mean_sat > 52 and comp_area > int(h * w * 0.12):
+                continue
+            if mean_sat > 42 and bright_ratio < 0.35 and comp_area > int(h * w * 0.18):
+                continue
+
+        k = _odd(max(3, int(round(np.sqrt(comp_area) / 30))))
+        component = cv2.morphologyEx(
+            component,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)),
+            iterations=1,
+        )
+        component = cv2.morphologyEx(
+            component,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            iterations=1,
+        )
+
+        score = _bubble_fill_score(
+            component=component,
+            region_mask=region_mask,
+            region_h=h,
+            region_w=w,
+        )
+        if score > best_score:
+            best_score = score
+            best_component = component
+
+    return best_component
 
 
-def _find_fill_seed(
+def _bubble_fill_score(
+    *,
+    component: NDArray,
+    region_mask: NDArray | None,
+    region_h: int,
+    region_w: int,
+) -> float:
+    """Score a flood-filled candidate: prefer compact fills that wrap the text.
+
+    A fill seeded outside the balloon (panel background) tends to touch the
+    render-context edges and to dwarf the glyph cluster; a fill seeded inside
+    the balloon is compact and contains the glyphs.  Comparing fills by these
+    signals makes seed selection robust when the glyph centroid is blocked.
+    """
+    comp_area = cv2.countNonZero(component)
+    bbox = _mask_bbox(component)
+    if bbox is None:
+        return -1e9
+    bx1, by1, bx2, by2 = bbox
+    bw = max(1, bx2 - bx1)
+    bh = max(1, by2 - by1)
+
+    compactness = comp_area / float(bw * bh)
+    score = compactness * 2.0
+
+    text_info = _text_mask_geometry(region_mask, region_w, region_h)
+    if text_info is not None:
+        (tx1, ty1, tx2, ty2), _ = text_info
+        gw = max(1, tx2 - tx1)
+        gh = max(1, ty2 - ty1)
+        # Containment of the source glyphs (seal glyph-shaped holes first).
+        if region_mask.max() > 1:
+            _, text_binary = cv2.threshold(region_mask, 127, 255, cv2.THRESH_BINARY)
+        else:
+            text_binary = (region_mask > 0).astype(np.uint8) * 255
+        text_total = max(1, cv2.countNonZero(text_binary))
+        seal_k = _odd(int(np.clip(round(min(region_h, region_w) * 0.08), 5, 21)))
+        sealed = cv2.morphologyEx(
+            component,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (seal_k, seal_k)),
+            iterations=1,
+        )
+        containment = cv2.countNonZero(cv2.bitwise_and(text_binary, sealed)) / float(text_total)
+        score += containment * 4.0
+        # Penalize fills that dwarf the glyph cluster (likely background).
+        oversize = max(bw / float(gw), bh / float(gh))
+        if oversize > 2.0:
+            score -= (oversize - 2.0) * 1.5
+
+    touch_l = bx1 <= 1
+    touch_r = bx2 >= region_w - 1
+    touch_t = by1 <= 1
+    touch_b = by2 >= region_h - 1
+    touches = int(touch_l) + int(touch_r) + int(touch_t) + int(touch_b)
+    score -= touches * 1.0
+    if (touch_l and touch_r) or (touch_t and touch_b):
+        score -= 3.0
+    return score
+
+
+def _find_fill_seeds(
     gray: NDArray,
     flood_mask: NDArray,
     seed: tuple[int, int],
     blocked_mask: NDArray | None = None,
-) -> tuple[int, int] | None:
-    """Find a nearby unblocked flood-fill seed, preferring brighter pixels."""
+    max_seeds: int = 4,
+) -> list[tuple[int, int]]:
+    """Find up to ``max_seeds`` spatially distinct unblocked flood-fill seeds."""
     h, w = gray.shape[:2]
     sx = int(np.clip(seed[0], 0, max(0, w - 1)))
     sy = int(np.clip(seed[1], 0, max(0, h - 1)))
@@ -2004,40 +2130,54 @@ def _find_fill_seed(
             return blocked_mask[y, x] == 0
         return True
 
+    candidates: list[tuple[int, int]] = []
     if is_open(sx, sy):
-        return (sx, sy)
+        candidates.append((sx, sy))
 
     max_radius = max(6, int(min(h, w) * 0.35))
-    best: tuple[int, int] | None = None
-    best_score = -1e9
     for r in range(1, max_radius + 1):
         x0 = max(0, sx - r)
         x1 = min(w - 1, sx + r)
         y0 = max(0, sy - r)
         y1 = min(h - 1, sy + r)
 
+        ring_best: tuple[int, int] | None = None
+        ring_best_score = -1e9
         for x in range(x0, x1 + 1):
             for y in (y0, y1):
                 if not is_open(x, y):
                     continue
                 score = float(gray[y, x]) - (abs(x - sx) + abs(y - sy)) * 1.2
-                if score > best_score:
-                    best_score = score
-                    best = (x, y)
+                if score > ring_best_score:
+                    ring_best_score = score
+                    ring_best = (x, y)
 
         for y in range(y0 + 1, y1):
             for x in (x0, x1):
                 if not is_open(x, y):
                     continue
                 score = float(gray[y, x]) - (abs(x - sx) + abs(y - sy)) * 1.2
-                if score > best_score:
-                    best_score = score
-                    best = (x, y)
+                if score > ring_best_score:
+                    ring_best_score = score
+                    ring_best = (x, y)
 
-        if best is not None and r >= 4:
-            break
+        if ring_best is not None:
+            # Keep candidates spatially distinct so they land in different
+            # fill components (inside balloon vs. outside background).
+            if all(
+                abs(ring_best[0] - cx) + abs(ring_best[1] - cy) > 14
+                for cx, cy in candidates
+            ):
+                candidates.append(ring_best)
+            if len(candidates) >= max_seeds:
+                break
+            # Candidates near the anchor are most useful; once a few rings with
+            # open points have been seen, further ones are far away and rarely
+            # change the outcome.
+            if len(candidates) >= 2 and r >= 10:
+                break
 
-    return best
+    return candidates
 
 
 def _prepare_bubble_render_mask(mask: NDArray) -> NDArray | None:
@@ -2191,6 +2331,143 @@ def _isolate_bubble_lobe_near_text(
     return selected
 
 
+def _trim_bubble_mask_at_outline(
+    bubble_mask: NDArray,
+    region_mask: NDArray | None,
+    region_image: NDArray,
+) -> NDArray:
+    """Trim a leaked bubble mask back to the dark outline enclosing the text.
+
+    Flood-fill/bubble estimation can leak through a broken balloon outline into
+    the panel background or a neighbouring balloon.  The real outline is a dark
+    line somewhere between the source glyphs and the mask edge.  Scanning
+    outward from the glyph bounding box, the first strong dark line (within the
+    glyph row/column band) marks the true boundary; anything beyond it is not
+    part of this balloon.  Correct masks are unaffected: their only dark line
+    on the way out is the balloon's own outline at the mask edge.
+    """
+    h, w = bubble_mask.shape[:2]
+    text_info = _text_mask_geometry(region_mask, w, h)
+    if text_info is None or region_image.size == 0:
+        return bubble_mask
+    (tx1, ty1, tx2, ty2), _ = text_info
+    mask_bbox = _mask_bbox(bubble_mask)
+    if mask_bbox is None:
+        return bubble_mask
+    mx1, my1, mx2, my2 = mask_bbox
+
+    gray = (
+        region_image
+        if region_image.ndim == 2
+        else cv2.cvtColor(region_image, cv2.COLOR_BGR2GRAY)
+    )
+    dark = gray < 110
+    trimmed = (bubble_mask > 0).astype(np.uint8) * 255
+
+    def _find_outline(
+        start: int,
+        stop: int,
+        band_lo: int,
+        band_hi: int,
+        vertical: bool,
+        step: int,
+    ) -> int | None:
+        """Return position of the first strong dark line scanning from start."""
+        run = 0
+        found: int | None = None
+        pos = start
+        while pos != stop:
+            if vertical:
+                band = dark[band_lo:band_hi, pos]
+            else:
+                band = dark[pos, band_lo:band_hi]
+            frac = float(np.mean(band)) if band.size else 0.0
+            if frac >= 0.45:
+                if run == 0:
+                    found = pos
+                run += 1
+                if run >= 2:
+                    return found
+            else:
+                run = 0
+                found = None
+            pos += step
+        return None
+
+    # Right of the glyphs (scan within the glyph row band).
+    if mx2 > tx2 + 6:
+        outline = _find_outline(tx2 + 3, mx2, ty1, max(ty1 + 1, ty2), True, 1)
+        if outline is not None:
+            trimmed[:, outline:] = 0
+    # Left of the glyphs.
+    if mx1 < tx1 - 6:
+        outline = _find_outline(tx1 - 3, mx1 - 1, ty1, max(ty1 + 1, ty2), True, -1)
+        if outline is not None:
+            trimmed[:, : outline + 1] = 0
+    # Below the glyphs.
+    if my2 > ty2 + 6:
+        outline = _find_outline(ty2 + 3, my2, tx1, max(tx1 + 1, tx2), False, 1)
+        if outline is not None:
+            trimmed[outline:, :] = 0
+    # Above the glyphs.
+    if my1 < ty1 - 6:
+        outline = _find_outline(ty1 - 3, my1 - 1, tx1, max(tx1 + 1, tx2), False, -1)
+        if outline is not None:
+            trimmed[: outline + 1, :] = 0
+
+    new_bbox = _mask_bbox(trimmed)
+    if new_bbox is None:
+        return bubble_mask
+    # Trimming only cuts beyond the glyph bounding box, so glyph pixels inside
+    # the original mask are always preserved.  The only remaining guard is that
+    # a usable area survives; a leaked mask is mostly leak by definition and
+    # should be cut back hard.
+    if region_mask.max() > 1:
+        _, text_binary = cv2.threshold(region_mask, 127, 255, cv2.THRESH_BINARY)
+    else:
+        text_binary = (region_mask > 0).astype(np.uint8) * 255
+    text_pixels = cv2.countNonZero(text_binary)
+    if cv2.countNonZero(trimmed) < max(800, int(text_pixels * 1.5)):
+        return bubble_mask
+    return trimmed
+
+
+def _bubble_mask_is_context_bounded(
+    bubble_mask: NDArray,
+    region_mask: NDArray | None,
+) -> bool:
+    """Reject masks that behave like panel background rather than a balloon.
+
+    The render context is always padded around the source text, so a genuine
+    balloon mask ends inside the context.  A mask that touches opposite context
+    edges (spanning the full width or height) is leaked panel background.  A
+    mask touching one edge is only plausible when it stays tight around the
+    source glyphs (panel-edge narration boxes).
+    """
+    h, w = bubble_mask.shape[:2]
+    bbox = _mask_bbox(bubble_mask)
+    if bbox is None:
+        return False
+    bx1, by1, bx2, by2 = bbox
+    touch_l = bx1 <= 1
+    touch_r = bx2 >= w - 1
+    touch_t = by1 <= 1
+    touch_b = by2 >= h - 1
+    if (touch_l and touch_r) or (touch_t and touch_b):
+        return False
+    if touch_l or touch_r or touch_t or touch_b:
+        text_info = _text_mask_geometry(region_mask, w, h)
+        if text_info is not None:
+            (tx1, ty1, tx2, ty2), _ = text_info
+            gw = max(1, tx2 - tx1)
+            gh = max(1, ty2 - ty1)
+            bw = bx2 - bx1
+            bh = by2 - by1
+            if bw > gw * 2.0 + 60 or bh > gh * 1.8 + 60:
+                return False
+    return True
+
+
 def _bubble_mask_is_plausible_for_text(
     bubble_mask: NDArray,
     region_mask: NDArray | None,
@@ -2260,6 +2537,13 @@ def _bubble_mask_is_plausible_for_text(
     if bw >= max(150, tw * 4) and (rel_x < 0.18 or rel_x > 0.82):
         return False
     if bh >= max(150, th * 4) and (rel_y < 0.12 or rel_y > 0.88):
+        return False
+    # When the accepted bubble is much larger than the glyph cluster, the glyphs
+    # must sit reasonably close to its centre.  A mask that leaked toward a
+    # panel border places the translation above/beside the real balloon.
+    if bw >= max(120, tw * 2.2) and (rel_x < 0.22 or rel_x > 0.78):
+        return False
+    if bh >= max(120, th * 2.2) and (rel_y < 0.16 or rel_y > 0.84):
         return False
 
     return True
@@ -3297,6 +3581,16 @@ def _non_bubble_dialogue_surface(
             return None
 
     component = (labels == best_label).astype(np.uint8) * 255
+    # The paper fill can merge the balloon interior with a white panel
+    # background through a thin/broken outline.  Trim back to the real dark
+    # outline around the anchor glyphs when one exists.
+    component = _trim_bubble_mask_at_outline(
+        bubble_mask=component,
+        region_mask=anchor_mask,
+        region_image=region_image,
+    )
+    if cv2.countNonZero(component) < max(180, int(crop_area * 0.04)):
+        return None
     bbox = _mask_bbox(component)
     if bbox is None:
         return None
@@ -3397,6 +3691,11 @@ def _mask_anchored_neutral_dialogue_surface(
         return None
 
     component = (labels == best_label).astype(np.uint8) * 255
+    component = _trim_bubble_mask_at_outline(
+        bubble_mask=component,
+        region_mask=anchor_mask,
+        region_image=region_image,
+    )
     # Pull lettering a few pixels away from the balloon outline.  Rendering is
     # clipped to this eroded component even when its bounding box is rectangular.
     component = cv2.erode(
@@ -3513,6 +3812,13 @@ def _bright_rect_dialogue_surface(
         return None
 
     component = (labels == best_label).astype(np.uint8) * 255
+    component = _trim_bubble_mask_at_outline(
+        bubble_mask=component,
+        region_mask=anchor_mask,
+        region_image=gray,
+    )
+    if cv2.countNonZero(component) < max(180, int(crop_area * 0.035)):
+        return None
     bbox = _mask_bbox(component)
     if bbox is None:
         return None

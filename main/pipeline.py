@@ -550,7 +550,7 @@ def _render_collides_with_previous(
     if new_count == 0:
         return False
     overlap = int(np.count_nonzero(changed & (rendered_pixel_mask > 0)))
-    return overlap > max(120, int(new_count * 0.12))
+    return overlap > max(80, int(new_count * 0.08))
 
 
 def _restore_unit_source_text(
