@@ -985,10 +985,22 @@ def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:
             if len(clustered_boxes) >= 2:
                 merged_boxes = clustered_boxes
             else:
-                # A detector region lying on one balloon is already one semantic
-                # dialogue unit. Splitting its vertical glyph columns produces
-                # one-character translations and leaves most of the balloon blank.
-                return [region]
+                enclosed_groups, enclosed_remaining = (
+                    _split_bright_bubble_by_outline_enclosure(
+                        region=region,
+                        boxes=boxes,
+                    )
+                )
+                if len(enclosed_groups) >= 2:
+                    merged_boxes = enclosed_groups + _merge_nearby_boxes(
+                        enclosed_remaining,
+                        gap=max(8, int(min(region.w, region.h) * 0.04)),
+                    )
+                else:
+                    # A detector region lying on one balloon is already one semantic
+                    # dialogue unit. Splitting its vertical glyph columns produces
+                    # one-character translations and leaves most of the balloon blank.
+                    return [region]
     else:
         merged_boxes = []
 
@@ -1020,6 +1032,20 @@ def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:
         )
     elif not bright_bubble_region:
         merged_boxes = _merge_nearby_boxes(boxes, gap=merge_gap)
+        if len(merged_boxes) < 2:
+            # Same outline-aware rescue for bubble-scale regions whose surface
+            # checks failed: two balloons must never stay one OCR unit.
+            enclosed_groups, enclosed_remaining = (
+                _split_bright_bubble_by_outline_enclosure(
+                    region=region,
+                    boxes=boxes,
+                )
+            )
+            if len(enclosed_groups) >= 2:
+                merged_boxes = enclosed_groups + _merge_nearby_boxes(
+                    enclosed_remaining,
+                    gap=max(8, int(min(region.w, region.h) * 0.04)),
+                )
 
     if not large_mixed_region and not bright_bubble_region:
         merged_boxes = _merge_aligned_ocr_boxes(
@@ -1282,6 +1308,32 @@ def _merge_same_surface_vertical_ocr_boxes(
     used: set[int] = set()
     merged: list[tuple[int, int, int, int]] = []
     region_area = max(1, region.w * region.h)
+    enclosure = _outline_enclosed_label_map(region)
+
+    def _try_merge_group(
+        member_indices: list[int],
+        members: list[tuple[int, int, int, int]],
+        component_box: tuple[int, int, int, int],
+        component_area: int,
+    ) -> bool:
+        if not _should_keep_bright_component_as_one_group(
+            component_box=component_box,
+            component_area=component_area,
+            region_w=region.w,
+            region_h=region.h,
+            members=members,
+        ):
+            return False
+
+        gx1 = min(item[0] for item in members)
+        gy1 = min(item[1] for item in members)
+        gx2 = max(item[2] for item in members)
+        gy2 = max(item[3] for item in members)
+        if (gx2 - gx1) < 12 or (gy2 - gy1) < 12:
+            return False
+        merged.append((gx1, gy1, gx2, gy2))
+        used.update(member_indices)
+        return True
 
     for label in range(1, num_labels):
         cx1 = int(stats[label, cv2.CC_STAT_LEFT])
@@ -1312,23 +1364,39 @@ def _merge_same_surface_vertical_ocr_boxes(
                 member_indices.append(idx)
                 members.append(box)
 
-        if not _should_keep_bright_component_as_one_group(
+        if enclosure is not None and len(members) >= 2:
+            # Never chain text across distinct outline-enclosed balloon
+            # interiors; each balloon must stay its own OCR unit even when
+            # their paper connects on the plain bright mask.
+            by_enclosure: dict[int, list[int]] = {}
+            for pos, box in enumerate(members):
+                lab = _enclosure_label_at(
+                    enclosure,
+                    (box[0] + box[2]) * 0.5,
+                    (box[1] + box[3]) * 0.5,
+                )
+                by_enclosure.setdefault(lab, []).append(pos)
+            positive_parts = [
+                positions for lab, positions in by_enclosure.items() if lab > 0
+            ]
+            if len(positive_parts) >= 2:
+                for positions in positive_parts:
+                    part_indices = [member_indices[p] for p in positions]
+                    part_members = [members[p] for p in positions]
+                    _try_merge_group(
+                        part_indices,
+                        part_members,
+                        component_box=(cx1, cy1, cx2, cy2),
+                        component_area=area,
+                    )
+                continue
+
+        _try_merge_group(
+            member_indices,
+            members,
             component_box=(cx1, cy1, cx2, cy2),
             component_area=area,
-            region_w=region.w,
-            region_h=region.h,
-            members=members,
-        ):
-            continue
-
-        gx1 = min(item[0] for item in members)
-        gy1 = min(item[1] for item in members)
-        gx2 = max(item[2] for item in members)
-        gy2 = max(item[3] for item in members)
-        if (gx2 - gx1) < 12 or (gy2 - gy1) < 12:
-            continue
-        merged.append((gx1, gy1, gx2, gy2))
-        used.update(member_indices)
+        )
 
     merged.extend(box for idx, box in enumerate(boxes) if idx not in used)
     return merged
@@ -1368,6 +1436,7 @@ def _merge_same_surface_horizontal_ocr_boxes(
 
     used: set[tuple[int, int, int, int]] = set()
     merged: list[tuple[int, int, int, int]] = []
+    enclosure = _outline_enclosed_label_map(region)
     for row in rows:
         row = sorted(row, key=lambda b: b[0])
         cluster: list[tuple[int, int, int, int]] = []
@@ -1384,9 +1453,9 @@ def _merge_same_surface_horizontal_ocr_boxes(
             if x_gap <= max_gap:
                 cluster.append(box)
                 continue
-            _append_horizontal_ocr_cluster(cluster, merged, used, region)
+            _append_horizontal_ocr_cluster(cluster, merged, used, region, enclosure)
             cluster = [box]
-        _append_horizontal_ocr_cluster(cluster, merged, used, region)
+        _append_horizontal_ocr_cluster(cluster, merged, used, region, enclosure)
 
     merged.extend(box for box in boxes if box not in used)
     return merged
@@ -1397,9 +1466,28 @@ def _append_horizontal_ocr_cluster(
     merged: list[tuple[int, int, int, int]],
     used: set[tuple[int, int, int, int]],
     region: TextRegion,
+    enclosure: np.ndarray | None = None,
 ) -> None:
     if len(cluster) < 3:
         return
+    if enclosure is not None:
+        # Never chain row fragments across distinct outline-enclosed balloon
+        # interiors; each balloon must stay its own OCR unit.
+        by_enclosure: dict[int, list[tuple[int, int, int, int]]] = {}
+        for box in cluster:
+            lab = _enclosure_label_at(
+                enclosure,
+                (box[0] + box[2]) * 0.5,
+                (box[1] + box[3]) * 0.5,
+            )
+            by_enclosure.setdefault(lab, []).append(box)
+        positive_parts = [
+            part for lab, part in by_enclosure.items() if lab > 0
+        ]
+        if len(positive_parts) >= 2:
+            for part in positive_parts:
+                _append_horizontal_ocr_cluster(part, merged, used, region, None)
+            return
     x1 = min(b[0] for b in cluster)
     y1 = min(b[1] for b in cluster)
     x2 = max(b[2] for b in cluster)
@@ -1653,6 +1741,171 @@ def _split_bright_bubble_by_text_clusters(
         return []
 
     return clusters
+
+
+def _outline_enclosed_label_map(region: TextRegion) -> np.ndarray | None:
+    """Label map of outline-enclosed bright interiors (balloon insides).
+
+    Plain bright-threshold grouping fails when balloon paper connects to the
+    panel background or to a neighbouring balloon.  Excluding the dilated dark
+    outline strokes first keeps every closed balloon interior disconnected.
+    Components too small to be a balloon, or wrapping the region edges like
+    panel background, are zeroed out.
+    """
+    if region.cropped is None or region.cropped.size == 0:
+        return None
+
+    gray = cv2.cvtColor(region.cropped, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(region.cropped, cv2.COLOR_BGR2HSV)
+    bright_threshold = int(np.clip(np.percentile(gray, 82), 205, 235))
+    paper = ((gray >= bright_threshold) & (hsv[:, :, 1] <= 90)).astype(np.uint8) * 255
+
+    _, dark = cv2.threshold(gray, 130, 255, cv2.THRESH_BINARY_INV)
+    dark = cv2.dilate(
+        dark,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+    enclosed = cv2.subtract(paper, dark)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        enclosed,
+        connectivity=8,
+    )
+    if num_labels <= 1:
+        return None
+
+    region_area = max(1, region.w * region.h)
+    qualified = np.zeros(num_labels, dtype=bool)
+    for label in range(1, num_labels):
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < max(1600, int(region_area * 0.02)):
+            continue
+        if w < 36 or h < 36:
+            continue
+        edge_touches = int(x <= 1) + int(y <= 1)
+        edge_touches += int((x + w) >= region.w - 1)
+        edge_touches += int((y + h) >= region.h - 1)
+        bbox_area = w * h
+        # Panel background/margins wrap around the region; balloons may touch
+        # an edge or two but never wrap the whole region.
+        if edge_touches >= 3:
+            continue
+        if edge_touches >= 2 and bbox_area > int(region_area * 0.55):
+            continue
+        qualified[label] = True
+
+    if not qualified[1:].any():
+        return None
+    labels = labels.copy()
+    labels[~qualified[labels]] = 0
+    return labels
+
+
+def _enclosure_label_at(
+    labels: np.ndarray | None,
+    x: float,
+    y: float,
+) -> int:
+    """Return the enclosed-interior label near a local point (0 = none).
+
+    Box centres of glyph clusters typically land on the glyphs themselves,
+    which are excluded from the interiors.  Sample a small neighbourhood and
+    take the majority interior label instead.
+    """
+    if labels is None:
+        return 0
+    h, w = labels.shape[:2]
+    ix, iy = int(x), int(y)
+    x1, x2 = max(0, ix - 12), min(w, ix + 13)
+    y1, y2 = max(0, iy - 12), min(h, iy + 13)
+    if x2 <= x1 or y2 <= y1:
+        return 0
+    window = labels[y1:y2, x1:x2]
+    positives = window[window > 0]
+    if positives.size == 0:
+        return 0
+    values, counts = np.unique(positives, return_counts=True)
+    return int(values[int(np.argmax(counts))])
+
+
+def _split_bright_bubble_by_outline_enclosure(
+    region: TextRegion,
+    boxes: list[tuple[int, int, int, int]],
+) -> tuple[list[tuple[int, int, int, int]], list[tuple[int, int, int, int]]]:
+    """Separate adjacent balloons via their dark enclosing outlines.
+
+    Merging several speech bubbles into one OCR unit renders one translation
+    across bubbles and leaves the others blank.  Assigning each text cluster
+    to the outline-enclosed interior that contains it keeps every balloon its
+    own semantic unit.
+    """
+    if len(boxes) < 2:
+        return [], boxes
+    labels = _outline_enclosed_label_map(region)
+    if labels is None or labels.max() < 1:
+        return [], boxes
+
+    num_labels = int(labels.max())
+    components: list[tuple[int, int, int, int, int]] = []
+    for label in range(1, num_labels + 1):
+        ys, xs = np.where(labels == label)
+        if len(xs) == 0:
+            continue
+        components.append(
+            (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1, label)
+        )
+
+    if len(components) < 2:
+        return [], boxes
+
+    used: set[int] = set()
+    groups: list[tuple[int, int, int, int]] = []
+    for cx1, cy1, cx2, cy2, _label in components:
+        members: list[tuple[int, int, int, int]] = []
+        for idx, box in enumerate(boxes):
+            if idx in used:
+                continue
+            bx1, by1, bx2, by2 = box
+            bcx = (bx1 + bx2) * 0.5
+            bcy = (by1 + by2) * 0.5
+            ix1, iy1 = max(cx1, bx1), max(cy1, by1)
+            ix2, iy2 = min(cx2, bx2), min(cy2, by2)
+            overlap = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            box_area = max(1, (bx2 - bx1) * (by2 - by1))
+            center_inside = cx1 - 4 <= bcx <= cx2 + 4 and cy1 - 4 <= bcy <= cy2 + 4
+            if center_inside or overlap >= int(box_area * 0.40):
+                members.append(box)
+
+        if not members:
+            continue
+        gx1 = min(item[0] for item in members)
+        gy1 = min(item[1] for item in members)
+        gx2 = max(item[2] for item in members)
+        gy2 = max(item[3] for item in members)
+        if (gx2 - gx1) < 12 or (gy2 - gy1) < 12:
+            continue
+        groups.append((gx1, gy1, gx2, gy2))
+        for idx, box in enumerate(boxes):
+            if box in members:
+                used.add(idx)
+
+    if len(groups) < 2:
+        return [], boxes
+
+    # Narration printed on artwork can fall inside bright non-balloon patches
+    # (skin, screens, highlights).  A genuine multi-balloon region has nearly
+    # all of its text inside the interiors; reject splits that leave most
+    # text outside.
+    if len(used) < int(len(boxes) * 0.55):
+        return [], boxes
+
+    remaining = [box for idx, box in enumerate(boxes) if idx not in used]
+    return groups, remaining
 
 
 def _mask_bbox_local(mask: np.ndarray) -> tuple[int, int, int, int] | None:

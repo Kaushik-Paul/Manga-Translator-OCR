@@ -647,7 +647,7 @@ def render_text_on_image(
                 # ends; drawing into that rectangle is the main source of text
                 # spilling across balloon outlines. Direct-to-art narration is
                 # a separate, source-anchored case and remains supported.
-                if not _is_mask_anchored_art_dialogue_box(
+                if _is_mask_anchored_art_dialogue_box(
                     region_image=result[box_y : box_y + box_h, box_x : box_x + box_w],
                     region_mask=search_region_mask,
                     search_x=search_x,
@@ -658,8 +658,28 @@ def render_text_on_image(
                     box_h=box_h,
                     text=text,
                 ):
-                    return _skip_render("no safe non-bubble surface")
-                mask_anchored_dialogue_box = True
+                    mask_anchored_dialogue_box = True
+                else:
+                    # The detector-anchored checks above reject boxes that grew
+                    # much wider than the source glyph lane (common for panel
+                    # narration on art).  Re-anchor a fresh box to the source
+                    # glyphs instead of giving up and restoring the Japanese.
+                    anchored_box = _source_anchored_art_dialogue_box(
+                        region_mask=search_region_mask,
+                        search_x=search_x,
+                        search_y=search_y,
+                        search_w=search_w,
+                        search_h=search_h,
+                        search_image=result[
+                            search_y : search_y + search_h,
+                            search_x : search_x + search_w,
+                        ],
+                        text=text,
+                    )
+                    if anchored_box is None:
+                        return _skip_render("no safe non-bubble surface")
+                    box_x, box_y, box_w, box_h = anchored_box
+                    mask_anchored_dialogue_box = True
             else:
                 local_x, local_y, local_w, local_h, forced_box_clip_mask = surface
                 box_x += local_x
@@ -668,6 +688,33 @@ def render_text_on_image(
                 box_h = local_h
     if _is_punctuation_only(text):
         return _skip_render("punctuation-only")
+
+    # A narrow vertical source lane can never fit horizontal English words.
+    # Regardless of which surface path approved the box, re-anchor narrow
+    # non-bubble dialogue boxes with moderate horizontal room around the
+    # source glyphs.
+    if (
+        non_bubble_dialogue
+        and forced_box_clip_mask is None
+        and bubble_clip_mask_local is None
+        and box_w < 70
+        and box_h > box_w * 1.8
+    ):
+        wider_box = _source_anchored_art_dialogue_box(
+            region_mask=search_region_mask,
+            search_x=search_x,
+            search_y=search_y,
+            search_w=search_w,
+            search_h=search_h,
+            search_image=result[
+                search_y : search_y + search_h,
+                search_x : search_x + search_w,
+            ],
+            text=text,
+        )
+        if wider_box is not None and wider_box[2] > box_w:
+            box_x, box_y, box_w, box_h = wider_box
+            mask_anchored_dialogue_box = True
 
     if (
         forced_box_clip_mask is not None
@@ -781,6 +828,13 @@ def render_text_on_image(
     max_size_cap = None
     if non_bubble_dialogue and not mask_anchored_dialogue_box:
         max_size_cap = max(14, min(24, int(min(avail_w, avail_h) * 0.42)))
+    elif mask_anchored_dialogue_box and len(text.split()) <= 3:
+        # Direct-to-art interjections replace small source glyphs; without a
+        # ceiling the box fit can blow a one-word shout up several times past
+        # the original lettering size and cover the surrounding artwork.
+        glyph_cap = _sfx_source_glyph_size_cap(search_region_mask)
+        if glyph_cap is not None:
+            max_size_cap = max(16, int(glyph_cap * 1.25))
     font, lines, line_spacing = _fit_text_to_box(
         draw=draw,
         text=text,
@@ -811,6 +865,23 @@ def render_text_on_image(
                 len(lines),
             )
     if text_style == "sfx" and lines:
+        # Replacement lettering should roughly match the original glyph size;
+        # an unbounded fit can blow a two-character effect up into a giant
+        # word that covers the surrounding artwork.
+        sfx_size_cap = _sfx_source_glyph_size_cap(search_region_mask)
+        if sfx_size_cap is not None and getattr(font, "size", 0) > sfx_size_cap:
+            font_cap, lines_cap, spacing_cap = _fit_text_to_box(
+                draw=draw,
+                text=text,
+                max_w=avail_w,
+                max_h=avail_h,
+                font_path=font_file,
+                style=text_style,
+                max_size_cap=sfx_size_cap,
+            )
+            if lines_cap:
+                font, lines, line_spacing = font_cap, lines_cap, spacing_cap
+                stroke_width = _stroke_width_for_font(font)
         widest = _max_line_width(draw, lines, font, stroke_width=stroke_width)
         if widest > int(avail_w * 1.08):
             compact_text = _compact_sfx_text(text)
@@ -1135,16 +1206,6 @@ def render_text_on_image(
 
     # Draw each line centered horizontally
     clip_dialogue_to_mask = box_clip_mask is not None and text_style == "dialogue"
-    if clip_dialogue_to_mask:
-        text_layer = Image.new("RGBA", pil_image.size, (0, 0, 0, 0))
-        target_draw = ImageDraw.Draw(text_layer)
-        fill_color = (*render_color, 255)
-        stroke_color = (*outline_color, 255)
-    else:
-        text_layer = None
-        target_draw = draw
-        fill_color = render_color
-        stroke_color = outline_color
 
     # Compute final per-line draw positions first.  When a bubble clip mask is
     # active, verify the complete layout pixel-accurately against the mask:
@@ -1216,44 +1277,97 @@ def render_text_on_image(
             line_positions.append((int(line_x - left), int(current_y - top)))
             current_y += lh + line_spacing
 
-    for (draw_x, draw_y), line in zip(line_positions, lines):
-        # Draw outline for readability (stroke)
-        target_draw.text(
-            (draw_x, draw_y),
-            line,
-            font=font,
-            anchor="lt",
-            fill=fill_color,
-            stroke_width=stroke_width,
-            stroke_fill=stroke_color,
-        )
+    def _composite_with_ink(
+        ink_fill: tuple[int, int, int],
+        ink_outline: tuple[int, int, int],
+    ) -> NDArray:
+        """Draw the final layout with a specific ink and return a BGR image."""
+        base_pil = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
+        if clip_dialogue_to_mask:
+            layer = Image.new("RGBA", base_pil.size, (0, 0, 0, 0))
+            target = ImageDraw.Draw(layer)
+            fill = (*ink_fill, 255)
+            stroke = (*ink_outline, 255)
+        else:
+            layer = None
+            target = ImageDraw.Draw(base_pil)
+            fill = ink_fill
+            stroke = ink_outline
 
-    if clip_dialogue_to_mask and text_layer is not None:
-        alpha = np.array(text_layer.getchannel("A"), dtype=np.uint8)
-        clip = np.zeros_like(alpha)
-        clip_mask = (box_clip_mask > 0).astype(np.uint8) * 255
-        clip[box_y : box_y + box_h, box_x : box_x + box_w] = (
-            clip_mask
-        )
-        alpha = np.minimum(alpha, clip)
-        text_layer.putalpha(Image.fromarray(alpha))
-        pil_image = Image.alpha_composite(pil_image.convert("RGBA"), text_layer).convert("RGB")
+        for (draw_x, draw_y), line in zip(line_positions, lines):
+            # Draw outline for readability (stroke)
+            target.text(
+                (draw_x, draw_y),
+                line,
+                font=font,
+                anchor="lt",
+                fill=fill,
+                stroke_width=stroke_width,
+                stroke_fill=stroke,
+            )
 
-    # Convert back to BGR
-    rendered = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+        if layer is not None:
+            alpha = np.array(layer.getchannel("A"), dtype=np.uint8)
+            clip = np.zeros_like(alpha)
+            clip_mask = (box_clip_mask > 0).astype(np.uint8) * 255
+            clip[box_y : box_y + box_h, box_x : box_x + box_w] = (
+                clip_mask
+            )
+            alpha = np.minimum(alpha, clip)
+            layer.putalpha(Image.fromarray(alpha))
+            base_pil = Image.alpha_composite(
+                base_pil.convert("RGBA"), layer
+            ).convert("RGB")
+
+        return cv2.cvtColor(np.array(base_pil), cv2.COLOR_RGB2BGR)
+
+    rendered = _composite_with_ink(render_color, outline_color)
 
     # Final placement sanity: dialogue ink must land on a surface that
     # contrasts with it.  This catches translations spilled onto dark artwork
     # (black text) or washed into white areas (white text) when no reliable
-    # bubble mask constrained the draw.
+    # bubble mask constrained the draw.  Before giving up, retry with the
+    # opposite ink: mixed light/dark backgrounds are often readable with the
+    # other fill/stroke pairing, and restoring the Japanese is worse.
     if text_style == "dialogue" and not _dialogue_render_has_contrast(
         rendered=rendered,
         base=image,
         render_color=render_color,
     ):
-        return _skip_render("dialogue placed on non-contrasting surface")
+        alt_rendered = _composite_with_ink(outline_color, render_color)
+        if _dialogue_render_has_contrast(
+            rendered=alt_rendered,
+            base=image,
+            render_color=outline_color,
+        ):
+            rendered = alt_rendered
+        else:
+            primary_score = _achieved_contrast_fraction(rendered, image)
+            alt_score = _achieved_contrast_fraction(alt_rendered, image)
+            best, best_score = (
+                (alt_rendered, alt_score)
+                if alt_score > primary_score
+                else (rendered, primary_score)
+            )
+            # The contrasting stroke ring keeps text readable even when part
+            # of the fill lands on a same-tone background; accept the better
+            # ink when nearly half the drawn pixels achieve real contrast.
+            if best_score < 0.45:
+                return _skip_render("dialogue placed on non-contrasting surface")
+            rendered = best
 
     return _return(rendered, True)
+
+
+def _achieved_contrast_fraction(rendered: NDArray, base: NDArray) -> float:
+    """Fraction of drawn pixels whose luma clearly differs from the page."""
+    changed = np.any(rendered != base, axis=2)
+    if int(np.count_nonzero(changed)) < 40:
+        return 1.0
+    rendered_gray = cv2.cvtColor(rendered, cv2.COLOR_BGR2GRAY).astype(np.int16)
+    base_gray = cv2.cvtColor(base, cv2.COLOR_BGR2GRAY).astype(np.int16)
+    diff = np.abs(rendered_gray - base_gray)
+    return float(np.mean(diff[changed] >= 60))
 
 
 def _dialogue_render_has_contrast(
@@ -1887,6 +2001,33 @@ def _resolve_sfx_box(
         by2 = min(h, cy + half)
 
     return (x + bx1, y + by1, max(1, bx2 - bx1), max(1, by2 - by1))
+
+
+def _sfx_source_glyph_size_cap(region_mask: NDArray | None) -> int | None:
+    """Estimate a font-size ceiling from the source SFX glyph dimensions.
+
+    Uses the source mask's short axis as the characteristic glyph size: the
+    column width for vertical effects, the row height for horizontal ones.
+    Returns None when the mask cannot provide a reliable estimate.
+    """
+    if region_mask is None or region_mask.size == 0:
+        return None
+    if region_mask.max() > 1:
+        _, binary = cv2.threshold(region_mask, 127, 255, cv2.THRESH_BINARY)
+    else:
+        binary = (region_mask > 0).astype(np.uint8) * 255
+    if cv2.countNonZero(binary) < 20:
+        return None
+    bbox = _mask_bbox(binary)
+    if bbox is None:
+        return None
+    sx1, sy1, sx2, sy2 = bbox
+    source_w = max(1, sx2 - sx1)
+    source_h = max(1, sy2 - sy1)
+    glyph_size = source_w if source_h > source_w else source_h
+    if glyph_size < 8:
+        return None
+    return max(14, int(glyph_size * 1.35))
 
 
 def _mask_centroid(
@@ -3387,6 +3528,82 @@ def _is_mask_anchored_art_dialogue_box(
     if white_paper_ratio >= 0.72:
         return False
     return True
+
+
+def _source_anchored_art_dialogue_box(
+    *,
+    region_mask: NDArray | None,
+    search_x: int,
+    search_y: int,
+    search_w: int,
+    search_h: int,
+    search_image: NDArray,
+    text: str,
+) -> tuple[int, int, int, int] | None:
+    """Build a render box anchored to the source glyphs for direct-to-art text.
+
+    Used when no balloon surface can be proven and the regular mask-anchored
+    box was rejected for growing beyond the source lettering lane.  The box
+    stays centred on the detected glyph cluster: narrow vertical Japanese
+    lanes get moderate horizontal room for wrapped English, horizontal blocks
+    get a small margin.  White paper neighbourhoods are rejected so a missed
+    speech balloon still falls through to the skip/restore path.
+    """
+    clean = " ".join(text.split())
+    if not clean or not re.search(r"[A-Za-z0-9]", clean):
+        return None
+    if region_mask is None or region_mask.shape[:2] != (search_h, search_w):
+        return None
+    if search_image is None or search_image.size == 0:
+        return None
+
+    if region_mask.max() > 1:
+        _, binary = cv2.threshold(region_mask, 127, 255, cv2.THRESH_BINARY)
+    else:
+        binary = (region_mask > 0).astype(np.uint8) * 255
+    if cv2.countNonZero(binary) < 30:
+        return None
+
+    bbox = _mask_bbox(binary)
+    if bbox is None:
+        return None
+    sx1, sy1, sx2, sy2 = bbox
+    source_w = max(1, sx2 - sx1)
+    source_h = max(1, sy2 - sy1)
+
+    vertical_lane = source_h > source_w * 1.25
+    if vertical_lane:
+        box_w = int(min(search_w, max(source_w * 2.3, source_w + 56, 120)))
+        box_h = int(min(search_h, max(source_h * 1.12, source_h + 10)))
+    else:
+        box_w = int(min(search_w, source_w * 1.15 + 16))
+        box_h = int(min(search_h, max(source_h * 1.35, source_h + 24)))
+    if box_w < 24 or box_h < 20 or box_w * box_h < 700:
+        return None
+
+    centroid = _mask_centroid(region_mask, search_w, search_h)
+    if centroid is not None:
+        ccx, ccy = centroid
+    else:
+        ccx, ccy = (sx1 + sx2) // 2, (sy1 + sy2) // 2
+    lx1 = int(np.clip(ccx - box_w // 2, 0, max(0, search_w - box_w)))
+    ly1 = int(np.clip(ccy - box_h // 2, 0, max(0, search_h - box_h)))
+
+    # Reject genuinely white balloon/paper interiors; direct-to-art placement
+    # is only safe on artwork.  Sample the ring around the source glyphs.
+    gray = cv2.cvtColor(search_image, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(search_image, cv2.COLOR_BGR2HSV)
+    near_mask = _mask_neighborhood_sample(binary, box_w=search_w, box_h=search_h)
+    sample = near_mask > 0 if near_mask is not None else np.ones(gray.shape, dtype=bool)
+    if not np.any(sample):
+        return None
+    white_paper_ratio = float(
+        np.mean((gray[sample] >= 242) & (hsv[:, :, 1][sample] <= 16))
+    )
+    if white_paper_ratio >= 0.72:
+        return None
+
+    return (search_x + lx1, search_y + ly1, int(box_w), int(box_h))
 
 
 def _neutral_surface_stats(
