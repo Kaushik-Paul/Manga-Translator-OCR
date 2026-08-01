@@ -849,17 +849,32 @@ def _build_local_render_context_region(
 
 
 def _crop_has_neutral_dialogue_surface(crop: np.ndarray) -> bool:
-    """Return True for white/grey speech-balloon-like local crops."""
+    """Return True for white/grey speech-balloon-like local crops.
+
+    White glyphs on coloured art (e.g. free-floating narration on purple) can
+    pull global saturation/gray statistics toward "neutral".  Require a real
+    paper-like bright interior instead of only low average saturation.
+    """
     if crop is None or crop.size == 0:
         return False
     if crop.shape[0] < 24 or crop.shape[1] < 24:
         return False
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    neutral_ratio = float(np.mean(hsv[:, :, 1] < 85))
-    median_sat = float(np.median(hsv[:, :, 1]))
-    mean_gray = float(np.mean(gray))
-    return neutral_ratio >= 0.72 and median_sat <= 70 and mean_gray >= 115
+    sat = hsv[:, :, 1]
+    bright_paper = (gray >= 198) & (sat <= 60)
+    paper_ratio = float(np.mean(bright_paper))
+    if paper_ratio >= 0.26:
+        paper_sat = float(np.median(sat[bright_paper])) if np.any(bright_paper) else 255.0
+        return paper_sat <= 55
+
+    # Pale grey balloons without pure-white fill.
+    mid_paper = (gray >= 155) & (gray < 198) & (sat <= 42)
+    mid_ratio = float(np.mean(mid_paper))
+    if mid_ratio >= 0.42:
+        return float(np.median(sat)) <= 48
+
+    return False
 
 
 def _build_translation_constraint(unit: RenderTextUnit) -> TranslationConstraint:
@@ -1029,18 +1044,24 @@ def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:
         merge_gap = max(merge_gap, int(max(region.w, region.h) * 0.05))
 
     if large_mixed_region:
-        bubble_text_boxes, remaining_boxes = _split_bright_bubble_text_groups(
-            region=region,
-            boxes=boxes,
-        )
-        sfx_boxes = _merge_nearby_boxes(remaining_boxes, gap=merge_gap)
-        merged_boxes = bubble_text_boxes + sfx_boxes
-        merged_boxes = _refine_oversized_ocr_groups(
-            merged_boxes=merged_boxes,
-            component_boxes=boxes,
-            region_w=region.w,
-            region_h=region.h,
-        )
+        if _crop_has_neutral_dialogue_surface(region.cropped):
+            bubble_text_boxes, remaining_boxes = _split_bright_bubble_text_groups(
+                region=region,
+                boxes=boxes,
+            )
+            sfx_boxes = _merge_nearby_boxes(remaining_boxes, gap=merge_gap)
+            merged_boxes = bubble_text_boxes + sfx_boxes
+            merged_boxes = _refine_oversized_ocr_groups(
+                merged_boxes=merged_boxes,
+                component_boxes=boxes,
+                region_w=region.w,
+                region_h=region.h,
+            )
+        else:
+            # Free-floating narration on coloured art: keep a tight merge so
+            # vertical columns remain separable downstream.
+            merge_gap = max(6, int(min(region.w, region.h) * 0.018))
+            merged_boxes = _merge_nearby_boxes(boxes, gap=merge_gap)
     elif not bright_bubble_region:
         merged_boxes = _merge_nearby_boxes(boxes, gap=merge_gap)
 
@@ -1690,7 +1711,7 @@ def _split_wide_vertical_text_columns(
         gx1, gy1, gx2, gy2 = group
         gw = gx2 - gx1
         gh = gy2 - gy1
-        if gw < 160 or gh < 140 or gw < int(gh * 0.38):
+        if gw < 110 or gh < 120 or gw < int(gh * 0.28):
             refined.append(group)
             continue
 
@@ -1707,14 +1728,14 @@ def _split_wide_vertical_text_columns(
                 >= int(max(1, (box[2] - box[0]) * (box[3] - box[1])) * 0.45)
             )
         ]
-        if len(members) < 4:
+        if len(members) < 3:
             refined.append(group)
             continue
 
         crop = region.cropped[gy1:gy2, gx1:gx2]
         # Prefer column split for free-floating narration on non-paper art.
-        # Bright speech balloons keep their merged phrase groups.
-        if _crop_has_neutral_dialogue_surface(crop) and gw < 320:
+        # Bright speech balloons keep their merged phrase groups even when wide.
+        if _crop_has_neutral_dialogue_surface(crop):
             refined.append(group)
             continue
 
@@ -1722,7 +1743,7 @@ def _split_wide_vertical_text_columns(
         widths = np.array([b[2] - b[0] for b in members], dtype=np.float32)
         median_w = float(np.median(widths)) if widths.size else 28.0
         # Histogram valleys between vertical Japanese columns.
-        hist_bins = max(12, int(gw // max(10, int(median_w * 0.55))))
+        hist_bins = max(14, int(gw // max(8, int(median_w * 0.45))))
         hist, edges = np.histogram(centers, bins=hist_bins, range=(gx1, gx2))
         if hist.size < 3:
             refined.append(group)
@@ -1731,8 +1752,8 @@ def _split_wide_vertical_text_columns(
         # Smooth lightly so single-glyph noise does not create fake valleys.
         kernel = np.array([1, 2, 1], dtype=np.float32)
         smooth = np.convolve(hist.astype(np.float32), kernel, mode="same")
-        peak_floor = max(1.5, float(np.max(smooth)) * 0.18)
-        valley_ceil = max(0.8, float(np.max(smooth)) * 0.12)
+        peak_floor = max(1.2, float(np.max(smooth)) * 0.15)
+        valley_ceil = max(0.6, float(np.max(smooth)) * 0.10)
 
         cut_xs: list[float] = []
         in_peak = False
@@ -1759,7 +1780,7 @@ def _split_wide_vertical_text_columns(
                     continue
                 col = columns[-1]
                 col_cx = float(np.median([(b[0] + b[2]) * 0.5 for b in col]))
-                if abs(cx - col_cx) <= max(16, min(42, median_w * 0.85)):
+                if abs(cx - col_cx) <= max(12, min(36, median_w * 0.75)):
                     col.append(box)
                 else:
                     columns.append([box])
@@ -1787,9 +1808,9 @@ def _split_wide_vertical_text_columns(
             y2 = max(b[3] for b in col)
             cw = x2 - x1
             ch = y2 - y1
-            if cw < 10 or ch < max(70, int(gh * 0.30)):
+            if cw < 8 or ch < max(55, int(gh * 0.22)):
                 continue
-            if ch < cw * 1.05 and cw > 100:
+            if ch < cw * 1.05 and cw > 90:
                 continue
             column_boxes.append((x1, y1, x2, y2))
 
@@ -1801,9 +1822,9 @@ def _split_wide_vertical_text_columns(
         gaps_ok = 0
         for left, right in zip(column_boxes, column_boxes[1:]):
             gap = right[0] - left[2]
-            if gap >= 4 or abs(
+            if gap >= 3 or abs(
                 ((left[0] + left[2]) * 0.5) - ((right[0] + right[2]) * 0.5)
-            ) >= max(24, median_w * 0.9):
+            ) >= max(18, median_w * 0.75):
                 gaps_ok += 1
         if gaps_ok == 0:
             refined.append(group)
@@ -1811,7 +1832,32 @@ def _split_wide_vertical_text_columns(
 
         refined.extend(column_boxes)
 
-    return refined
+    # Second pass: dense free-text blocks can still be wider than one column
+    # after the first valley split.  Re-run only on remaining wide non-paper
+    # groups so speech balloons are left alone.
+    if refined == merged_boxes:
+        return refined
+
+    second: list[tuple[int, int, int, int]] = []
+    changed = False
+    for group in refined:
+        gx1, gy1, gx2, gy2 = group
+        gw = gx2 - gx1
+        gh = gy2 - gy1
+        if gw < 95 or gh < 140:
+            second.append(group)
+            continue
+        crop = region.cropped[gy1:gy2, gx1:gx2]
+        if _crop_has_neutral_dialogue_surface(crop):
+            second.append(group)
+            continue
+        sub = _split_wide_vertical_text_columns([group], component_boxes, region)
+        if len(sub) >= 2:
+            second.extend(sub)
+            changed = True
+        else:
+            second.append(group)
+    return second if changed else refined
 
 
 def _split_adjacent_dialogue_clusters(
@@ -2518,6 +2564,11 @@ def _context_region_has_bright_bubble(region: TextRegion) -> bool:
         return False
     if region.w < 24 or region.h < 24:
         return False
+    # Free-floating white lettering on coloured art can look "bright" after
+    # closing, but it is not a speech balloon.  Require a paper-like surface
+    # first so purple/dark narration regions take the column-split path.
+    if not _crop_has_neutral_dialogue_surface(region.cropped):
+        return False
 
     gray = cv2.cvtColor(region.cropped, cv2.COLOR_BGR2GRAY)
     if gray.size == 0:
@@ -2537,21 +2588,28 @@ def _context_region_has_bright_bubble(region: TextRegion) -> bool:
     hsv = cv2.cvtColor(region.cropped, cv2.COLOR_BGR2HSV)
 
     context_area = max(1, region.w * region.h)
+    # Multi-bubble parents are mostly art; each balloon is a small fraction of
+    # the crop.  Once the surface is confirmed paper-like, accept compact
+    # bright components instead of requiring panel-scale fill.
+    min_area = max(500, int(context_area * (0.035 if context_area >= 120_000 else 0.12)))
+    min_bbox = int(context_area * (0.03 if context_area >= 120_000 else 0.10))
     for label in range(1, num_labels):
         w = int(stats[label, cv2.CC_STAT_WIDTH])
         h = int(stats[label, cv2.CC_STAT_HEIGHT])
         area = int(stats[label, cv2.CC_STAT_AREA])
         bbox_area = max(1, w * h)
         fill_ratio = area / float(bbox_area)
-        if area < max(500, int(context_area * 0.12)):
+        if area < min_area:
             continue
-        if bbox_area < int(context_area * 0.10):
+        if bbox_area < min_bbox:
+            continue
+        if w < 36 or h < 36:
             continue
         component_mask = _labels == label
         mean_sat = float(np.mean(hsv[:, :, 1][component_mask]))
         if mean_sat > 55:
             continue
-        if fill_ratio >= 0.50:
+        if fill_ratio >= 0.42:
             return True
     return False
 

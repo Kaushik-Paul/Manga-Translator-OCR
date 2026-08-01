@@ -388,7 +388,7 @@ def _complete_inpaint_mask(region: NDArray, mask: NDArray) -> NDArray:
     x1, y1, x2, y2 = bbox
     text_span = max(1, min(x2 - x1, y2 - y1))
 
-    close_k = _odd(int(np.clip(round(text_span * 0.035), 3, 9)))
+    close_k = _odd(int(np.clip(round(text_span * 0.045), 3, 11)))
     binary = cv2.morphologyEx(
         binary,
         cv2.MORPH_CLOSE,
@@ -396,7 +396,7 @@ def _complete_inpaint_mask(region: NDArray, mask: NDArray) -> NDArray:
         iterations=1,
     )
 
-    dilate_k = _odd(int(np.clip(round(text_span * 0.13), 5, 21)))
+    dilate_k = _odd(int(np.clip(round(text_span * 0.16), 5, 25)))
     expanded = cv2.dilate(
         binary,
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_k, dilate_k)),
@@ -404,22 +404,49 @@ def _complete_inpaint_mask(region: NDArray, mask: NDArray) -> NDArray:
     )
 
     paper_color = _paper_fill_color(region, expanded)
-    if paper_color is None:
-        return expanded
-
-    # If a detector mask misses antialiased outlines around the glyph, capture
-    # nearby pixels whose colour differs from the local paper surface.
-    near_k = _odd(int(np.clip(round(text_span * 0.28), 9, 39)))
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    near_k = _odd(int(np.clip(round(text_span * 0.32), 9, 45)))
     near_text = cv2.dilate(
         binary,
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (near_k, near_k)),
         iterations=1,
     )
-    diff = np.linalg.norm(region.astype(np.int16) - paper_color.astype(np.int16), axis=2)
-    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-    ink_like = ((diff > 34) | (gray < 185)).astype(np.uint8) * 255
-    halo = cv2.bitwise_and(near_text, ink_like)
-    completed = cv2.bitwise_or(expanded, halo)
+
+    if paper_color is not None:
+        # If a detector mask misses antialiased outlines around the glyph, capture
+        # nearby pixels whose colour differs from the local paper surface.
+        diff = np.linalg.norm(
+            region.astype(np.int16) - paper_color.astype(np.int16),
+            axis=2,
+        )
+        ink_like = ((diff > 28) | (gray < 195)).astype(np.uint8) * 255
+        halo = cv2.bitwise_and(near_text, ink_like)
+        completed = cv2.bitwise_or(expanded, halo)
+    else:
+        # Free-floating white/black lettering on art: grow toward high-contrast
+        # ink near the detector mask so leftover glyph fragments are erased.
+        local = gray[y1:y2, x1:x2]
+        if local.size == 0:
+            return expanded
+        local_mean = float(np.mean(local))
+        if local_mean < 140:
+            # White/light glyphs on dark art.
+            ink_like = (gray >= max(165, int(local_mean + 45))).astype(np.uint8) * 255
+        else:
+            # Dark glyphs on mid/bright art.
+            ink_like = (gray <= min(140, int(local_mean - 35))).astype(np.uint8) * 255
+        halo = cv2.bitwise_and(near_text, ink_like)
+        # Keep halo from eating large art regions: only accept components that
+        # touch the original detector mask.
+        halo = cv2.bitwise_and(
+            halo,
+            cv2.dilate(
+                binary,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_k, dilate_k)),
+                iterations=1,
+            ),
+        )
+        completed = cv2.bitwise_or(expanded, halo)
 
     return cv2.morphologyEx(
         completed,
@@ -2042,7 +2069,8 @@ def _extract_bright_paper_bubble_mask(
     gray = cv2.cvtColor(region_image, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(region_image, cv2.COLOR_BGR2HSV)
     # Prefer very bright low-sat paper so skin/highlights do not merge into the
-    # balloon component on close-up panels.
+    # balloon component on close-up panels.  For jagged balloons, also try a
+    # slightly lower threshold so spike valleys still connect into one body.
     thr = int(np.clip(np.percentile(gray, 88), 220, 245))
     bright = ((gray >= thr) & (hsv[:, :, 1] < 55)).astype(np.uint8) * 255
     bright = cv2.morphologyEx(
@@ -2057,6 +2085,21 @@ def _extract_bright_paper_bubble_mask(
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
         iterations=1,
     )
+    if cv2.countNonZero(bright) < max(400, int(h * w * 0.02)):
+        thr2 = int(np.clip(np.percentile(gray, 78), 200, 235))
+        bright = ((gray >= thr2) & (hsv[:, :, 1] < 60)).astype(np.uint8) * 255
+        bright = cv2.morphologyEx(
+            bright,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+            iterations=2,
+        )
+        bright = cv2.morphologyEx(
+            bright,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            iterations=1,
+        )
 
     text_info = _text_mask_geometry(region_mask, w, h)
     if text_info is None:
@@ -2065,29 +2108,37 @@ def _extract_bright_paper_bubble_mask(
     gw = max(1, tx2 - tx1)
     gh = max(1, ty2 - ty1)
     text_area = max(1, gw * gh)
+    # Expanded render contexts often carry sparse detector ink far beyond the
+    # true glyph cluster. Cap the area prior so compact jagged balloons are not
+    # rejected as "too small" relative to a bloated text bbox.
+    region_area = max(1, h * w)
+    if text_area > int(region_area * 0.45):
+        text_area = max(900, int(region_area * 0.18))
+        gw = max(gw, int(np.sqrt(text_area * 0.55)))
+        gh = max(gh, int(np.sqrt(text_area * 1.45)))
 
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bright, 8)
     best: NDArray | None = None
     best_score = -1e9
-    region_area = max(1, h * w)
     for label in range(1, num_labels):
         x = int(stats[label, cv2.CC_STAT_LEFT])
         y = int(stats[label, cv2.CC_STAT_TOP])
         bw = int(stats[label, cv2.CC_STAT_WIDTH])
         bh = int(stats[label, cv2.CC_STAT_HEIGHT])
         area = int(stats[label, cv2.CC_STAT_AREA])
-        if area < max(500, int(text_area * 1.2)):
+        if area < max(400, int(text_area * 0.55)):
             continue
         if bw < 28 or bh < 28:
             continue
         bbox_area = max(1, bw * bh)
-        if bbox_area > int(region_area * 0.72):
+        if bbox_area > int(region_area * 0.78):
             continue
         fill = area / float(bbox_area)
-        if fill < 0.36:
+        # Jagged balloons have lower fill than ovals; still reject wispy noise.
+        if fill < 0.28:
             continue
-        oversize = max(bw / float(gw), bh / float(gh))
-        if oversize > 3.8:
+        oversize = max(bw / float(max(1, gw)), bh / float(max(1, gh)))
+        if oversize > 4.5:
             continue
 
         component = (labels == label).astype(np.uint8) * 255
@@ -2100,7 +2151,7 @@ def _extract_bright_paper_bubble_mask(
             * max(0, min(ty2, y + bh) - max(ty1, y))
         )
         inside = x - 2 <= tcx <= x + bw + 2 and y - 2 <= tcy <= y + bh + 2
-        if not inside and overlap < int(text_area * 0.20):
+        if not inside and overlap < int(text_area * 0.12):
             continue
 
         cx = x + bw * 0.5
@@ -2109,6 +2160,8 @@ def _extract_bright_paper_bubble_mask(
         score = overlap * 10.0 + area * 0.02 - dist * 1.5 - oversize * 40.0
         if inside:
             score += 2500.0
+        # Prefer compact balloon bodies over panel-scale white leaks.
+        score += fill * 180.0
         if score > best_score:
             best_score = score
             best = component
@@ -2155,9 +2208,18 @@ def _extract_bubble_mask(
             _, seed_block = cv2.threshold(region_mask, 127, 255, cv2.THRESH_BINARY)
         else:
             seed_block = (region_mask > 0).astype(np.uint8) * 255
+        # Only block the dense glyph core. Dilating a sparse/page-wide detector
+        # mask would cover the entire balloon interior and leave no flood seeds.
+        core = cv2.erode(
+            seed_block.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            iterations=1,
+        )
+        if cv2.countNonZero(core) >= max(24, int(cv2.countNonZero(seed_block) * 0.25)):
+            seed_block = core
         blocked_seed_mask = cv2.dilate(
             seed_block.astype(np.uint8),
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
             iterations=1,
         )
 
@@ -2415,8 +2477,62 @@ def _prepare_bubble_render_mask(mask: NDArray) -> NDArray | None:
         iterations=1,
     )
     if cv2.countNonZero(eroded) >= max(120, int(comp_area * 0.35)):
-        return eroded
-    return mask.astype(np.uint8)
+        prepared = eroded
+    else:
+        prepared = mask.astype(np.uint8)
+
+    # Jagged / burst balloons have deep spike valleys that inflate the mask
+    # bbox.  Drop top/bottom tip rows that are much narrower than the body so
+    # vertical centering stays in the readable interior instead of sitting on
+    # the spikes.
+    return _trim_jagged_mask_tips(prepared)
+
+
+def _trim_jagged_mask_tips(mask: NDArray) -> NDArray:
+    """Remove narrow spike-tip rows from a bubble mask before text layout."""
+    if mask.size == 0:
+        return mask
+    binary = (mask > 0).astype(np.uint8) * 255
+    widths = binary.sum(axis=1) // 255
+    active = np.where(widths > 0)[0]
+    if active.size < 24:
+        return binary
+
+    body_widths = widths[active]
+    body_thr = max(12, int(np.percentile(body_widths, 35)))
+    # Only treat clearly-narrow tip rows as spikes; jagged valleys mid-balloon
+    # should not fragment the usable vertical range.
+    tip_thr = max(8, int(body_thr * 0.45))
+    tip_rows = widths < tip_thr
+
+    y0 = int(active[0])
+    y1 = int(active[-1])
+    # Trim contiguous tip rows only from the ends, capped so we never discard
+    # most of the balloon body.
+    max_trim = max(4, int(active.size * 0.14))
+    top_trim = 0
+    while y0 + top_trim <= y1 and tip_rows[y0 + top_trim] and top_trim < max_trim:
+        top_trim += 1
+    bottom_trim = 0
+    while y1 - bottom_trim >= y0 and tip_rows[y1 - bottom_trim] and bottom_trim < max_trim:
+        bottom_trim += 1
+
+    if top_trim == 0 and bottom_trim == 0:
+        return binary
+
+    new_y0 = y0 + top_trim
+    new_y1 = y1 - bottom_trim
+    if new_y1 - new_y0 + 1 < max(16, int(active.size * 0.55)):
+        return binary
+
+    trimmed = binary.copy()
+    if top_trim:
+        trimmed[:new_y0, :] = 0
+    if bottom_trim:
+        trimmed[new_y1 + 1 :, :] = 0
+    if cv2.countNonZero(trimmed) < max(120, int(cv2.countNonZero(binary) * 0.55)):
+        return binary
+    return trimmed
 
 
 def _mask_bbox(mask: NDArray) -> tuple[int, int, int, int] | None:
@@ -2803,10 +2919,14 @@ def _bubble_mask_has_paper_surface(
     bbox_area = max(1, (bx2 - bx1) * (by2 - by1))
     edge_touches = int(bx1 <= 1) + int(by1 <= 1)
     edge_touches += int(bx2 >= bw - 1) + int(by2 >= bh - 1)
+    # Edge-touching panel leaks are usually dull grey.  Bright paper balloons
+    # clipped by the render context (common for jagged corner balloons) remain
+    # valid even when they touch two crop edges.
     if (
         edge_touches >= 2
         and bbox_area > int(bw * bh * 0.45)
         and mean_gray < 232
+        and paper_ratio < 0.55
     ):
         return False
 
@@ -4628,12 +4748,17 @@ def _candidate_mask_start_ys(centered: int, padding: int, slack: int) -> list[in
     """Return centered-first vertical starts within the available text slack."""
     low = int(padding)
     high = int(padding + max(0, slack))
+    # Prefer a touch above geometric center: jagged balloon tips are usually
+    # deeper at the bottom, so a slight upward bias reduces spill into spikes.
+    preferred = int(np.clip(centered - min(8, max(0, slack // 5)), low, high))
     centered = int(np.clip(centered, low, high))
-    values = [centered]
+    values = [preferred]
+    if centered not in values:
+        values.append(centered)
     for delta in (4, -4, 8, -8, 12, -12, 18, -18, 24, -24):
         if abs(delta) > slack + 1:
             continue
-        cand = int(np.clip(centered + delta, low, high))
+        cand = int(np.clip(preferred + delta, low, high))
         if cand not in values:
             values.append(cand)
     for cand in (low, high):
