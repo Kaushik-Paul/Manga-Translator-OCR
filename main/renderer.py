@@ -557,33 +557,19 @@ def render_text_on_image(
     search_x, search_y, search_w, search_h = x, y, w, h
     search_region_image = region_slice
     search_region_mask = region_mask
-    if allow_bubble_expansion and w < 100 and h > w * 1.35 and text_style == "dialogue":
-        # Vertical Japanese often occupies only the right/left lane of a much
-        # wider balloon.  Expand far enough horizontally to recover the oval
-        # outline; otherwise text is centered in the glyph lane and spills out
-        # the near edge while the far side of the balloon stays empty.
-        pad_x = min(max(int(w * 1.15), 36), 90)
-        pad_y = min(max(int(h * 0.08), 8), 28)
+    if allow_bubble_expansion and w < 80 and h > w * 1.5 and text_style == "dialogue":
+        pad_x = min(max(int(w * 0.55), 20), 40)
         sx1 = max(0, x - pad_x)
-        sy1 = max(0, y - pad_y)
         sx2 = min(result.shape[1], x + w + pad_x)
-        sy2 = min(result.shape[0], y + h + pad_y)
-        search_x, search_y = sx1, sy1
-        search_w, search_h = sx2 - sx1, sy2 - sy1
+        search_x, search_y = sx1, y
+        search_w, search_h = sx2 - sx1, h
         search_region_image = result[search_y : search_y + search_h, search_x : search_x + search_w]
         if region_mask is not None and region_mask.shape[:2] == (h, w):
             padded_mask = np.zeros((search_h, search_w), dtype=np.uint8)
             offset_x = x - search_x
-            offset_y = y - search_y
-            mask_u8 = (
-                region_mask.astype(np.uint8)
-                if region_mask.max() <= 1
-                else (region_mask > 0).astype(np.uint8) * 255
+            padded_mask[:, offset_x : offset_x + w] = (
+                region_mask.astype(np.uint8) if region_mask.max() <= 1 else (region_mask > 0).astype(np.uint8) * 255
             )
-            padded_mask[
-                offset_y : offset_y + h,
-                offset_x : offset_x + w,
-            ] = mask_u8
             search_region_mask = padded_mask
         else:
             search_region_mask = None
@@ -661,7 +647,7 @@ def render_text_on_image(
                 # ends; drawing into that rectangle is the main source of text
                 # spilling across balloon outlines. Direct-to-art narration is
                 # a separate, source-anchored case and remains supported.
-                art_ok = _is_mask_anchored_art_dialogue_box(
+                if not _is_mask_anchored_art_dialogue_box(
                     region_image=result[box_y : box_y + box_h, box_x : box_x + box_w],
                     region_mask=search_region_mask,
                     search_x=search_x,
@@ -671,38 +657,7 @@ def render_text_on_image(
                     box_w=box_w,
                     box_h=box_h,
                     text=text,
-                )
-                if not art_ok:
-                    # Oversized fallback boxes (merged vertical columns / padded
-                    # contexts) fail the art-lane check even when the source
-                    # glyph mask itself is a valid free-text lane.  Shrink to
-                    # the mask bbox and retry before giving up.
-                    shrunk = _shrink_box_to_source_mask(
-                        region_mask=search_region_mask,
-                        search_x=search_x,
-                        search_y=search_y,
-                        box_x=box_x,
-                        box_y=box_y,
-                        box_w=box_w,
-                        box_h=box_h,
-                    )
-                    if shrunk is not None:
-                        box_x, box_y, box_w, box_h = shrunk
-                        art_ok = _is_mask_anchored_art_dialogue_box(
-                            region_image=result[
-                                box_y : box_y + box_h,
-                                box_x : box_x + box_w,
-                            ],
-                            region_mask=search_region_mask,
-                            search_x=search_x,
-                            search_y=search_y,
-                            box_x=box_x,
-                            box_y=box_y,
-                            box_w=box_w,
-                            box_h=box_h,
-                            text=text,
-                        )
-                if not art_ok:
+                ):
                     return _skip_render("no safe non-bubble surface")
                 mask_anchored_dialogue_box = True
             else:
@@ -751,7 +706,7 @@ def render_text_on_image(
     text = _sanitize_for_font(text, font_file)
 
     if text_style == "dialogue":
-        text_padding = max(5, int(round(min(box_w, box_h) * 0.06)), padding)
+        text_padding = max(4, int(round(min(box_w, box_h) * 0.05)), padding - 1)
     else:
         text_padding = max(1, padding - 4)
     avail_w = box_w - 2 * text_padding
@@ -783,12 +738,11 @@ def render_text_on_image(
     if box_clip_mask is not None:
         effective_w = _effective_mask_text_width(box_clip_mask)
         if effective_w > 14:
-            # Trust the interior mask width.  Previously we refused to shrink
-            # below 80% of the rectangular box, which let oval/jagged balloons
-            # keep a wrap width wider than their outline and spill on the sides.
+            # Only narrow if the mask is meaningfully narrower than the box.
+            # Use a relaxed threshold (0.80) so oval bubbles keep more width.
             mask_avail = max(10, effective_w - 2 * text_padding)
-            if mask_avail < avail_w:
-                avail_w = int(mask_avail)
+            if mask_avail < avail_w * 0.80:
+                avail_w = int(max(avail_w * 0.80, mask_avail))
     if avail_w <= 10 or avail_h <= 10:
         return _skip_render("no available text area")
 
@@ -822,12 +776,6 @@ def render_text_on_image(
         if contrast_ratio >= 40:  # Minimum perceptual contrast
             if not (text_style == "dialogue" and text_chroma > 45 and text_luma > 55):
                 render_color = text_color
-    # Free-floating narration on dark art is almost always white with a dark
-    # outline in doujinshi. Prefer that look when the mask-anchored art path
-    # was selected and the local crop is clearly dark.
-    if mask_anchored_dialogue_box and mean_brightness < 130:
-        render_color = (255, 255, 255)
-        outline_color = (0, 0, 0)
 
     # Auto-size font to fit
     max_size_cap = None
@@ -1248,42 +1196,9 @@ def render_text_on_image(
                 x_anchor=x_anchor,
             )
             if refit is None:
-                # Last chance: shorten the dialogue until a readable mask-safe
-                # layout exists.  Prefer a compact English line over restoring
-                # the original Japanese inside an already-inpainted balloon.
-                shortened = _fit_shortened_dialogue_to_bubble_mask(
-                    draw=draw,
-                    text=text,
-                    font_path=font_file,
-                    avail_w=avail_w,
-                    avail_h=avail_h,
-                    mask=box_clip_mask,
-                    text_padding=text_padding,
-                    min_size=_DIALOGUE_MIN_SIZE,
-                    max_size=max(_DIALOGUE_MIN_SIZE, getattr(font, "size", _DIALOGUE_MIN_SIZE)),
-                    max_lines=_DIALOGUE_MAX_LINES,
-                )
-                if shortened is None:
-                    return _skip_render("dialogue clipped by bubble mask")
-                font, lines, line_spacing, line_metrics, local_start_y, text = shortened
-                stroke_width = _stroke_width_for_font(font)
-                start_y = box_y + local_start_y
-                line_positions = _place_dialogue_lines_in_mask(
-                    lines=lines,
-                    line_metrics=line_metrics,
-                    line_spacing=line_spacing,
-                    start_y=start_y,
-                    box_x=box_x,
-                    box_y=box_y,
-                    x_anchor=x_anchor,
-                    avail_w=avail_w,
-                    mask=box_clip_mask,
-                ) or []
-                if not line_positions:
-                    return _skip_render("dialogue clipped by bubble mask")
-            else:
-                font, lines, line_spacing, line_metrics, start_y, line_positions = refit
-                stroke_width = _stroke_width_for_font(font)
+                return _skip_render("dialogue clipped by bubble mask")
+            font, lines, line_spacing, line_metrics, start_y, line_positions = refit
+            stroke_width = _stroke_width_for_font(font)
     else:
         current_y = start_y
         for lw, lh, left, top in line_metrics:
@@ -1330,17 +1245,11 @@ def render_text_on_image(
     # Final placement sanity: dialogue ink must land on a surface that
     # contrasts with it.  This catches translations spilled onto dark artwork
     # (black text) or washed into white areas (white text) when no reliable
-    # bubble mask constrained the draw.  Mask-anchored free-text narration is
-    # exempt because its lane is already detector-proven and often sits on
-    # mid-tone illustrated backgrounds.
-    if (
-        text_style == "dialogue"
-        and not mask_anchored_dialogue_box
-        and not _dialogue_render_has_contrast(
-            rendered=rendered,
-            base=image,
-            render_color=render_color,
-        )
+    # bubble mask constrained the draw.
+    if text_style == "dialogue" and not _dialogue_render_has_contrast(
+        rendered=rendered,
+        base=image,
+        render_color=render_color,
     ):
         return _skip_render("dialogue placed on non-contrasting surface")
 
@@ -1364,13 +1273,11 @@ def _dialogue_render_has_contrast(
     ink_luma = 0.299 * r + 0.587 * g + 0.114 * b
     if ink_luma < 128:
         # Dark ink: a meaningful share of the background must be light.
-        bad_fraction = float(np.mean(bg_vals < 110))
+        bad_fraction = float(np.mean(bg_vals < 120))
     else:
         # Light ink: a meaningful share of the background must be dark.
-        # Psychedelic/purple narration panels are mid-dark; avoid rejecting
-        # valid white lettering on those surfaces.
-        bad_fraction = float(np.mean(bg_vals > 165))
-    return bad_fraction <= 0.32
+        bad_fraction = float(np.mean(bg_vals > 140))
+    return bad_fraction <= 0.25
 
 
 def _place_dialogue_lines_in_mask(
@@ -1648,11 +1555,6 @@ def _resolve_dialogue_box(
         if bubble_mask is not None:
             break
     if bubble_mask is None:
-        bubble_mask = _extract_bright_paper_bubble_mask(
-            region_image=region_image,
-            region_mask=region_mask,
-        )
-    if bubble_mask is None:
         for anchor in anchors:
             bubble_box = _estimate_bubble_box(region_image=region_image, anchor=anchor)
             if bubble_box is None:
@@ -1684,26 +1586,6 @@ def _resolve_dialogue_box(
     )
     if bubble_mask is None:
         return _fallback_result()
-
-    # Flood-fill can leak through jagged spikes into a panel-scale white area.
-    # If the accepted mask dwarfs the glyph cluster, prefer a compact bright
-    # paper component instead of rendering into that leaked region.
-    text_info = _text_mask_geometry(region_mask, w, h)
-    bubble_bbox = _mask_bbox(bubble_mask)
-    if text_info is not None and bubble_bbox is not None:
-        (tx1, ty1, tx2, ty2), _ = text_info
-        bx1, by1, bx2, by2 = bubble_bbox
-        gw = max(1, tx2 - tx1)
-        gh = max(1, ty2 - ty1)
-        bw = max(1, bx2 - bx1)
-        bh = max(1, by2 - by1)
-        if max(bw / float(gw), bh / float(gh)) > 3.0:
-            paper = _extract_bright_paper_bubble_mask(
-                region_image=region_image,
-                region_mask=region_mask,
-            )
-            if paper is not None:
-                bubble_mask = paper
 
     bubble_mask = _trim_bubble_mask_at_outline(
         bubble_mask=bubble_mask,
@@ -2024,98 +1906,6 @@ def _mask_centroid(
     return (int(np.mean(xs)), int(np.mean(ys)))
 
 
-def _extract_bright_paper_bubble_mask(
-    region_image: NDArray,
-    region_mask: NDArray | None = None,
-) -> NDArray | None:
-    """Find a compact bright speech-balloon component near the OCR glyphs.
-
-    Flood-fill often leaks through jagged balloon spikes into surrounding art.
-    Connected bright-paper components stay closer to the true balloon body.
-    """
-    if region_image is None or region_image.size == 0:
-        return None
-    h, w = region_image.shape[:2]
-    if h < 24 or w < 24:
-        return None
-
-    gray = cv2.cvtColor(region_image, cv2.COLOR_BGR2GRAY)
-    hsv = cv2.cvtColor(region_image, cv2.COLOR_BGR2HSV)
-    # Prefer very bright low-sat paper so skin/highlights do not merge into the
-    # balloon component on close-up panels.
-    thr = int(np.clip(np.percentile(gray, 88), 220, 245))
-    bright = ((gray >= thr) & (hsv[:, :, 1] < 55)).astype(np.uint8) * 255
-    bright = cv2.morphologyEx(
-        bright,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
-        iterations=2,
-    )
-    bright = cv2.morphologyEx(
-        bright,
-        cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
-        iterations=1,
-    )
-
-    text_info = _text_mask_geometry(region_mask, w, h)
-    if text_info is None:
-        return None
-    (tx1, ty1, tx2, ty2), (tcx, tcy) = text_info
-    gw = max(1, tx2 - tx1)
-    gh = max(1, ty2 - ty1)
-    text_area = max(1, gw * gh)
-
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bright, 8)
-    best: NDArray | None = None
-    best_score = -1e9
-    region_area = max(1, h * w)
-    for label in range(1, num_labels):
-        x = int(stats[label, cv2.CC_STAT_LEFT])
-        y = int(stats[label, cv2.CC_STAT_TOP])
-        bw = int(stats[label, cv2.CC_STAT_WIDTH])
-        bh = int(stats[label, cv2.CC_STAT_HEIGHT])
-        area = int(stats[label, cv2.CC_STAT_AREA])
-        if area < max(500, int(text_area * 1.2)):
-            continue
-        if bw < 28 or bh < 28:
-            continue
-        bbox_area = max(1, bw * bh)
-        if bbox_area > int(region_area * 0.72):
-            continue
-        fill = area / float(bbox_area)
-        if fill < 0.36:
-            continue
-        oversize = max(bw / float(gw), bh / float(gh))
-        if oversize > 3.8:
-            continue
-
-        component = (labels == label).astype(np.uint8) * 255
-        mean_sat = float(np.mean(hsv[:, :, 1][component > 0]))
-        if mean_sat > 48:
-            continue
-
-        overlap = (
-            max(0, min(tx2, x + bw) - max(tx1, x))
-            * max(0, min(ty2, y + bh) - max(ty1, y))
-        )
-        inside = x - 2 <= tcx <= x + bw + 2 and y - 2 <= tcy <= y + bh + 2
-        if not inside and overlap < int(text_area * 0.20):
-            continue
-
-        cx = x + bw * 0.5
-        cy = y + bh * 0.5
-        dist = abs(cx - tcx) + abs(cy - tcy)
-        score = overlap * 10.0 + area * 0.02 - dist * 1.5 - oversize * 40.0
-        if inside:
-            score += 2500.0
-        if score > best_score:
-            best_score = score
-            best = component
-
-    return best
-
-
 def _extract_bubble_mask(
     region_image: NDArray,
     anchor: tuple[int, int],
@@ -2283,12 +2073,6 @@ def _bubble_fill_score(
     compactness = comp_area / float(bw * bh)
     score = compactness * 2.0
 
-    touch_l = bx1 <= 1
-    touch_r = bx2 >= region_w - 1
-    touch_t = by1 <= 1
-    touch_b = by2 >= region_h - 1
-    touches = int(touch_l) + int(touch_r) + int(touch_t) + int(touch_b)
-
     text_info = _text_mask_geometry(region_mask, region_w, region_h)
     if text_info is not None:
         (tx1, ty1, tx2, ty2), _ = text_info
@@ -2313,16 +2097,12 @@ def _bubble_fill_score(
         oversize = max(bw / float(gw), bh / float(gh))
         if oversize > 2.0:
             score -= (oversize - 2.0) * 1.5
-        # Hard-reject panel-scale fills even when they contain the glyphs.
-        # Jagged balloons often leak into surrounding bright art; containment
-        # alone is not enough to trust those fills.
-        if oversize > 2.8:
-            return -1e9
-        if (bw * bh) > int(region_w * region_h * 0.60) and touches >= 1:
-            return -1e9
-        if (bw * bh) > int(gw * gh * 6.0) and touches >= 2:
-            return -1e9
 
+    touch_l = bx1 <= 1
+    touch_r = bx2 >= region_w - 1
+    touch_t = by1 <= 1
+    touch_b = by2 >= region_h - 1
+    touches = int(touch_l) + int(touch_r) + int(touch_t) + int(touch_b)
     score -= touches * 1.0
     if (touch_l and touch_r) or (touch_t and touch_b):
         score -= 3.0
@@ -2408,7 +2188,7 @@ def _prepare_bubble_render_mask(mask: NDArray) -> NDArray | None:
     if comp_area < 180:
         return None
 
-    k = _odd(max(7, int(round(np.sqrt(comp_area) / 48))))
+    k = _odd(max(5, int(round(np.sqrt(comp_area) / 52))))
     eroded = cv2.erode(
         mask.astype(np.uint8),
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)),
@@ -3535,55 +3315,6 @@ def _is_neutral_mask_anchored_dialogue_box(
     )
 
 
-def _shrink_box_to_source_mask(
-    *,
-    region_mask: NDArray | None,
-    search_x: int,
-    search_y: int,
-    box_x: int,
-    box_y: int,
-    box_w: int,
-    box_h: int,
-) -> tuple[int, int, int, int] | None:
-    """Tighten an oversized fallback box to the detector glyph lane."""
-    if region_mask is None or region_mask.size == 0:
-        return None
-    mask_h, mask_w = region_mask.shape[:2]
-    lx1 = int(box_x - search_x)
-    ly1 = int(box_y - search_y)
-    lx2 = lx1 + int(box_w)
-    ly2 = ly1 + int(box_h)
-    if lx1 < 0 or ly1 < 0 or lx2 > mask_w or ly2 > mask_h:
-        return None
-
-    local = region_mask[ly1:ly2, lx1:lx2]
-    binary = (local > 0).astype(np.uint8) * 255
-    if cv2.countNonZero(binary) < 24:
-        return None
-    bbox = _mask_bbox(binary)
-    if bbox is None:
-        return None
-    sx1, sy1, sx2, sy2 = bbox
-    pad_x = max(4, int((sx2 - sx1) * 0.18))
-    pad_y = max(4, int((sy2 - sy1) * 0.08))
-    nx1 = max(0, sx1 - pad_x)
-    ny1 = max(0, sy1 - pad_y)
-    nx2 = min(box_w, sx2 + pad_x)
-    ny2 = min(box_h, sy2 + pad_y)
-    if nx2 - nx1 < 20 or ny2 - ny1 < 20:
-        return None
-    # Always prefer the glyph lane when it is narrower or shorter than the
-    # fallback box; free-floating narration often lands in an oversized crop.
-    if (nx2 - nx1) >= box_w and (ny2 - ny1) >= int(box_h * 0.92):
-        return None
-    return (
-        int(box_x + nx1),
-        int(box_y + ny1),
-        int(nx2 - nx1),
-        int(ny2 - ny1),
-    )
-
-
 def _is_mask_anchored_art_dialogue_box(
     *,
     region_image: NDArray,
@@ -3634,9 +3365,9 @@ def _is_mask_anchored_art_dialogue_box(
     # Vertical Japanese occupies a much narrower lane than wrapped English.
     # Permit moderate horizontal growth for direct-to-art narration while
     # retaining a hard cap so a panel-wide detector box can never qualify.
-    if box_w > max(120, min(280, int(source_w * 5.0))):
+    if box_w > max(90, min(190, int(source_w * 3.75))):
         return False
-    if box_h > max(140, int(source_h * 2.80)):
+    if box_h > max(80, int(source_h * 2.10)):
         return False
 
     gray = cv2.cvtColor(region_image, cv2.COLOR_BGR2GRAY)
@@ -4322,9 +4053,9 @@ def _effective_mask_text_width(mask: NDArray) -> int:
     widths = widths[widths > 0]
     if widths.size == 0:
         return 0
-    # Use 55th percentile so oval balloons report a width closer to their
-    # true interior rather than the wide middle bulge alone.
-    return int(np.percentile(widths, 55))
+    # Use 75th percentile instead of 45th to preserve more usable width,
+    # since text is centered and most lines sit in the wider middle of a bubble.
+    return int(np.percentile(widths, 75))
 
 
 def _mask_band_span(mask: NDArray, y: int, line_h: int, line_w: int) -> tuple[int, int, int] | None:
@@ -4354,14 +4085,14 @@ def _mask_band_span(mask: NDArray, y: int, line_h: int, line_w: int) -> tuple[in
     right_values = np.array(row_right)
 
     # Use an inner span instead of the widest visible row.  Manga balloons often
-    # curve sharply near the top/bottom; keep the usable band clearly inside the
-    # outline so centered lines do not visually spill.
-    left = int(np.percentile(left_values, 60))
-    right = int(np.percentile(right_values, 40))
+    # curve sharply near the top/bottom; the previous 25/75 percentile span let
+    # a line pass if only a few rows were wide enough, which caused edge spills.
+    left = int(np.percentile(left_values, 55))
+    right = int(np.percentile(right_values, 45))
     avail = right - left + 1
     if avail < max(8, int(line_w * 0.60)):
-        left = int(np.percentile(left_values, 45))
-        right = int(np.percentile(right_values, 55))
+        left = int(np.percentile(left_values, 40))
+        right = int(np.percentile(right_values, 60))
         avail = right - left + 1
 
     if avail <= 6:
