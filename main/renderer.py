@@ -1703,14 +1703,30 @@ def _resolve_dialogue_box(
                 continue
             break
         if bubble_mask is None:
-            return _fallback_result()
+            paper_caption = _extract_rectangular_paper_caption_mask(
+                region_image=region_image,
+                region_mask=region_mask,
+            )
+            if paper_caption is not None:
+                bubble_mask = paper_caption
+            else:
+                return _fallback_result()
 
     bubble_mask = _isolate_bubble_lobe_near_text(
         bubble_mask=bubble_mask,
         region_mask=region_mask,
     )
     if bubble_mask is None:
-        return _fallback_result()
+        # Rectangular narration/caption boxes are often missed by flood-fill and
+        # oval balloon heuristics.  Recover a compact bright-paper mask around
+        # the OCR glyphs before falling back to the guarded non-bubble path.
+        paper_caption = _extract_rectangular_paper_caption_mask(
+            region_image=region_image,
+            region_mask=region_mask,
+        )
+        if paper_caption is None:
+            return _fallback_result()
+        bubble_mask = paper_caption
 
     # Flood-fill can leak through jagged spikes into a panel-scale white area.
     # If the accepted mask dwarfs the glyph cluster, prefer a compact bright
@@ -2049,6 +2065,98 @@ def _mask_centroid(
     if len(xs) < 20:
         return None
     return (int(np.mean(xs)), int(np.mean(ys)))
+
+
+def _extract_rectangular_paper_caption_mask(
+    region_image: NDArray,
+    region_mask: NDArray | None = None,
+) -> NDArray | None:
+    """Recover tall/wide rectangular paper caption boxes missed by balloon finders."""
+    if region_image is None or region_image.size == 0:
+        return None
+    h, w = region_image.shape[:2]
+    if h < 40 or w < 28:
+        return None
+
+    text_info = _text_mask_geometry(region_mask, w, h)
+    if text_info is None:
+        return None
+    (tx1, ty1, tx2, ty2), (tcx, tcy) = text_info
+    gw = max(1, tx2 - tx1)
+    gh = max(1, ty2 - ty1)
+    # Caption boxes are usually taller or wider than a compact SFX cluster.
+    if max(gw, gh) < 70:
+        return None
+
+    gray = cv2.cvtColor(region_image, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(region_image, cv2.COLOR_BGR2HSV)
+    thr = int(np.clip(np.percentile(gray, 80), 200, 240))
+    bright = ((gray >= thr) & (hsv[:, :, 1] < 58)).astype(np.uint8) * 255
+    bright = cv2.morphologyEx(
+        bright,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)),
+        iterations=2,
+    )
+    bright = cv2.morphologyEx(
+        bright,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+        iterations=1,
+    )
+    if cv2.countNonZero(bright) < max(300, int(h * w * 0.03)):
+        return None
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bright, 8)
+    region_area = max(1, h * w)
+    text_area = max(1, gw * gh)
+    best: NDArray | None = None
+    best_score = -1e9
+    for label in range(1, num_labels):
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        bw = int(stats[label, cv2.CC_STAT_WIDTH])
+        bh = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < max(500, int(text_area * 0.70)):
+            continue
+        if bw < 24 or bh < 40:
+            continue
+        bbox_area = max(1, bw * bh)
+        if bbox_area > int(region_area * 0.92):
+            continue
+        fill = area / float(bbox_area)
+        # Rectangular captions are densely filled paper.
+        if fill < 0.45:
+            continue
+        aspect = max(bw / float(bh), bh / float(bw))
+        if aspect < 1.15 and fill < 0.62:
+            continue
+
+        component = (labels == label).astype(np.uint8) * 255
+        mean_sat = float(np.mean(hsv[:, :, 1][component > 0]))
+        if mean_sat > 50:
+            continue
+        inside = x - 3 <= tcx <= x + bw + 3 and y - 3 <= tcy <= y + bh + 3
+        overlap = (
+            max(0, min(tx2, x + bw) - max(tx1, x))
+            * max(0, min(ty2, y + bh) - max(ty1, y))
+        )
+        if not inside and overlap < int(text_area * 0.35):
+            continue
+
+        score = fill * 1000.0 + area * 0.01 + (200.0 if inside else 0.0)
+        score -= abs((x + bw * 0.5) - tcx) * 0.4
+        score -= abs((y + bh * 0.5) - tcy) * 0.4
+        if score > best_score:
+            best_score = score
+            best = component
+
+    if best is None:
+        return None
+    if not _bubble_mask_has_paper_surface(region_image, best):
+        return None
+    return best
 
 
 def _extract_bright_paper_bubble_mask(
