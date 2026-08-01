@@ -702,8 +702,15 @@ def _expand_single_dialogue_context_region(
 ) -> TextRegion:
     """Give isolated dialogue enough surrounding pixels to find its balloon."""
     img_h, img_w = image.shape[:2]
+    # Wide multi-lobe balloons already contain most of their outline; aggressive
+    # padding pulls in neighbouring balloons/SFX and breaks mask fitting.
     pad_x = min(140, max(28, int(region.w * 1.15), int(region.h * 0.32)))
     pad_y = min(110, max(20, int(region.h * 0.34), int(region.w * 0.22)))
+    if region.w >= 280:
+        pad_x = min(pad_x, max(24, int(region.w * 0.18)))
+    if region.w * region.h >= 70_000:
+        pad_x = min(pad_x, 72)
+        pad_y = min(pad_y, 64)
     x1 = max(0, region.x - pad_x)
     y1 = max(0, region.y - pad_y)
     x2 = min(img_w, region.x + region.w + pad_x)
@@ -802,6 +809,18 @@ def _build_local_render_context_region(
     x2 = min(x2, right_limit)
     y1 = max(y1, top_limit)
     y2 = min(y2, bottom_limit)
+
+    # Sibling gutters must never crop away the unit's own glyphs.  A clipped
+    # context loses the paper balloon/caption interior and falls through to
+    # "no safe non-bubble surface".
+    x1 = min(x1, ux1)
+    y1 = min(y1, uy1)
+    x2 = max(x2, ux2)
+    y2 = max(y2, uy2)
+    x1 = max(parent_x1, x1)
+    y1 = max(parent_y1, y1)
+    x2 = min(parent_x2, x2)
+    y2 = min(parent_y2, y2)
 
     min_w = min(parent_region.w, max(unit_region.w + 8, 28))
     min_h = min(parent_region.h, max(unit_region.h + 8, 24))
@@ -1049,6 +1068,29 @@ def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:
                 region=region,
                 boxes=boxes,
             )
+            if len(bubble_text_boxes) < 2:
+                # Bright morphology often joins touching balloons into one
+                # component.  Fall back to spatial dialogue clusters so each
+                # balloon stays its own OCR/render unit.
+                adjacent_boxes = _split_adjacent_dialogue_clusters(
+                    region=region,
+                    boxes=boxes,
+                )
+                if len(adjacent_boxes) >= 2:
+                    leftover: list[tuple[int, int, int, int]] = []
+                    for box in boxes:
+                        bx1, by1, bx2, by2 = box
+                        bcx = (bx1 + bx2) * 0.5
+                        bcy = (by1 + by2) * 0.5
+                        claimed = False
+                        for ax1, ay1, ax2, ay2 in adjacent_boxes:
+                            if ax1 - 4 <= bcx <= ax2 + 4 and ay1 - 4 <= bcy <= ay2 + 4:
+                                claimed = True
+                                break
+                        if not claimed:
+                            leftover.append(box)
+                    bubble_text_boxes = adjacent_boxes
+                    remaining_boxes = leftover
             sfx_boxes = _merge_nearby_boxes(remaining_boxes, gap=merge_gap)
             merged_boxes = bubble_text_boxes + sfx_boxes
             merged_boxes = _refine_oversized_ocr_groups(
@@ -1071,14 +1113,23 @@ def _split_region_for_ocr(region: TextRegion) -> list[TextRegion]:
             region_w=region.w,
             region_h=region.h,
         )
-    merged_boxes = _merge_same_surface_vertical_ocr_boxes(
-        merged_boxes,
-        region=region,
-    )
-    merged_boxes = _merge_same_surface_horizontal_ocr_boxes(
-        merged_boxes,
-        region=region,
-    )
+        merged_boxes = _merge_same_surface_vertical_ocr_boxes(
+            merged_boxes,
+            region=region,
+        )
+        merged_boxes = _merge_same_surface_horizontal_ocr_boxes(
+            merged_boxes,
+            region=region,
+        )
+    else:
+        # Bubble-aware splits already separated neighbouring balloons.  Running
+        # same-surface merges afterward re-glues those balloons whenever they
+        # share one connected paper fill (dosei empty-bubble cases).
+        merged_boxes = _resplit_merged_adjacent_dialogue_groups(
+            merged_boxes=merged_boxes,
+            component_boxes=boxes,
+            region=region,
+        )
     # Free-floating vertical narration (white text on dark art) often lands as
     # one wide OCR group.  Split those into column lanes before rendering so
     # each lane can use a safe mask-anchored box instead of a panel-wide crop.
@@ -1534,6 +1585,16 @@ def _should_keep_bright_component_as_one_group(
     if fill_ratio < 0.42:
         return False
 
+    # Touching adjacent balloons often share one connected paper component.
+    # Never re-merge already-separated dialogue-sized clusters sitting on that
+    # shared fill — that is the main source of empty sibling balloons.
+    if _members_look_like_separate_dialogue_balloons(
+        members,
+        region_w=region_w,
+        region_h=region_h,
+    ):
+        return False
+
     vertical_members = [
         box
         for box in members
@@ -1572,6 +1633,82 @@ def _should_keep_bright_component_as_one_group(
     clean_rect_surface = fill_ratio >= 0.62 and bbox_area >= int(region_area * 0.12)
     tall_shared_surface = ch >= max(90, cw * 0.80) and fill_ratio >= 0.50
     return clean_rect_surface or tall_shared_surface
+
+
+def _members_look_like_separate_dialogue_balloons(
+    members: list[tuple[int, int, int, int]],
+    *,
+    region_w: int,
+    region_h: int,
+) -> bool:
+    """True when member boxes form 2+ spatially separated dialogue clusters."""
+    if len(members) < 2:
+        return False
+
+    gap = max(8, int(min(region_w, region_h) * 0.045))
+    clusters = _merge_nearby_boxes(members, gap=gap)
+    major = [
+        box
+        for box in clusters
+        if ((box[2] - box[0]) * (box[3] - box[1]))
+        >= max(3500, int(region_w * region_h * 0.028))
+        or (box[3] - box[1]) >= max(80, int(region_h * 0.24))
+    ]
+    if len(major) < 2:
+        # Even two already-merged dialogue boxes (post-refine) should stay apart.
+        major = [
+            box
+            for box in members
+            if ((box[2] - box[0]) * (box[3] - box[1])) >= 8_000
+            and (box[3] - box[1]) >= 90
+        ]
+    if len(major) < 2:
+        return False
+
+    ordered = sorted(major, key=lambda b: ((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5))
+    for left, right in zip(ordered, ordered[1:]):
+        lw = max(1, left[2] - left[0])
+        lh = max(1, left[3] - left[1])
+        rw = max(1, right[2] - right[0])
+        rh = max(1, right[3] - right[1])
+        lcx = (left[0] + left[2]) * 0.5
+        rcx = (right[0] + right[2]) * 0.5
+        lcy = (left[1] + left[3]) * 0.5
+        rcy = (right[1] + right[3]) * 0.5
+        x_gap = max(0, max(left[0], right[0]) - min(left[2], right[2]))
+        y_gap = max(0, max(left[1], right[1]) - min(left[3], right[3]))
+        x_overlap = max(0, min(left[2], right[2]) - max(left[0], right[0]))
+        y_overlap = max(0, min(left[3], right[3]) - max(left[1], right[1]))
+
+        # Same-bubble vertical columns stay together.
+        if (
+            max(lw, rw) <= 90
+            and y_overlap >= int(min(lh, rh) * 0.55)
+            and x_gap <= max(18, int(min(lw, rw) * 0.45))
+            and abs(lcy - rcy) <= max(40, int(min(lh, rh) * 0.35))
+        ):
+            continue
+
+        side_by_side = (
+            abs(lcx - rcx) >= max(36, int(region_w * 0.12))
+            and x_gap >= 4
+            and y_overlap >= int(min(lh, rh) * 0.06)
+        )
+        stacked = (
+            abs(lcy - rcy) >= max(36, int(region_h * 0.12))
+            and y_gap >= 6
+            and x_overlap >= int(min(lw, rw) * 0.06)
+        )
+        diagonal = (
+            abs(lcx - rcx) >= max(28, int(region_w * 0.09))
+            and abs(lcy - rcy) >= max(24, int(region_h * 0.08))
+            and (x_gap + y_gap) >= 8
+            and x_overlap < int(min(lw, rw) * 0.65)
+            and y_overlap < int(min(lh, rh) * 0.65)
+        )
+        if side_by_side or stacked or diagonal:
+            return True
+    return False
 
 
 def _looks_like_vertical_text_box(box: tuple[int, int, int, int]) -> bool:
@@ -2103,9 +2240,9 @@ def _refine_oversized_ocr_groups(
         group_area = max(1, gw * gh)
 
         if (
-            group_area < max(95_000, int(region_area * 0.22))
-            or gw < 260
-            or gh < 180
+            group_area < max(55_000, int(region_area * 0.14))
+            or gw < 180
+            or gh < 140
         ):
             refined.append(group)
             continue
@@ -2123,11 +2260,11 @@ def _refine_oversized_ocr_groups(
             if center_inside or overlap >= int(box_area * 0.50):
                 members.append(box)
 
-        if len(members) < 4:
+        if len(members) < 3:
             refined.append(group)
             continue
 
-        tight_gap = max(8, int(min(region_w, region_h) * 0.018))
+        tight_gap = max(6, int(min(region_w, region_h) * 0.015))
         split = _merge_nearby_boxes(members, gap=tight_gap)
         split = [
             b
@@ -2137,12 +2274,72 @@ def _refine_oversized_ocr_groups(
             and ((b[2] - b[0]) * (b[3] - b[1])) >= 140
         ]
 
-        if 2 <= len(split) <= 10:
+        if 2 <= len(split) <= 10 and _members_look_like_separate_dialogue_balloons(
+            split,
+            region_w=region_w,
+            region_h=region_h,
+        ):
+            refined.extend(split)
+        elif 2 <= len(split) <= 10 and group_area >= max(95_000, int(region_area * 0.22)):
             refined.extend(split)
         else:
             refined.append(group)
 
     return refined
+
+
+def _resplit_merged_adjacent_dialogue_groups(
+    merged_boxes: list[tuple[int, int, int, int]],
+    component_boxes: list[tuple[int, int, int, int]],
+    region: TextRegion,
+) -> list[tuple[int, int, int, int]]:
+    """Undo same-surface merges that collapsed neighbouring balloons."""
+    if len(merged_boxes) < 1 or len(component_boxes) < 4:
+        return merged_boxes
+
+    out: list[tuple[int, int, int, int]] = []
+    changed = False
+    for group in merged_boxes:
+        gx1, gy1, gx2, gy2 = group
+        gw = gx2 - gx1
+        gh = gy2 - gy1
+        if gw < 150 or gh < 120 or (gw * gh) < 40_000:
+            out.append(group)
+            continue
+
+        members = [
+            box
+            for box in component_boxes
+            if gx1 - 2 <= ((box[0] + box[2]) * 0.5) <= gx2 + 2
+            and gy1 - 2 <= ((box[1] + box[3]) * 0.5) <= gy2 + 2
+        ]
+        if len(members) < 4:
+            out.append(group)
+            continue
+
+        # Build a temporary local region so adjacent-cluster heuristics use the
+        # group's own scale instead of the full parent panel.
+        local = TextRegion(
+            x=region.x + gx1,
+            y=region.y + gy1,
+            w=gw,
+            h=gh,
+            cropped=region.cropped[gy1:gy2, gx1:gx2],
+            mask=None,
+        )
+        local_members = [
+            (bx1 - gx1, by1 - gy1, bx2 - gx1, by2 - gy1)
+            for bx1, by1, bx2, by2 in members
+        ]
+        split = _split_adjacent_dialogue_clusters(local, local_members)
+        if len(split) < 2:
+            out.append(group)
+            continue
+        changed = True
+        for sx1, sy1, sx2, sy2 in split:
+            out.append((sx1 + gx1, sy1 + gy1, sx2 + gx1, sy2 + gy1))
+
+    return out if changed else merged_boxes
 
 
 def _merge_aligned_ocr_boxes(
