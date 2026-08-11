@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import logging
 import traceback
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -82,16 +81,10 @@ def run_translation_pipeline(
 
     # Config override pointing output to the translated dir
     translate_cfg = Settings(
-        use_openrouter=cfg.use_openrouter,
-        openrouter_api_key=cfg.openrouter_api_key,
-        openrouter_model=cfg.openrouter_model,
-        openrouter_base_url=cfg.openrouter_base_url,
+        base_url=cfg.base_url,
+        api_key=cfg.api_key,
+        model=cfg.model,
         translation_max_concurrent_calls=cfg.translation_max_concurrent_calls,
-        opencode_go_api_key=cfg.opencode_go_api_key,
-        opencode_go_model=cfg.opencode_go_model,
-        opencode_go_api_style=cfg.opencode_go_api_style,
-        opencode_go_openai_base_url=cfg.opencode_go_openai_base_url,
-        opencode_go_anthropic_base_url=cfg.opencode_go_anthropic_base_url,
         source_lang=cfg.source_lang,
         use_modal=cfg.use_modal,
         use_mangaocr_cpu=cfg.use_mangaocr_cpu,
@@ -104,13 +97,11 @@ def run_translation_pipeline(
 
     translated_paths: list[Path] = []
     total = result.total
-    job_session_id = str(uuid.uuid4())
-    logger.info("Translation job session ID: %s", job_session_id)
 
     def _translate_one(idx_path: tuple[int, Path]) -> tuple[int, Path, Path | None, Exception | None]:
         i, local_path = idx_path
         try:
-            out = translate_page(local_path, config=translate_cfg, session_id=job_session_id)
+            out = translate_page(local_path, config=translate_cfg)
             return i, local_path, out, None
         except Exception as e:
             return i, local_path, None, e
@@ -152,7 +143,7 @@ def run_translation_pipeline(
             yield f"🔄 [{i}/{total}] Translating {image_name}..."
 
             try:
-                out = translate_page(local_path, config=translate_cfg, session_id=job_session_id)
+                out = translate_page(local_path, config=translate_cfg)
                 translated_paths.append(out)
                 result.succeeded += 1
                 yield (

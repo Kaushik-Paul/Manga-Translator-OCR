@@ -52,7 +52,7 @@ Examples:
   # Translate a directory of pages
   uv run python -m main.cli --input ./manga_pages/ --output ./translated/
 
-  # Use a specific model for the active provider
+  # Override the configured model
   uv run python -m main.cli --input page.png --model deepseek-v4-flash
         """,
     )
@@ -76,7 +76,7 @@ Examples:
         "--model",
         "-m",
         default=None,
-        help="Model override for the active translation provider",
+        help="Override the MODEL environment variable",
     )
     parser.add_argument(
         "--verbose",
@@ -110,7 +110,6 @@ def run(argv: list[str] | None = None) -> None:
         sys.exit(1)
 
     logger.info("Source language: %s", settings.source_lang)
-    logger.info("Translation provider: %s", settings.translation_provider)
     logger.info("Translation model: %s", settings.active_translation_model)
     logger.info(
         "Detection backend: %s",

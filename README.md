@@ -22,7 +22,7 @@ This project wouldn't be possible without the incredible work from the open-sour
 
 * **Robust Speech Bubble Detection**: Powered by `comic-text-detector` to accurately find text regions, even in complex panels.
 * **Cutting-Edge Japanese OCR**: Utilizes `manga-ocr` to handle vertical text, furigana, and varied manga fonts with incredibly high accuracy.
-* **Smart LLM Translations**: Context-aware translations powered by OpenCode Go by default, with OpenRouter still available as an opt-in provider. The translation client disables reasoning where the provider supports it so output tokens stay focused on translated text.
+* **Smart LLM Translations**: Context-aware translations through an OpenAI-compatible chat-completions endpoint, configured entirely with environment variables. Translation requests explicitly disable reasoning so the output budget is reserved for translated text.
 * **Seamless Inpainting & Rendering**: Dynamically removes original Japanese text from the image and smartly renders the translated English text to fit perfectly inside the speech bubbles.
 * **Parallel Page Processing**: Processes multiple pages concurrently out of the box — overlapping I/O-bound API calls with CPU-bound detection/OCR for faster batch translations, even without a local GPU.
 * **Cloud GPU Acceleration**: Need more speed? Toggle Modal.com integration to offload OCR and Detection to remote GPUs and process entire chapters in parallel!
@@ -64,20 +64,17 @@ uv sync
 
 ### 4. Configure Environment Variables
 
-Create a `.env` file in the root directory to configure the pipeline:
+Copy the environment template, then configure your OpenAI-compatible translation endpoint:
+
+```bash
+cp .env.example .env
+```
 
 ```env
-# Required for LLM translations.
-# OpenCode Go is the default provider. Set USE_OPENROUTER=true to use OpenRouter.
-OPENCODE_GO_API_KEY="your-opencode-go-api-key-here"
-OPENCODE_GO_MODEL="deepseek-v4-flash"
-USE_OPENROUTER="false"
-OPENROUTER_API_KEY="your-openrouter-api-key-here"
-OPENROUTER_MODEL="deepseek/deepseek-chat"
-
-# Optional: auto, openai, or anthropic. Auto handles Qwen Anthropic-style OpenCode Go
-# models like qwen*-plus/qwen*-max. MiniMax models are blocked because they force reasoning.
-OPENCODE_GO_API_STYLE="auto"
+# Required: OpenAI-compatible chat-completions endpoint
+BASE_URL="https://api.example.com/v1"
+API_KEY="your-api-key"
+MODEL="your-model-name"
 
 # Optional: Enable Modal OCR offloading
 USE_MODAL="false"
@@ -105,24 +102,7 @@ MODAL_MAX_PARALLEL_PAGES="2"
 GRADIO_ACTION_PASSWORD="change-this-password"
 ```
 
-### OpenCode Go Model Support
-
-OpenCode Go is the default translation provider. Set `USE_OPENROUTER="true"` only when you want to route translation calls through OpenRouter instead.
-
-Recommended OpenCode Go models:
-
-| Model | API style | Reasoning handling |
-| --- | --- | --- |
-| `deepseek-v4-flash` | OpenAI-compatible | Sends `reasoning: {"effort": "none"}`, `thinking: {"type": "disabled"}`, and `include_reasoning: false` |
-| `deepseek-v4-pro` | OpenAI-compatible | Same as DeepSeek Flash |
-| `glm-5`, `glm-5.1` | OpenAI-compatible | Same reasoning-disable payload |
-| `mimo-v2.5`, `mimo-v2.5-pro` | OpenAI-compatible | Same reasoning-disable payload |
-| `kimi-k2.5`, `kimi-k2.6` | OpenAI-compatible | Sends only `thinking: {"type": "disabled"}` because Kimi rejects `reasoning` / `include_reasoning` |
-| `qwen*-plus`, `qwen*-max` | Anthropic-compatible | Uses `/messages` and sends `thinking: {"type": "disabled"}` |
-
-MiniMax models are intentionally blocked for translation because OpenCode Go currently forces reasoning tokens for `minimax-*` models. This includes models such as `minimax-m2.5`, `minimax-m2.7`, `minimax-m3`, and `minimax-max`.
-
-`OPENROUTER_MODEL` is used only when `USE_OPENROUTER="true"`. `TRANSLATION_MODEL` is no longer used; configure `OPENCODE_GO_MODEL` or `OPENROUTER_MODEL` instead.
+`BASE_URL` should be the API root (typically ending in `/v1`), not the full endpoint path. The client sends requests to `{BASE_URL}/chat/completions`. `MODEL` must be a model ID supported by that endpoint.
 
 ---
 
@@ -164,7 +144,7 @@ To host the app completely on Hugging Face Spaces, use the bundled deploy helper
    uv run python -m main.scripts.deploy_space --dry-run
    ```
 
-2. **Configure Secrets**: In your new HF Space's settings tab, specify your environment variables, especially `OPENCODE_GO_API_KEY` for the default provider or `OPENROUTER_API_KEY` when `USE_OPENROUTER="true"`.
+2. **Configure Secrets**: In your new HF Space's settings tab, add `BASE_URL`, `API_KEY`, and `MODEL`. Store `API_KEY` as a Space secret.
 
 3. **Upload Heavy Assets**: Since `weights` and `fonts` are intentionally skipped by the safe deploy command, use our bundled upload script to sync these heavy assets automatically up to HF without straining your Git history.
 
@@ -218,7 +198,7 @@ uv run python -m main.cli --input ./raw_manga_chapter/ --output output/translate
 uv run python -m main.cli --input page.png --model kimi-k2.6
 ```
 
-`--model` overrides the active provider's model: use OpenCode Go model IDs when `USE_OPENROUTER="false"` and OpenRouter model IDs when `USE_OPENROUTER="true"`.
+`--model` overrides `MODEL` for that CLI run. The override must be supported by the configured `BASE_URL`.
 
 ---
 
@@ -226,7 +206,7 @@ uv run python -m main.cli --input page.png --model kimi-k2.6
 
 1. **Detection**: `comic-text-detector` analyzes the image and creates precise masks for every speech bubble and text block.
 2. **Text Extraction (OCR)**: The masked regions are passed to `manga-ocr` (either locally or optionally distributed via Modal) to extract raw Japanese text.
-3. **Translation**: The extracted Japanese text is sent to the active LLM provider: OpenCode Go by default, or OpenRouter when `USE_OPENROUTER="true"`.
+3. **Translation**: The extracted Japanese text is sent to the configured OpenAI-compatible LLM endpoint.
 4. **Inpainting**: The original Japanese text is erased from the background image using advanced inpainting techniques.
 5. **Rendering**: The translated English text is algorithmically fitted, word-wrapped, and rendered back onto the clean image bubbles.
 

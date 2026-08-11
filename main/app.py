@@ -44,7 +44,13 @@ def launch() -> None:
     from main.ui.gradio_app import create_app
 
     app, theme, css = create_app()
-    app.launch(server_name="0.0.0.0", server_port=7860, theme=theme, css=css)
+    app.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        theme=theme,
+        css=css,
+        ssr_mode=False,
+    )
 
 
 if __name__ == "__main__":

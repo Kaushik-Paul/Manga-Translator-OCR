@@ -85,7 +85,6 @@ def translate_texts(
     model: str | None = None,
     max_retries: int = 3,
     constraints: list[TranslationConstraint] | None = None,
-    session_id: str | None = None,
 ) -> list[str]:
     """
     Translate a batch of texts from Japanese/Chinese to English.
@@ -96,10 +95,9 @@ def translate_texts(
     Args:
         texts: List of source language text strings.
         source_lang: Source language ("ja" or "zh"). Defaults to settings.
-        model: Model override for the active translation provider. Defaults to settings.
+        model: Model override. Defaults to the configured MODEL setting.
         max_retries: Number of retries on failure.
         constraints: Optional per-line translation constraints.
-        session_id: Session ID for grouping related requests. All API calls within a single translation job share the same session_id.
 
     Returns:
         List of translated English strings (same length as input).
@@ -118,7 +116,6 @@ def translate_texts(
                     model=model,
                     max_retries=max_retries,
                     constraints=(constraints[start:end] if constraints is not None else None),
-                    session_id=session_id,
                 )
             )
         return translated
@@ -164,7 +161,6 @@ def translate_texts(
                 model_name,
                 user_message,
                 system_prompt=SYSTEM_PROMPT,
-                session_id=session_id,
             )
             translated_map = _parse_numbered_response(response_text, len(indexed_texts))
             break
@@ -225,7 +221,6 @@ def translate_texts(
                     model_name,
                     repair_message,
                     system_prompt=REPAIR_SYSTEM_PROMPT,
-                    session_id=session_id,
                 )
                 repaired_map = _parse_numbered_response(
                     repair_response, len(repair_candidates)
@@ -280,7 +275,6 @@ def translate_texts(
                         model_name,
                         singleton_message,
                         system_prompt=REPAIR_SYSTEM_PROMPT,
-                        session_id=session_id,
                     ).strip()
                     singleton_map = _parse_numbered_response(singleton_response, 1)
                     fixed = singleton_map.get(0, "").strip()

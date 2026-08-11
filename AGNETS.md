@@ -5,7 +5,7 @@ Manga Translator OCR is an end-to-end pipeline that translates Japanese manga/do
 ## Core Pipeline (in order)
 1. **Detection** — `comic-text-detector` ONNX model finds text regions and produces a pixel-level mask
 2. **OCR** — `manga-ocr` extracts Japanese text from each region (supports vertical text, furigana, varied fonts)
-3. **Translation** — Batch call to OpenRouter LLM (default: `qwen/qwen3-235b-a22b-2507`); includes a repair pass for broken outputs
+3. **Translation** — Batch call to an OpenAI-compatible LLM endpoint; includes a repair pass for broken outputs
 4. **Inpainting** — OpenCV Telea algorithm erases original Japanese text using the ML mask
 5. **Rendering** — PIL renders translated English text into the cleaned bubble using comic fonts
 
@@ -35,7 +35,8 @@ manga-translator-ocr/
 │   ├── pipeline.py              # Core orchestrator: detection → OCR → translate → inpaint → render
 │   ├── detector.py              # ComicTextDetector (ONNX), ModalTextDetector, TextRegion dataclass
 │   ├── ocr.py                   # MangaOCREngine, ModalOCREngine, ModalCPUOCREngine
-│   ├── translator.py            # OpenRouter API calls, batch translation, repair pass
+│   ├── translator.py            # LLM prompting, batch translation, repair pass
+│   ├── model_client.py          # OpenAI-compatible chat-completions client
 │   ├── renderer.py              # Inpainting (cv2), text rendering (PIL), font/bubble logic
 │   ├── gcp_storage.py           # GCS download/upload, presigned URLs, ZIP handling
 │   ├── fonts/                   # Bundled comic fonts (animeace2.otf, CCWildWordsRoman.ttf, CJK fonts)
@@ -116,12 +117,9 @@ Use factory functions to get the right backend based on config:
 All settings are loaded from `.env` via `main/config.py` into a `Settings` dataclass singleton (`settings`). Key env vars:
 
 ```
-OPENCODE_GO_API_KEY       # Required when USE_OPENROUTER=false
-OPENCODE_GO_MODEL         # Default: deepseek-v4-flash
-OPENCODE_GO_API_STYLE     # auto/openai/anthropic
-USE_OPENROUTER            # false -> OpenCode Go, true -> OpenRouter
-OPENROUTER_API_KEY        # Required when USE_OPENROUTER=true
-OPENROUTER_MODEL          # Default: deepseek/deepseek-chat
+BASE_URL                  # Required OpenAI-compatible API root
+API_KEY                   # Required API key for the translation endpoint
+MODEL                     # Required translation model ID
 USE_MODAL                 # true/false — enables Modal GPU offloading
 USE_MANGAOCR_CPU          # true/false — Modal CPU vs GPU OCR
 USE_DETECTION_MODEL       # true/false — Modal vs local ONNX detector
