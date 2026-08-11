@@ -48,6 +48,7 @@ def call_translation_model(
         "temperature": 0.3,
         "max_tokens": 4096,
         "reasoning": {"effort": "none"},
+        "reasoning_effort": "low"
     }
 
     call_id = next(_TRANSLATION_CALL_COUNTER)
