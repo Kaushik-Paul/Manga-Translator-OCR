@@ -28,8 +28,6 @@ from .renderer import (
 )
 from .translator import TranslationConstraint, translate_texts
 
-import uuid
-
 logger = logging.getLogger(__name__)
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
 
@@ -55,7 +53,6 @@ def translate_page(
     image_path: str | Path,
     output_path: str | Path | None = None,
     config: Settings | None = None,
-    session_id: str | None = None,
 ) -> Path:
     """
     Translate a single manga page end-to-end.
@@ -64,7 +61,6 @@ def translate_page(
         image_path: Path to the input manga page image.
         output_path: Path to save the translated image. Auto-generated if None.
         config: Settings override. Uses global settings if None.
-        session_id: OpenRouter session ID to pass through to translation API calls.
 
     Returns:
         Path to the saved translated image.
@@ -201,7 +197,6 @@ def translate_page(
         source_lang=cfg.source_lang,
         model=cfg.active_translation_model,
         constraints=constraints,
-        session_id=session_id,
     )
     # Light sanitization: only block CJK leakage, let renderer handle sizing
     translated_texts = [
@@ -420,15 +415,13 @@ def translate_images(
 
     results: list[Path] = []
     tasks = list(enumerate(files, start=1))
-    job_session_id = str(uuid.uuid4())
-    logger.debug("Translation job session ID: %s", job_session_id)
 
     def _translate_one(task: tuple[int, Path]) -> tuple[Path | None, Exception | None]:
         i, img_path = task
         started_at = time.monotonic()
         logger.info("Page %d/%d started: %s", i, total, img_path.name)
         try:
-            out = translate_page(img_path, config=cfg, session_id=job_session_id)
+            out = translate_page(img_path, config=cfg)
             logger.info(
                 "Page %d/%d finished: %s -> %s (%.1fs)",
                 i,
