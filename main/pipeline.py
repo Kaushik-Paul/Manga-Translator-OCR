@@ -1831,6 +1831,7 @@ def _split_wide_vertical_text_columns(
     merged_boxes: list[tuple[int, int, int, int]],
     component_boxes: list[tuple[int, int, int, int]],
     region: TextRegion,
+    _depth: int = 0,
 ) -> list[tuple[int, int, int, int]]:
     """Split oversized OCR groups into separate vertical glyph columns."""
     if not merged_boxes or not component_boxes:
@@ -1960,6 +1961,14 @@ def _split_wide_vertical_text_columns(
             refined.append(group)
             continue
 
+        # Overlap-based membership can rebuild a column identical to the
+        # source group when one component box spans the whole group.  Such a
+        # column is a fixed point: the refinement pass below would recurse on
+        # it forever (RecursionError).  Reject splits that do not shrink.
+        if any(col == group for col in column_boxes):
+            refined.append(group)
+            continue
+
         refined.extend(column_boxes)
 
     # Second pass: dense free-text blocks can still be wider than one column
@@ -1974,14 +1983,18 @@ def _split_wide_vertical_text_columns(
         gx1, gy1, gx2, gy2 = group
         gw = gx2 - gx1
         gh = gy2 - gy1
-        if gw < 95 or gh < 140:
+        # Depth cap guards against near-fixed-point cycles (A splits into B,
+        # B splits back into A) that the exact-match guard above cannot see.
+        if gw < 95 or gh < 140 or _depth >= 12:
             second.append(group)
             continue
         crop = region.cropped[gy1:gy2, gx1:gx2]
         if _crop_has_neutral_dialogue_surface(crop):
             second.append(group)
             continue
-        sub = _split_wide_vertical_text_columns([group], component_boxes, region)
+        sub = _split_wide_vertical_text_columns(
+            [group], component_boxes, region, _depth + 1
+        )
         if len(sub) >= 2:
             second.extend(sub)
             changed = True
