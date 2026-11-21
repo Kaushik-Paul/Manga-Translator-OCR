@@ -295,6 +295,7 @@ def inpaint_text_region(
     w: int,
     h: int,
     region_mask: NDArray | None = None,
+    clip_mask: NDArray | None = None,
 ) -> NDArray:
     """
     Remove original text from a region using inpainting.
@@ -306,6 +307,9 @@ def inpaint_text_region(
         image: Full page image (BGR).
         x, y, w, h: Bounding box of the text region.
         region_mask: Per-pixel text mask for this region (255=text, 0=background).
+        clip_mask: Optional mask (same size as the region) limiting where
+            pixels may be erased, e.g. a balloon interior so the halo
+            expansion never eats into the balloon outline.
 
     Returns:
         Modified image with the text region cleaned.
@@ -317,6 +321,8 @@ def inpaint_text_region(
 
     # Ensure mask is uint8
     mask = mask.astype(np.uint8)
+    if clip_mask is not None and clip_mask.shape[:2] == mask.shape[:2]:
+        mask[clip_mask == 0] = 0
 
     paper_fill = _paper_fill_color(region, mask)
     if paper_fill is not None:
@@ -325,7 +331,12 @@ def inpaint_text_region(
         # Telea alone tends to leave grey/black ink shadows in large glyph holes.
         cleaned = region.copy()
         cleaned[mask > 0] = paper_fill
-        inpainted = cv2.inpaint(cleaned, mask, inpaintRadius=2, flags=cv2.INPAINT_TELEA)
+        # Only blend a thin ring at the mask edge.  Inpainting the whole mask
+        # would discard the paper fill and drag outline/border ink into the
+        # hole wherever the mask touches a balloon or caption-box edge.
+        inner = cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=2)
+        ring = cv2.subtract(mask, inner)
+        inpainted = cv2.inpaint(cleaned, ring, inpaintRadius=2, flags=cv2.INPAINT_TELEA)
     else:
         # Non-paper art/background needs true inpainting, but keep the radius
         # bounded so large decorative text does not smear the surrounding art.
@@ -3534,11 +3545,9 @@ def _should_prefer_hyphenated_layout(
     if hyphen_size <= no_hyphen_size:
         return False
 
-    inserted_breaks = _hyphenated_line_break_count(hyphen_lines)
-    if inserted_breaks == 0:
-        return True
-
-    return inserted_breaks <= 1 and hyphen_size >= no_hyphen_size + 4
+    # Never split a word with a hyphen while a whole-word layout fits: broken
+    # words read far worse than slightly smaller lettering.
+    return _hyphenated_line_break_count(hyphen_lines) == 0
 
 
 def _hyphenated_line_break_count(lines: list[str]) -> int:
@@ -5200,3 +5209,269 @@ def _hyphenate_word(word: str) -> list[str]:
                     return [clean[:pos], clean[pos:] + suffix]
 
     return [word]
+
+
+# ---------------------------------------------------------------------------
+# Balloon-shape rendering
+# ---------------------------------------------------------------------------
+#
+# When the layout stage has segmented the balloon interior, text is fitted to
+# that exact shape: every line gets the horizontal span the balloon actually
+# has at its height (narrow near the top/bottom of an oval, wide in the
+# middle), a margin keeps glyphs off the outline, and words are only ever
+# broken at spaces.
+
+_BUBBLE_MIN_FONT_RATIO = 0.0085  # readable floor, as a fraction of page height
+_BUBBLE_RESCUE_FONT_RATIO = 0.0072  # last-resort floor before giving up
+_BUBBLE_ABS_MIN_FONT = 12
+
+
+def bubble_min_font_size(page_h: int) -> int:
+    """Smallest comfortable dialogue size for a page of this height."""
+    return max(_BUBBLE_ABS_MIN_FONT, int(round(page_h * _BUBBLE_MIN_FONT_RATIO)))
+
+
+def _row_spans(inner: NDArray, cx: int) -> tuple[NDArray, NDArray]:
+    """Per row, the [left, right) extent of the interior run containing ``cx``.
+
+    Rows where ``cx`` is outside the interior get an empty span.  Using the run
+    through the centre (not the row's total width) keeps a line from
+    straddling a gap in irregular/double balloons.
+    """
+    h, w = inner.shape[:2]
+    left = np.full(h, cx, dtype=np.int32)
+    right = np.full(h, cx, dtype=np.int32)
+    cx = int(np.clip(cx, 0, w - 1))
+    for y in range(h):
+        row = inner[y]
+        if not row[cx]:
+            continue
+        off_left = np.flatnonzero(~row[:cx][::-1])
+        off_right = np.flatnonzero(~row[cx:])
+        left[y] = cx - (int(off_left[0]) if off_left.size else cx)
+        right[y] = cx + (int(off_right[0]) if off_right.size else w - cx)
+    return left, right
+
+
+def _pack_words_into_bands(
+    words: list[str],
+    word_widths: list[float],
+    space_w: float,
+    band_widths: list[float],
+) -> list[str] | None:
+    """Greedily fill lines whose maximum widths are ``band_widths``."""
+    lines: list[str] = []
+    i = 0
+    for cap in band_widths:
+        if i >= len(words):
+            lines.append("")
+            continue
+        if word_widths[i] > cap:
+            return None
+        current = [words[i]]
+        used = word_widths[i]
+        i += 1
+        while i < len(words) and used + space_w + word_widths[i] <= cap:
+            used += space_w + word_widths[i]
+            current.append(words[i])
+            i += 1
+        lines.append(" ".join(current))
+    if i < len(words):
+        return None
+    return lines
+
+
+def _layout_in_shape(
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    stroke: int,
+    left: NDArray,
+    right: NDArray,
+    cy: int,
+) -> tuple[list[str], list[int], list[int], int] | None:
+    """Fit ``text`` around row ``cy`` of a shape described by row spans.
+
+    Returns (lines, line_center_xs, line_top_ys, line_height) or None.
+    """
+    words = text.split()
+    if not words:
+        return None
+    word_widths = [font.getlength(w) + 2 * stroke for w in words]
+    space_w = font.getlength(" ")
+    ascent, descent = font.getmetrics()
+    line_h = ascent + descent + 2 * stroke
+    gap = max(1, int(round(font.size * 0.08)))
+    pitch = line_h + gap
+    rows = left.shape[0]
+    max_lines = min(len(words), max(1, rows // max(1, pitch)))
+
+    for n in range(1, max_lines + 1):
+        total = n * line_h + (n - 1) * gap
+        # Try the vertically centred placement first, then nudge it, which
+        # helps balloons whose widest part is off-centre (tails, lobes).
+        for shift in (0, -pitch // 2, pitch // 2, -pitch, pitch):
+            top = int(round(cy - total / 2.0)) + shift
+            if top < 0 or top + total > rows:
+                continue
+            caps: list[float] = []
+            centers: list[int] = []
+            tops: list[int] = []
+            ok = True
+            for i in range(n):
+                y0 = top + i * pitch
+                band_l = int(left[y0 : y0 + line_h].max())
+                band_r = int(right[y0 : y0 + line_h].min())
+                if band_r - band_l <= 0:
+                    ok = False
+                    break
+                caps.append(float(band_r - band_l))
+                centers.append((band_l + band_r) // 2)
+                tops.append(y0)
+            if not ok:
+                continue
+            lines = _pack_words_into_bands(words, word_widths, space_w, caps)
+            if lines is None or any(not ln for ln in lines):
+                continue
+            return lines, centers, tops, line_h
+    return None
+
+
+def render_text_in_bubble(
+    image: NDArray,
+    text: str,
+    bubble_x: int,
+    bubble_y: int,
+    bubble_mask: NDArray,
+    *,
+    max_font_size: int,
+    text_color: tuple[int, int, int] | None = None,
+    avoid_mask: NDArray | None = None,
+    font_path: str | None = None,
+) -> tuple[NDArray, bool]:
+    """Render ``text`` inside a segmented balloon interior.
+
+    Args:
+        image: Page image (BGR), already inpainted.
+        text: Translated text.
+        bubble_x, bubble_y: Page position of ``bubble_mask``.
+        bubble_mask: uint8 balloon interior (non-zero = inside).
+        max_font_size: Upper bound for the font size (from source glyph size).
+        text_color: Detected chromatic text colour (RGB) or None.
+        avoid_mask: Optional uint8 mask, same shape as ``bubble_mask``, of
+            pixels that must stay free (e.g. a neighbouring balloon).
+        font_path: Font override; defaults to the dialogue font.
+
+    Returns:
+        (image, rendered) - the input image unchanged when nothing fits.
+    """
+    font_file = font_path or _DIALOGUE_FONT_PATH or _DEFAULT_FONT_PATH
+    clean = " ".join(_sanitize_for_font(text, font_file).split())
+    if not clean or not font_file:
+        return image, False
+
+    page_h, page_w = image.shape[:2]
+    inside = bubble_mask > 0
+    if avoid_mask is not None and avoid_mask.shape == bubble_mask.shape:
+        inside &= avoid_mask == 0
+    if int(np.count_nonzero(inside)) < 64:
+        return image, False
+
+    # Pad with background so the crop edge counts as balloon boundary (the
+    # mask is cropped tight to the balloon bbox).
+    inside_u8 = np.pad(inside.astype(np.uint8), 1)
+    dist = cv2.distanceTransform(inside_u8, cv2.DIST_L2, 5)[1:-1, 1:-1]
+    bh, bw = inside.shape
+    floor = bubble_min_font_size(page_h)
+    rescue_floor = max(10, int(round(page_h * _BUBBLE_RESCUE_FONT_RATIO)))
+    max_size = int(max(floor, min(max_font_size, page_h * 0.06)))
+
+    base_margin = float(np.clip(min(bw, bh) * 0.07, 3, 18))
+
+    def _attempt(margin: float, sizes: range, face: str | None = None):
+        face = face or font_file
+        inner = dist >= margin
+        if int(np.count_nonzero(inner)) < 32:
+            return None
+        ys, xs = np.nonzero(inner)
+        # Centre on the inner region's centroid; fall back to its most
+        # interior point when the centroid falls outside (crescent shapes).
+        cx, cy = int(round(xs.mean())), int(round(ys.mean()))
+        if not inner[cy, cx]:
+            iy, ix = np.unravel_index(int(np.argmax(dist)), dist.shape)
+            cx, cy = int(ix), int(iy)
+        left, right = _row_spans(inner, cx)
+        for size in sizes:
+            font = ImageFont.truetype(face, size)
+            stroke = max(1, size // 12)
+            layout = _layout_in_shape(clean, font, stroke, left, right, cy)
+            if layout is not None:
+                return font, stroke, layout
+        return None
+
+    found = None
+    for margin in (base_margin, base_margin * 0.5, 1.0):
+        found = _attempt(margin, range(max_size, floor - 1, -1))
+        if found is not None:
+            break
+    narrow_face = _NARROW_DIALOGUE_FONT_PATH
+    if found is None and narrow_face and narrow_face != font_file:
+        # Narrow balloons: a condensed lettering face keeps the text at a
+        # readable size instead of shrinking the wide default face.
+        for margin in (base_margin * 0.5, 1.0):
+            found = _attempt(margin, range(max_size, floor - 1, -1), narrow_face)
+            if found is not None:
+                break
+    if found is None:
+        found = _attempt(1.0, range(floor - 1, rescue_floor - 1, -1), narrow_face or font_file)
+    if found is None:
+        return image, False
+
+    font, stroke, (lines, centers, tops, _line_h) = found
+
+    # Colour: black text on light paper / white on dark paper, unless the
+    # source lettering was clearly coloured and still contrasts.
+    crop = image[bubble_y : bubble_y + bh, bubble_x : bubble_x + bw]
+    paper = crop[inside] if crop.shape[:2] == inside.shape else crop.reshape(-1, 3)
+    paper_luma = float(np.mean(cv2.cvtColor(paper.reshape(-1, 1, 3), cv2.COLOR_BGR2GRAY)))
+    fill = (0, 0, 0) if paper_luma > 140 else (255, 255, 255)
+    if text_color is not None:
+        tr, tg, tb = text_color
+        luma = 0.299 * tr + 0.587 * tg + 0.114 * tb
+        if abs(luma - paper_luma) >= 70:
+            fill = (int(tr), int(tg), int(tb))
+    outline = _outline_color_for_text(fill)
+
+    x1 = max(0, bubble_x)
+    y1 = max(0, bubble_y)
+    x2 = min(page_w, bubble_x + bw)
+    y2 = min(page_h, bubble_y + bh)
+    if x2 <= x1 or y2 <= y1:
+        return image, False
+
+    result = image.copy()
+    pil = Image.fromarray(cv2.cvtColor(result[y1:y2, x1:x2], cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil)
+    ox, oy = bubble_x - x1, bubble_y - y1
+    ascent, _ = font.getmetrics()
+    for line, cx_line, top in zip(lines, centers, tops):
+        draw.text(
+            (ox + cx_line, oy + top + stroke + ascent),
+            line,
+            font=font,
+            anchor="ms",
+            fill=fill,
+            stroke_width=stroke,
+            stroke_fill=outline,
+        )
+    result[y1:y2, x1:x2] = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+    logger.debug(
+        "Bubble render: size=%d lines=%d box=(%d,%d,%d,%d) text='%s'",
+        getattr(font, "size", 0),
+        len(lines),
+        bubble_x,
+        bubble_y,
+        bw,
+        bh,
+        clean[:60],
+    )
+    return result, True
