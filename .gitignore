@@ -719,3 +719,4 @@ pyrightconfig.json
 # Local AI briefing files (ignored from git)
 /gradio_sdk.txt
 /.kiro/
+/FUTURE_FIXES.md
