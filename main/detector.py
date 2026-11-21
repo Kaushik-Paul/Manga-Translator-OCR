@@ -33,6 +33,10 @@ _LOCAL_MODEL_PATH = (
     Path(__file__).resolve().parent / "weights" / "comic-text-detector" / _MODEL_FILE
 )
 _MODEL_INPUT_SIZE = (1024, 1024)  # Model expects 1024x1024 input
+# YOLO text-block head post-processing (same defaults as the reference
+# comic-text-detector / manga-image-translator implementation).
+_BLOCK_CONF_THRESHOLD = 0.4
+_BLOCK_NMS_THRESHOLD = 0.35
 _MODAL_DETECTOR_APP = "manga-detector-service"
 _MODAL_DETECTOR_CLASS = "ComicTextDetectorService"
 
@@ -113,6 +117,131 @@ class TextRegion:
         return (self.x + self.w // 2, self.y + self.h // 2)
 
 
+@dataclass(frozen=True)
+class DetectedBlock:
+    """A text block predicted by the detector's YOLO head (page coordinates).
+
+    The model is trained to box a whole speech balloon's worth of text (all of
+    its columns/lines), which makes these boxes a far more reliable grouping
+    signal than morphology on the pixel mask.
+    """
+
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    score: float
+
+    @property
+    def w(self) -> int:
+        return self.x2 - self.x1
+
+    @property
+    def h(self) -> int:
+        return self.y2 - self.y1
+
+
+@dataclass
+class DetectionResult:
+    """Full detector output for one page."""
+
+    regions: list[TextRegion]
+    text_mask: NDArray
+    blocks: list[DetectedBlock]
+
+
+def _letterbox_blob(image: NDArray) -> tuple[NDArray, float, int, int]:
+    """Resize keeping aspect ratio and pad to the model input (top-left anchored).
+
+    The model was trained on letterboxed inputs; stretching a portrait manga
+    page to a square distorts glyph shapes and weakens both the mask and the
+    block predictions.
+    """
+    h, w = image.shape[:2]
+    in_w, in_h = _MODEL_INPUT_SIZE
+    ratio = min(in_w / float(w), in_h / float(h))
+    new_w = max(1, min(in_w, int(round(w * ratio))))
+    new_h = max(1, min(in_h, int(round(h * ratio))))
+    interp = cv2.INTER_AREA if ratio < 1.0 else cv2.INTER_LINEAR
+    canvas = np.zeros((in_h, in_w, 3), dtype=np.uint8)
+    canvas[:new_h, :new_w] = cv2.resize(image, (new_w, new_h), interpolation=interp)
+    rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+    blob = np.transpose(rgb.astype(np.float32) / 255.0, (2, 0, 1))[None]
+    return blob, ratio, new_h, new_w
+
+
+def _named_output(outputs: list, names: list[str], wanted: str) -> NDArray | None:
+    for name, out in zip(names, outputs):
+        if name == wanted:
+            return np.asarray(out)
+    return None
+
+
+def _decode_mask_output(
+    seg: NDArray,
+    content_h: int,
+    content_w: int,
+    orig_h: int,
+    orig_w: int,
+    threshold: float,
+) -> NDArray:
+    """Crop the letterbox padding from the seg map and binarize at page size."""
+    mask = np.asarray(seg, dtype=np.float32).squeeze()
+    if mask.ndim == 3:
+        mask = mask[0]
+    if mask.ndim != 2 or mask.size == 0:
+        return np.zeros((orig_h, orig_w), dtype=np.uint8)
+    if float(mask.max()) > 1.0:
+        mask = mask / float(mask.max())
+    mask = mask[: max(1, content_h), : max(1, content_w)]
+    resized = cv2.resize(mask, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+    return (resized > threshold).astype(np.uint8) * 255
+
+
+def _decode_block_output(
+    blk: NDArray,
+    ratio: float,
+    orig_h: int,
+    orig_w: int,
+    conf_threshold: float = _BLOCK_CONF_THRESHOLD,
+    nms_threshold: float = _BLOCK_NMS_THRESHOLD,
+) -> list[DetectedBlock]:
+    """Decode YOLO rows ``[cx, cy, w, h, obj, cls...]`` into page-space boxes."""
+    arr = np.asarray(blk, dtype=np.float32)
+    if arr.ndim == 3:
+        arr = arr[0]
+    if arr.ndim != 2 or arr.shape[1] < 6 or arr.shape[0] == 0:
+        return []
+
+    scores = arr[:, 4] * arr[:, 5:].max(axis=1)
+    keep = scores > conf_threshold
+    if not np.any(keep):
+        return []
+    arr = arr[keep]
+    scores = scores[keep]
+
+    rects = [
+        [float(cx - bw / 2.0), float(cy - bh / 2.0), float(bw), float(bh)]
+        for cx, cy, bw, bh in arr[:, :4]
+    ]
+    picked = cv2.dnn.NMSBoxes(rects, scores.tolist(), conf_threshold, nms_threshold)
+    if picked is None or len(picked) == 0:
+        return []
+
+    blocks: list[DetectedBlock] = []
+    scale = 1.0 / max(ratio, 1e-6)
+    for idx in np.asarray(picked).reshape(-1):
+        x, y, bw, bh = rects[int(idx)]
+        x1 = int(np.clip(round(x * scale), 0, orig_w))
+        y1 = int(np.clip(round(y * scale), 0, orig_h))
+        x2 = int(np.clip(round((x + bw) * scale), 0, orig_w))
+        y2 = int(np.clip(round((y + bh) * scale), 0, orig_h))
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            continue
+        blocks.append(DetectedBlock(x1, y1, x2, y2, float(scores[int(idx)])))
+    return blocks
+
+
 class ComicTextDetector:
     """
     ML-based text detector using the comic-text-detector ONNX model.
@@ -183,8 +312,21 @@ class ComicTextDetector:
         min_area: int = 30,
         padding: int = 5,
     ) -> tuple[list[TextRegion], NDArray]:
+        """Detect text regions in a manga page (legacy two-value API)."""
+        result = self.detect_layout(
+            image, text_threshold=text_threshold, min_area=min_area, padding=padding
+        )
+        return result.regions, result.text_mask
+
+    def detect_layout(
+        self,
+        image: NDArray,
+        text_threshold: float = 0.15,
+        min_area: int = 30,
+        padding: int = 5,
+    ) -> DetectionResult:
         """
-        Detect text regions in a manga page.
+        Detect text in a manga page.
 
         Args:
             image: Input image (BGR, as loaded by cv2.imread).
@@ -193,54 +335,40 @@ class ComicTextDetector:
             padding: Padding around detected regions.
 
         Returns:
-            Tuple of (list of TextRegion, full-page text mask).
+            DetectionResult with mask-derived regions, the full-page text mask
+            and the model's text-block boxes.
         """
         self._ensure_model()
 
         h, w = image.shape[:2]
+        blob, ratio, content_h, content_w = _letterbox_blob(image)
 
-        # Preprocess: resize to model input size
-        input_tensor = self._preprocess(image)
-
-        # Run inference
         input_name = self._session.get_inputs()[0].name
-        outputs = self._session.run(None, {input_name: input_tensor})
+        output_names = [o.name for o in self._session.get_outputs()]
+        outputs = self._session.run(None, {input_name: blob})
 
-        # The model outputs: blks (bounding boxes), mask, lines
-        # Output structure depends on model version, but typically:
-        # outputs[0] = text block bounding boxes or mask
-        # outputs[1] = text segmentation mask (if available)
+        seg = _named_output(outputs, output_names, "seg")
+        if seg is not None:
+            text_mask = _decode_mask_output(
+                seg, content_h, content_w, h, w, text_threshold
+            )
+        else:
+            text_mask = self._parse_mask(outputs, h, w, text_threshold)
 
-        # Parse the text mask from model outputs
-        text_mask = self._parse_mask(outputs, h, w, text_threshold)
+        blk = _named_output(outputs, output_names, "blk")
+        blocks = _decode_block_output(blk, ratio, h, w) if blk is not None else []
 
-        # Extract text regions from the mask
         regions = self._extract_regions_from_mask(
             image, text_mask, min_area=min_area, padding=padding
         )
-
-        # Sort in manga reading order
         regions = _sort_manga_order(regions, page_width=w)
 
         logger.debug(
-            "Detected %d text regions using comic-text-detector.", len(regions)
+            "Detected %d mask regions and %d text blocks using comic-text-detector.",
+            len(regions),
+            len(blocks),
         )
-        return regions, text_mask
-
-    def _preprocess(self, image: NDArray) -> NDArray:
-        """Preprocess image for the ONNX model."""
-        # Resize to model input size
-        resized = cv2.resize(image, _MODEL_INPUT_SIZE)
-
-        # Convert BGR to RGB
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-
-        # Normalize to [0, 1] and transpose to NCHW format
-        blob = rgb.astype(np.float32) / 255.0
-        blob = np.transpose(blob, (2, 0, 1))  # HWC -> CHW
-        blob = np.expand_dims(blob, axis=0)  # Add batch dim -> NCHW
-
-        return blob
+        return DetectionResult(regions=regions, text_mask=text_mask, blocks=blocks)
 
     def _parse_mask(
         self,
@@ -727,6 +855,7 @@ class ModalTextDetector(ComicTextDetector):
     _instance: ModalTextDetector | None = None
     _modal_detector = None
     _modal_lock = Lock()
+    _layout_unavailable = False
 
     def __new__(cls) -> ModalTextDetector:
         if cls._instance is None:
@@ -771,27 +900,52 @@ class ModalTextDetector(ComicTextDetector):
             )
         return (decoded > 0).astype(np.uint8) * 255
 
-    def detect(
+    def detect_layout(
         self,
         image: NDArray,
         text_threshold: float = 0.15,
         min_area: int = 30,
         padding: int = 5,
-    ) -> tuple[list[TextRegion], NDArray]:
+    ) -> DetectionResult:
         self._ensure_modal()
 
         h, w = image.shape[:2]
         image_bytes = self._encode_png(image)
 
-        try:
-            text_mask_bytes = self._modal_detector.detect_mask.remote(
-                image_bytes, text_threshold
-            )
-        except Exception as e:
-            raise RuntimeError(
-                "Modal detection failed. Deploy `modal_detector_service.py` and "
-                "ensure your Modal auth/env vars are configured."
-            ) from e
+        blocks: list[DetectedBlock] = []
+        text_mask_bytes: bytes | None = None
+        if not ModalTextDetector._layout_unavailable:
+            try:
+                payload = self._modal_detector.detect_layout.remote(
+                    image_bytes, text_threshold
+                )
+                text_mask_bytes = payload.get("mask", b"")
+                for row in payload.get("blocks", []) or []:
+                    x1, y1, x2, y2, score = row
+                    blocks.append(
+                        DetectedBlock(int(x1), int(y1), int(x2), int(y2), float(score))
+                    )
+            except Exception as e:  # older deployment without detect_layout
+                ModalTextDetector._layout_unavailable = True
+                logger.warning(
+                    "Modal detector has no detect_layout method (%s); "
+                    "falling back to mask-only detection. Redeploy "
+                    "modal_detector_service.py to enable text-block grouping.",
+                    e,
+                )
+                text_mask_bytes = None
+                blocks = []
+
+        if text_mask_bytes is None:
+            try:
+                text_mask_bytes = self._modal_detector.detect_mask.remote(
+                    image_bytes, text_threshold
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    "Modal detection failed. Deploy `modal_detector_service.py` and "
+                    "ensure your Modal auth/env vars are configured."
+                ) from e
 
         text_mask = self._decode_mask(text_mask_bytes, expected_h=h, expected_w=w)
         regions = self._extract_regions_from_mask(
@@ -799,9 +953,11 @@ class ModalTextDetector(ComicTextDetector):
         )
         regions = _sort_manga_order(regions, page_width=w)
         logger.debug(
-            "Detected %d text regions using Modal comic-text-detector.", len(regions)
+            "Detected %d mask regions and %d text blocks using Modal comic-text-detector.",
+            len(regions),
+            len(blocks),
         )
-        return regions, text_mask
+        return DetectionResult(regions=regions, text_mask=text_mask, blocks=blocks)
 
     def _ensure_model(self) -> None:
         # No local ONNX session required when using Modal detector service.
@@ -818,6 +974,29 @@ def get_text_detector() -> ComicTextDetector:
 
     logger.debug("Using local comic-text-detector model.")
     return ComicTextDetector()
+
+
+def detect_text_layout(image: NDArray, **kwargs) -> DetectionResult:
+    """Detect text regions, the full-page text mask and model text blocks."""
+    detector = get_text_detector()
+    return detector.detect_layout(image, **kwargs)
+
+
+def extract_regions_from_mask(
+    image: NDArray,
+    mask: NDArray,
+    min_area: int = 30,
+    padding: int = 5,
+) -> list[TextRegion]:
+    """Run the mask-morphology region extractor on an arbitrary text mask.
+
+    Does not touch the ONNX/Modal backends (the extractor is pure OpenCV).
+    """
+    extractor = ComicTextDetector.__new__(ComicTextDetector)
+    regions = extractor._extract_regions_from_mask(
+        image, mask, min_area=min_area, padding=padding
+    )
+    return _sort_manga_order(regions, page_width=image.shape[1])
 
 
 def detect_text_regions(
