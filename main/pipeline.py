@@ -18,12 +18,15 @@ import numpy as np
 from PIL import Image as PILImage
 
 from .config import Settings, settings
-from .detector import TextRegion, detect_text_regions
+from .detector import TextRegion, detect_text_layout, extract_regions_from_mask
+from .layout import BubbleMask, TextGroup, group_text_by_bubbles
 from .ocr import get_ocr_engine
 from .renderer import (
+    bubble_min_font_size,
     build_inpaint_mask,
     detect_text_color,
     inpaint_text_region,
+    render_text_in_bubble,
     render_text_on_image,
 )
 from .translator import TranslationConstraint, translate_texts
@@ -47,6 +50,12 @@ class RenderTextUnit:
     style_hint: str
     parent_region_index: int
     text_color: tuple[int, int, int] | None = None
+    # Balloon interior from the layout stage; when set the unit is one whole
+    # balloon and is rendered into this exact shape.
+    bubble: BubbleMask | None = None
+    # Group-derived units are already complete balloons/blocks: never re-split.
+    from_layout: bool = False
+    page_height: int = 0
 
 
 def translate_page(
@@ -83,10 +92,29 @@ def translate_page(
 
     # 2. Detect text regions using ML model
     logger.debug("Step 1/4: Detecting text regions (ML model)...")
-    regions, text_mask = detect_text_regions(image)
-    regions = _merge_overlapping_detected_regions(regions, image, text_mask)
-    regions = _merge_same_surface_detected_regions(regions, image, text_mask)
-    logger.debug("Found %d text regions.", len(regions))
+    detection = detect_text_layout(image)
+    text_mask = detection.text_mask
+    # Balloon-aware units first: one unit per balloon (or per model text
+    # block outside balloons).  Glyphs claimed by neither fall back to the
+    # legacy mask-morphology regions (mostly SFX / free lettering on art).
+    groups, residual_mask = group_text_by_bubbles(image, text_mask, detection.blocks)
+    group_regions = [_region_from_group(image, text_mask, g) for g in groups]
+    legacy_regions: list[TextRegion] = []
+    if cv2.countNonZero(residual_mask) > 0:
+        legacy_regions = extract_regions_from_mask(image, residual_mask)
+        legacy_regions = _merge_overlapping_detected_regions(
+            legacy_regions, image, residual_mask
+        )
+        legacy_regions = _merge_same_surface_detected_regions(
+            legacy_regions, image, residual_mask
+        )
+    regions = group_regions + legacy_regions
+    logger.debug(
+        "Found %d text regions (%d balloon/block units, %d legacy).",
+        len(regions),
+        len(group_regions),
+        len(legacy_regions),
+    )
 
     if not regions:
         logger.warning("No text regions detected. Saving original image.")
@@ -104,6 +132,11 @@ def translate_page(
     # Pre-split all regions into OCR sub-regions
     all_ocr_tasks: list[tuple[int, int, TextRegion]] = []
     for region_idx, region in enumerate(regions):
+        if region_idx < len(group_regions):
+            all_ocr_tasks.append(
+                (region_idx, 1, _ocr_view_of_group_region(region, text_mask))
+            )
+            continue
         ocr_regions = _split_region_for_ocr(region)
         if len(ocr_regions) >= 2:
             logger.debug(
@@ -140,21 +173,52 @@ def translate_page(
             empty_ocr_units += 1
             continue
 
-        style_hint = _infer_unit_style(text, ocr_region.w, ocr_region.h)
         parent_region = regions[region_idx]
-        units.append(
-            RenderTextUnit(
-                region=ocr_region,
-                context_region=_select_render_context_region(
-                    unit_region=ocr_region,
-                    parent_region=parent_region,
+        if region_idx < len(group_regions):
+            group = groups[region_idx]
+            # OCR ran on a cleaned view; render/inpaint use the real region.
+            unit_region = parent_region
+            if group.bubble is not None:
+                style_hint = "dialogue"
+            else:
+                style_hint = _infer_unit_style(text, unit_region.w, unit_region.h)
+                if style_hint == "dialogue" and _is_short_colored_lettering(
+                    text, unit_region
+                ):
+                    style_hint = "sfx"
+            units.append(
+                RenderTextUnit(
+                    region=unit_region,
+                    context_region=(
+                        _bubble_context_region(image, text_mask, group.bubble)
+                        if group.bubble is not None
+                        else unit_region
+                    ),
+                    source_text=text,
                     style_hint=style_hint,
-                ),
-                source_text=text,
-                style_hint=style_hint,
-                parent_region_index=region_idx,
+                    parent_region_index=region_idx,
+                    bubble=group.bubble,
+                    from_layout=True,
+                    page_height=image.shape[0],
+                )
             )
-        )
+        else:
+            style_hint = _infer_unit_style(text, ocr_region.w, ocr_region.h)
+            if style_hint == "dialogue" and _is_short_colored_lettering(text, ocr_region):
+                style_hint = "sfx"
+            units.append(
+                RenderTextUnit(
+                    region=ocr_region,
+                    context_region=_select_render_context_region(
+                        unit_region=ocr_region,
+                        parent_region=parent_region,
+                        style_hint=style_hint,
+                    ),
+                    source_text=text,
+                    style_hint=style_hint,
+                    parent_region_index=region_idx,
+                )
+            )
         inpaint_region_indices.add(region_idx)
         logger.debug(
             "  Region %d.%d [%s]: '%s'",
@@ -179,7 +243,7 @@ def translate_page(
         return out
 
     _assign_render_context_regions(
-        units=units,
+        units=[unit for unit in units if unit.bubble is None],
         parent_regions=regions,
         image=image,
         text_mask=text_mask,
@@ -264,13 +328,41 @@ def translate_page(
             region.w,
             region.h,
             region.mask,
+            clip_mask=_bubble_clip_for_region(unit.bubble, region),
         )
 
     # Second pass: render translated text onto the cleaned image
     rendered_pixel_mask = np.zeros(result.shape[:2], dtype=np.uint8)
     rendered_units = 0
     failed_render_units = 0
-    for unit, translated, can_render in zip(units, translated_texts, renderable_unit_mask):
+    bubble_avoid = _bubble_avoid_masks(units, renderable_unit_mask, image.shape[:2])
+    for unit_idx, (unit, translated, can_render) in enumerate(
+        zip(units, translated_texts, renderable_unit_mask)
+    ):
+        if can_render and unit.bubble is not None:
+            bubble = unit.bubble
+            rendered_result, did_render = render_text_in_bubble(
+                result,
+                translated,
+                bubble.x,
+                bubble.y,
+                bubble.mask,
+                max_font_size=_source_glyph_font_size(unit),
+                text_color=unit.text_color,
+                avoid_mask=bubble_avoid.get(unit_idx),
+            )
+            if did_render:
+                rendered_units += 1
+                changed = np.any(rendered_result != result, axis=2)
+                rendered_pixel_mask[changed] = 255
+                result = rendered_result
+                continue
+            logger.debug(
+                "  Balloon render did not fit for unit at (%d,%d); "
+                "falling back to box renderer.",
+                unit.region.x,
+                unit.region.y,
+            )
         if can_render:
             # If multiple renderable units share a parent, keep each in its own
             # local render context to avoid overlapping translations in adjacent
@@ -891,6 +983,8 @@ def _crop_has_neutral_dialogue_surface(crop: np.ndarray) -> bool:
 
 def _build_translation_constraint(unit: RenderTextUnit) -> TranslationConstraint:
     """Derive concise translation budgets from the region most likely to be rendered."""
+    if unit.bubble is not None and unit.page_height > 0:
+        return _bubble_translation_constraint(unit.bubble, unit.page_height)
     render_region = unit.context_region or unit.region
     rw = render_region.w
     rh = render_region.h
@@ -3285,3 +3379,191 @@ def _detected_region_cluster_should_merge(
         return False
 
     return True
+
+
+# ---------------------------------------------------------------------------
+# Balloon/block units from the layout stage
+# ---------------------------------------------------------------------------
+
+
+def _region_from_group(image: np.ndarray, text_mask: np.ndarray, group: TextGroup) -> TextRegion:
+    """TextRegion around a layout group, masked to the group's own glyphs."""
+    img_h, img_w = image.shape[:2]
+    pad = int(np.clip(round(min(group.w, group.h) * 0.2), 6, 24))
+    x1 = max(0, group.x1 - pad)
+    y1 = max(0, group.y1 - pad)
+    x2 = min(img_w, group.x2 + pad)
+    y2 = min(img_h, group.y2 + pad)
+    mask = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
+    mask[
+        group.y1 - y1 : group.y1 - y1 + group.h,
+        group.x1 - x1 : group.x1 - x1 + group.w,
+    ] = group.text_mask
+    return TextRegion(
+        x=x1,
+        y=y1,
+        w=x2 - x1,
+        h=y2 - y1,
+        cropped=image[y1:y2, x1:x2].copy(),
+        mask=mask,
+    )
+
+
+def _ocr_view_of_group_region(region: TextRegion, text_mask: np.ndarray) -> TextRegion:
+    """Copy of a group region with other units' glyphs painted out for OCR.
+
+    Neighbouring balloons often intrude into a balloon's bounding box; OCR
+    would otherwise read their text into this unit.
+    """
+    page_mask = text_mask[region.y : region.y + region.h, region.x : region.x + region.w]
+    own = region.mask > 0
+    foreign = (page_mask > 0) & ~own
+    if not np.any(foreign):
+        return region
+    foreign = cv2.dilate(foreign.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    foreign &= ~cv2.dilate(own.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    background = region.cropped[(page_mask == 0)]
+    if background.size == 0:
+        return region
+    paper = np.median(background.reshape(-1, 3), axis=0).astype(np.uint8)
+    cleaned = region.cropped.copy()
+    cleaned[foreign] = paper
+    return TextRegion(
+        x=region.x,
+        y=region.y,
+        w=region.w,
+        h=region.h,
+        cropped=cleaned,
+        mask=region.mask,
+    )
+
+
+def _bubble_context_region(
+    image: np.ndarray, text_mask: np.ndarray, bubble: BubbleMask
+) -> TextRegion:
+    x1, y1 = bubble.x, bubble.y
+    x2, y2 = bubble.x + bubble.w, bubble.y + bubble.h
+    return TextRegion(
+        x=x1,
+        y=y1,
+        w=x2 - x1,
+        h=y2 - y1,
+        cropped=image[y1:y2, x1:x2].copy(),
+        mask=text_mask[y1:y2, x1:x2].copy(),
+    )
+
+
+def _bubble_clip_for_region(bubble: BubbleMask | None, region: TextRegion) -> np.ndarray | None:
+    """Balloon interior (slightly grown) projected into ``region`` coordinates."""
+    if bubble is None:
+        return None
+    # Not grown: the outline lies outside the flood-filled interior, so the
+    # halo clean-up can never eat into balloon outlines or panel borders.
+    grown = bubble.mask
+    clip = np.zeros((region.h, region.w), dtype=np.uint8)
+    x1 = max(region.x, bubble.x)
+    y1 = max(region.y, bubble.y)
+    x2 = min(region.x + region.w, bubble.x + bubble.w)
+    y2 = min(region.y + region.h, bubble.y + bubble.h)
+    if x2 > x1 and y2 > y1:
+        clip[y1 - region.y : y2 - region.y, x1 - region.x : x2 - region.x] = grown[
+            y1 - bubble.y : y2 - bubble.y, x1 - bubble.x : x2 - bubble.x
+        ]
+    # Glyphs (plus their antialiasing) are always erasable, even where the
+    # balloon estimate falls short of them.
+    if region.mask is not None:
+        clip[cv2.dilate(region.mask, np.ones((3, 3), np.uint8)) > 0] = 255
+    return clip
+
+
+def _bubble_avoid_masks(
+    units: list[RenderTextUnit],
+    renderable: list[bool],
+    page_shape: tuple[int, int],
+) -> dict[int, np.ndarray]:
+    """Per balloon unit, pixels it must not draw on.
+
+    Balloon estimates (convex hulls of translucent balloons) can overlap a
+    neighbour; the overlap and any other unit's source text area are kept
+    free so translations never collide.
+    """
+    page_h, page_w = page_shape
+    occupancy = np.zeros((page_h, page_w), dtype=np.uint16)
+    others_text = np.zeros((page_h, page_w), dtype=np.uint8)
+    for unit, ok in zip(units, renderable):
+        if not ok:
+            continue
+        if unit.bubble is not None:
+            b = unit.bubble
+            occupancy[b.y : b.y + b.h, b.x : b.x + b.w] += (b.mask > 0).astype(np.uint16)
+
+    avoid: dict[int, np.ndarray] = {}
+    for idx, (unit, ok) in enumerate(zip(units, renderable)):
+        if not ok or unit.bubble is None:
+            continue
+        b = unit.bubble
+        shared = occupancy[b.y : b.y + b.h, b.x : b.x + b.w] > 1
+        others_text[:] = 0
+        for jdx, (other, ok2) in enumerate(zip(units, renderable)):
+            if jdx == idx or not ok2 or other.region.mask is None:
+                continue
+            r = other.region
+            if r.x >= b.x + b.w or r.x + r.w <= b.x or r.y >= b.y + b.h or r.y + r.h <= b.y:
+                continue
+            others_text[r.y : r.y + r.h, r.x : r.x + r.w] |= (r.mask > 0).astype(np.uint8)
+        local_text = others_text[b.y : b.y + b.h, b.x : b.x + b.w]
+        if np.any(local_text):
+            local_text = cv2.dilate(local_text, np.ones((9, 9), np.uint8))
+        mask = (shared | (local_text > 0)).astype(np.uint8) * 255
+        if np.any(mask):
+            avoid[idx] = mask
+    return avoid
+
+
+def _source_glyph_font_size(unit: RenderTextUnit) -> int:
+    """Upper bound for the English size from the source glyph size.
+
+    English lettering looks right at roughly the size of the Japanese glyphs
+    it replaces; short exclamations would otherwise balloon to huge sizes.
+    """
+    mask = unit.region.mask
+    chars = sum(1 for ch in unit.source_text if not ch.isspace())
+    if mask is None or chars <= 0:
+        return 40
+    ys, xs = np.nonzero(mask)
+    if ys.size == 0:
+        return 40
+    area = float((xs.max() - xs.min() + 1) * (ys.max() - ys.min() + 1))
+    glyph = (area / chars) ** 0.5
+    return int(np.clip(round(glyph * 0.95), 14, 72))
+
+
+def _is_short_colored_lettering(text: str, region: TextRegion) -> bool:
+    """Short, chromatic lettering drawn straight on the art is a sound effect.
+
+    Dialogue and narration are lettered in black or white; OCR often misreads
+    stylised SFX into plausible words, so the text alone cannot tell them apart.
+    """
+    chars = sum(1 for ch in text if not ch.isspace())
+    if chars == 0 or chars > 6:
+        return False
+    _, kana_count, kanji_count, _ = _script_profile(text)
+    if kanji_count > 0 or kana_count == 0:
+        # Sound effects are kana; kanji means words (titles, names, signs).
+        return False
+    color = detect_text_color(region_image=region.cropped, region_mask=region.mask)
+    if color is None:
+        return False
+    hsv = cv2.cvtColor(np.uint8([[color[::-1]]]), cv2.COLOR_BGR2HSV)[0, 0]
+    return int(hsv[1]) >= 50 and int(hsv[2]) >= 60
+
+
+def _bubble_translation_constraint(bubble: BubbleMask, page_h: int) -> TranslationConstraint:
+    """Character budget for what fits a balloon at a comfortable size."""
+    comfortable = bubble_min_font_size(page_h) * 1.15
+    char_w = comfortable * 0.68
+    line_pitch = comfortable * 1.25
+    usable = bubble.area * 0.6
+    max_chars = int(np.clip(usable / (char_w * line_pitch), 10, 120))
+    max_words = max(3, int(max_chars / 5.5) + 1)
+    return TranslationConstraint(style="dialogue", max_words=max_words, max_chars=max_chars)
