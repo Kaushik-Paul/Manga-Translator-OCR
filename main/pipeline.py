@@ -385,6 +385,7 @@ def translate_page(
                 text_color=unit.text_color,
                 allow_bubble_expansion=True,
                 return_status=True,
+                max_font_size=_source_glyph_font_size(unit),
             )
             if did_render and _render_collides_with_previous(
                 rendered_result=rendered_result,
@@ -413,6 +414,7 @@ def translate_page(
                     text_color=unit.text_color,
                     allow_bubble_expansion=False,
                     return_status=True,
+                    max_font_size=_source_glyph_font_size(unit),
                 )
                 if retry_did_render and not _render_collides_with_previous(
                     rendered_result=retry_result,
@@ -442,6 +444,7 @@ def translate_page(
                     text_color=unit.text_color,
                     allow_bubble_expansion=False,
                     return_status=True,
+                    max_font_size=_source_glyph_font_size(unit),
                 )
                 if sfx_did_render and not _render_collides_with_previous(
                     rendered_result=sfx_result,

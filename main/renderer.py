@@ -574,6 +574,7 @@ def render_text_on_image(
     text_color: tuple[int, int, int] | None = None,
     allow_bubble_expansion: bool = True,
     return_status: bool = False,
+    max_font_size: int | None = None,
 ) -> NDArray | tuple[NDArray, bool]:
     """
     Render translated text within a bounding box on the image.
@@ -587,6 +588,9 @@ def render_text_on_image(
         font_path: Path to a TTF font file.
         style_hint: Optional style override ("dialogue" or "sfx").
         padding: Internal padding.
+        max_font_size: Optional upper bound for the font size, e.g. from the
+            source glyph size, so short text never balloons past the lettering
+            it replaces.
 
     Returns:
         Modified image with text rendered.
@@ -936,6 +940,10 @@ def render_text_on_image(
     max_size_cap = None
     if non_bubble_dialogue and not mask_anchored_dialogue_box:
         max_size_cap = max(14, min(24, int(min(avail_w, avail_h) * 0.42)))
+    if max_font_size is not None:
+        max_size_cap = (
+            max_font_size if max_size_cap is None else min(max_size_cap, max_font_size)
+        )
     font, lines, line_spacing = _fit_text_to_box(
         draw=draw,
         text=text,
@@ -977,6 +985,7 @@ def render_text_on_image(
                     max_h=avail_h,
                     font_path=font_file,
                     style=text_style,
+                    max_size_cap=max_size_cap,
                 )
                 if lines2:
                     font, lines, line_spacing = font2, lines2, line_spacing2
