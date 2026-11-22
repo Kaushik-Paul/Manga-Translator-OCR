@@ -331,6 +331,16 @@ def inpaint_text_region(
         # Telea alone tends to leave grey/black ink shadows in large glyph holes.
         cleaned = region.copy()
         cleaned[mask > 0] = paper_fill
+        # Where the text sat on a wide non-paper surface (a translucent
+        # balloon over art, a panel-border band), continue that surface
+        # instead of stamping paper-coloured patches.
+        surface = _surface_background(region, mask, paper_fill)
+        if surface is not None:
+            deviation = np.max(
+                np.abs(surface.astype(np.int16) - paper_fill.astype(np.int16)), axis=2
+            )
+            hot = (deviation > _SURFACE_DIFF) & (mask > 0)
+            cleaned[hot] = surface[hot]
         # Only blend a thin ring at the mask edge.  Inpainting the whole mask
         # would discard the paper fill and drag outline/border ink into the
         # hole wherever the mask touches a balloon or caption-box edge.
@@ -345,6 +355,61 @@ def inpaint_text_region(
     result[y : y + h, x : x + w] = inpainted
 
     return result
+
+
+# Max per-channel distance from the paper colour that still counts as paper.
+_SURFACE_DIFF = 18
+
+
+def _surface_background(
+    region: NDArray, mask: NDArray, paper_fill: np.ndarray
+) -> NDArray | None:
+    """Background behind ``mask`` rebuilt from wide non-paper surfaces.
+
+    Returns ``None`` when the erased text is surrounded only by paper, so
+    ordinary balloons keep the plain paper fill.
+
+    Thin ink (balloon outlines, panel lines, glyph halos) never acts as an
+    inpainting source: a 5x5 opening keeps only surfaces at least ~5 px wide.
+    Neither does anything that can only be reached from the text by crossing
+    such ink, e.g. art outside the balloon outline.  This avoids the black
+    smears that whole-mask Telea used to drag in from outlines.
+    """
+    erase = mask > 0
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    # Lines darker than their local surroundings (outlines and their
+    # anti-aliasing).  Without this an outline bordering a wide gray area
+    # outside the balloon survives the opening and bridges into the text.
+    ink = gray.astype(np.int16) < cv2.medianBlur(gray, 11).astype(np.int16) - 25
+    if int(paper_fill.mean()) > 128:
+        # Very dark wide areas on light paper are ink (thick outlines, solid
+        # blacks), not a surface the text was printed on.
+        ink |= gray < 60
+    diff = np.max(np.abs(region.astype(np.int16) - paper_fill.astype(np.int16)), axis=2)
+    off_paper = ((diff > _SURFACE_DIFF) & ~erase & ~ink).astype(np.uint8) * 255
+    wide = (
+        cv2.morphologyEx(
+            off_paper,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        )
+        > 0
+    )
+    sources = ~erase & ~ink & ((diff <= _SURFACE_DIFF) | wide)
+    _, labels = cv2.connectedComponents((sources | erase).astype(np.uint8), connectivity=4)
+    touching = np.unique(labels[erase])
+    reachable = np.isin(labels, touching[touching > 0]) & sources
+    near_text = (
+        cv2.dilate(
+            mask.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)),
+        )
+        > 0
+    )
+    if np.count_nonzero(wide & reachable & near_text) < 30:
+        return None
+    holes = (~reachable).astype(np.uint8) * 255
+    return cv2.inpaint(region, holes, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
 
 
 def build_inpaint_mask(
