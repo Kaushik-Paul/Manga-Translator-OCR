@@ -422,6 +422,33 @@ def translate_page(
                     rendered_result = retry_result
                 else:
                     did_render = False
+            if (
+                not did_render
+                and unit.style_hint != "sfx"
+                and _is_compact_sfx_render(translated)
+            ):
+                # Short free text whose dialogue render found no paper surface
+                # (it sits on art): draw it as outlined lettering in its own
+                # region instead of leaving the Japanese in place.
+                sfx_result, sfx_did_render = render_text_on_image(
+                    result,
+                    translated,
+                    unit.region.x,
+                    unit.region.y,
+                    unit.region.w,
+                    unit.region.h,
+                    region_mask=unit.region.mask,
+                    style_hint="sfx",
+                    text_color=unit.text_color,
+                    allow_bubble_expansion=False,
+                    return_status=True,
+                )
+                if sfx_did_render and not _render_collides_with_previous(
+                    rendered_result=sfx_result,
+                    result=result,
+                    rendered_pixel_mask=rendered_pixel_mask,
+                ):
+                    rendered_result, did_render = sfx_result, True
             if did_render:
                 rendered_units += 1
                 changed = np.any(rendered_result != result, axis=2)
