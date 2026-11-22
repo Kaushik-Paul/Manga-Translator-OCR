@@ -56,6 +56,9 @@ class RenderTextUnit:
     # Group-derived units are already complete balloons/blocks: never re-split.
     from_layout: bool = False
     page_height: int = 0
+    # Glyph strokes of refined balloon-less lettering (region-local), used to
+    # read the lettering colour instead of the erase mask's outline halo.
+    glyph_mask: np.ndarray | None = None
 
 
 def translate_page(
@@ -129,6 +132,17 @@ def translate_page(
     units: list[RenderTextUnit] = []
     inpaint_region_indices: set[int] = set()
 
+    # Balloon-less lettering: tighten sloppy detector masks to the glyphs.
+    lettering: dict[int, _Lettering] = {}
+    for region_idx, region in enumerate(regions):
+        if region_idx < len(group_regions) and groups[region_idx].bubble is not None:
+            continue
+        refined = _refine_lettering_region(region)
+        if refined is not None:
+            lettering[region_idx] = refined
+    if lettering:
+        logger.debug("Refined %d lettering mask(s) to glyph strokes.", len(lettering))
+
     # Pre-split all regions into OCR sub-regions
     all_ocr_tasks: list[tuple[int, int, TextRegion]] = []
     for region_idx, region in enumerate(regions):
@@ -151,6 +165,13 @@ def translate_page(
     def _ocr_one(task: tuple[int, int, TextRegion]) -> tuple[int, int, TextRegion, str]:
         region_idx, sub_idx, ocr_region = task
         text = ocr_engine.extract_text(ocr_region.cropped, ocr_region.mask).strip()
+        refined = lettering.get(region_idx)
+        if refined is not None:
+            views = _lettering_ocr_views(ocr_region.cropped, refined.glyph_lab)
+            candidates = [
+                ocr_engine.extract_text(view, ocr_region.mask).strip() for view in views
+            ]
+            text = _vote_lettering_ocr(candidates + [text])
         return region_idx, sub_idx, ocr_region, text
 
     if cfg.use_modal and len(all_ocr_tasks) > 1:
@@ -174,16 +195,36 @@ def translate_page(
             continue
 
         parent_region = regions[region_idx]
+        refined = lettering.get(region_idx)
+        glyph_mask: np.ndarray | None = None
+        if refined is not None:
+            # Erase, colour-detect and anchor the render on the glyphs, not
+            # on the detector's blob.
+            if region_idx < len(group_regions):
+                glyph_mask = refined.glyph_mask
+            else:
+                glyph_mask = _slice_parent_mask(parent_region, ocr_region, refined.glyph_mask)
+                ocr_region = _with_mask(
+                    ocr_region,
+                    _slice_parent_mask(parent_region, ocr_region, refined.erase_mask),
+                )
         if region_idx < len(group_regions):
             group = groups[region_idx]
             # OCR ran on a cleaned view; render/inpaint use the real region.
-            unit_region = parent_region
+            unit_region = (
+                _with_mask(parent_region, refined.erase_mask)
+                if refined is not None
+                else parent_region
+            )
             if group.bubble is not None:
                 style_hint = "dialogue"
             else:
                 style_hint = _infer_unit_style(text, unit_region.w, unit_region.h)
                 if style_hint == "dialogue" and _is_short_colored_lettering(
-                    text, unit_region
+                    text,
+                    unit_region
+                    if glyph_mask is None
+                    else _with_mask(unit_region, glyph_mask),
                 ):
                     style_hint = "sfx"
             units.append(
@@ -200,11 +241,15 @@ def translate_page(
                     bubble=group.bubble,
                     from_layout=True,
                     page_height=image.shape[0],
+                    glyph_mask=glyph_mask,
                 )
             )
         else:
             style_hint = _infer_unit_style(text, ocr_region.w, ocr_region.h)
-            if style_hint == "dialogue" and _is_short_colored_lettering(text, ocr_region):
+            if style_hint == "dialogue" and _is_short_colored_lettering(
+                text,
+                ocr_region if glyph_mask is None else _with_mask(ocr_region, glyph_mask),
+            ):
                 style_hint = "sfx"
             units.append(
                 RenderTextUnit(
@@ -217,6 +262,7 @@ def translate_page(
                     source_text=text,
                     style_hint=style_hint,
                     parent_region_index=region_idx,
+                    glyph_mask=glyph_mask,
                 )
             )
         inpaint_region_indices.add(region_idx)
@@ -300,7 +346,7 @@ def translate_page(
         region = unit.region
         unit.text_color = detect_text_color(
             region_image=region.cropped,
-            region_mask=region.mask,
+            region_mask=region.mask if unit.glyph_mask is None else unit.glyph_mask,
         )
         if unit.text_color is not None:
             logger.debug(
@@ -2665,9 +2711,18 @@ def _is_effect_like_source(clean: str, kana_count: int, kanji_count: int) -> boo
 
 
 
+_SFX_LABEL_RE = re.compile(
+    r"^\s*(?:[\[(]\s*(?:sfx|sound\s+effect)\s*[\])]\s*[:：\-–]?"
+    r"|(?:sfx|sound\s+effect)\s*[:：\-–])\s*",
+    re.IGNORECASE,
+)
+
+
 def _sanitize_translated_text(text: str) -> str:
     """Guard against untranslated CJK leakage before rendering."""
     clean = " ".join(text.replace("\r", " ").replace("\n", " ").split())
+    # The model sometimes labels sound effects ("SFX: GOOD"); draw only the word.
+    clean = _SFX_LABEL_RE.sub("", clean) or clean
     # First pass: replace common unsupported unicode chars with ASCII equivalents
     clean = _replace_unsupported_chars(clean)
     if not _contains_cjk(clean):
@@ -3597,3 +3652,165 @@ def _bubble_translation_constraint(bubble: BubbleMask, page_h: int) -> Translati
     max_chars = int(np.clip(usable / (char_w * line_pitch), 10, 120))
     max_words = max(3, int(max_chars / 5.5) + 1)
     return TranslationConstraint(style="dialogue", max_words=max_words, max_chars=max_chars)
+
+
+@dataclass
+class _Lettering:
+    """Balloon-less lettering whose detector mask was tightened to its strokes."""
+
+    erase_mask: np.ndarray  # region-local uint8 0/255: glyphs plus outline halo
+    glyph_mask: np.ndarray  # region-local uint8 0/255: glyph strokes only
+    glyph_lab: np.ndarray  # Lab centre of the glyph colour
+
+
+def _ellipse(size: int) -> np.ndarray:
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+
+
+# Lab chroma below which lettering counts as black/white/gray.
+_LETTERING_MIN_CHROMA = 25.0
+
+
+def _refine_lettering_region(region: TextRegion) -> _Lettering | None:
+    """Tighten a sloppy detector mask on free lettering to the real glyphs.
+
+    The text detector's mask for SFX drawn on art is often a blob that is
+    offset from the strokes and covers skin, hands or nearby lettering.  OCR,
+    colour detection and inpainting all inherit that blob.  The mask pixels
+    are clustered by colour; clusters that also dominate the surrounding ring
+    are background, and the innermost remaining cluster is the glyph colour
+    (outlines and halos sit at the edge of the mask, the fill inside).
+
+    Returns ``None`` unless the glyphs are coloured (not black/white), the
+    glyph colour is clearly separable and every other non-background colour
+    hugs the glyphs as their outline, so multi-coloured or ambiguous regions
+    keep their original mask.
+    """
+    crop, mask = region.cropped, region.mask
+    if crop is None or mask is None or mask.shape[:2] != crop.shape[:2]:
+        return None
+    mask = (mask > 0).astype(np.uint8) * 255
+    inside = mask > 0
+    n = int(np.count_nonzero(inside))
+    if n < 200:
+        return None
+    ring = (cv2.dilate(mask, _ellipse(15)) > 0) & ~(cv2.dilate(mask, _ellipse(7)) > 0)
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2Lab).astype(np.float32)
+    ring_px = lab[ring]
+    if len(ring_px) < 50:
+        return None
+
+    cv2.setRNGSeed(7)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    _, labels, centres = cv2.kmeans(
+        lab[inside], 3, None, criteria, 3, cv2.KMEANS_PP_CENTERS
+    )
+    labels = labels.ravel()
+    depth = cv2.distanceTransform(inside.astype(np.uint8), cv2.DIST_L2, 3)[inside]
+    clusters = []
+    for c in range(3):
+        sel = labels == c
+        share = float(sel.mean())
+        bg_likeness = float((np.linalg.norm(ring_px - centres[c], axis=1) < 15).mean())
+        inner = float(np.median(depth[sel])) if sel.any() else 0.0
+        clusters.append((c, share, bg_likeness, inner))
+    foreground = [cl for cl in clusters if cl[2] < 0.10 and cl[1] >= 0.08]
+    if not foreground:
+        return None
+    glyph_c = max(foreground, key=lambda cl: cl[3])[0]
+    # Only coloured lettering: black/white text keeps the detector mask that
+    # the legacy box renderer's balloon heuristics are tuned on.
+    chroma = float(np.hypot(centres[glyph_c][1] - 128.0, centres[glyph_c][2] - 128.0))
+    if chroma < _LETTERING_MIN_CHROMA:
+        return None
+    separation = min(
+        float(np.linalg.norm(centres[glyph_c] - centres[o])) for o in range(3) if o != glyph_c
+    )
+    if separation < 20:
+        return None
+
+    dist = np.stack([np.linalg.norm(lab - centres[c], axis=2) for c in range(3)], axis=2)
+    near = cv2.dilate(mask, _ellipse(7)) > 0
+    glyph = near & (np.argmin(dist, axis=2) == glyph_c) & (dist[:, :, glyph_c] < 25)
+    glyph = cv2.morphologyEx(
+        glyph.astype(np.uint8) * 255, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8)
+    )
+    glyph_px = int(np.count_nonzero(glyph))
+    if glyph_px < max(60, int(0.10 * n)):
+        return None
+
+    # Other foreground colours must be the glyphs' outline/halo; a second
+    # lettering colour elsewhere in the region means we would drop text.
+    halo_zone = cv2.dilate(glyph, _ellipse(19)) > 0
+    for c, share, bg_likeness, _ in clusters:
+        if c == glyph_c or bg_likeness >= 0.10 or share < 0.08:
+            continue
+        sel = np.zeros_like(inside)
+        sel[inside] = labels == c
+        if np.count_nonzero(sel & ~halo_zone) > 0.3 * np.count_nonzero(sel):
+            return None
+
+    # Erase the strokes plus a halo scaled to the stroke width (the white or
+    # dark outline lettering usually carries), never beyond the detector mask.
+    stroke_dt = cv2.distanceTransform(glyph, cv2.DIST_L2, 3)[glyph > 0]
+    stroke = 2.0 * float(np.percentile(stroke_dt, 90))
+    radius = int(np.clip(round(stroke), 4, 9))
+    erase = cv2.dilate(glyph, _ellipse(2 * radius + 1)) & cv2.dilate(mask, _ellipse(7))
+    return _Lettering(erase_mask=erase, glyph_mask=glyph, glyph_lab=centres[glyph_c].copy())
+
+
+def _with_mask(region: TextRegion, mask: np.ndarray) -> TextRegion:
+    return TextRegion(
+        x=region.x, y=region.y, w=region.w, h=region.h, cropped=region.cropped, mask=mask
+    )
+
+
+def _slice_parent_mask(parent: TextRegion, sub: TextRegion, mask: np.ndarray) -> np.ndarray:
+    """Cut a parent-local mask down to a sub-region's box."""
+    x0, y0 = sub.x - parent.x, sub.y - parent.y
+    out = np.zeros((sub.h, sub.w), dtype=np.uint8)
+    part = mask[max(0, y0) : y0 + sub.h, max(0, x0) : x0 + sub.w]
+    oy, ox = max(0, -y0), max(0, -x0)
+    out[oy : oy + part.shape[0], ox : ox + part.shape[1]] = part
+    return out
+
+
+def _lettering_ocr_views(crop: np.ndarray, glyph_lab: np.ndarray) -> list[np.ndarray]:
+    """Clutter-free OCR inputs for lettering of a known colour.
+
+    1. The real glyph pixels with their outline, everything else white.
+    2. A synthetic dark-on-white rendering of the glyph colour.
+    Every glyph-coloured stroke in the crop is kept, not only this unit's,
+    because the detector mask often covers just part of an SFX.
+    """
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2Lab).astype(np.float32)
+    dist = np.linalg.norm(lab - glyph_lab, axis=2)
+    strokes = cv2.morphologyEx(
+        (dist < 25).astype(np.uint8), cv2.MORPH_OPEN, np.ones((2, 2), np.uint8)
+    )
+    natural = crop.copy()
+    natural[cv2.dilate(strokes, _ellipse(9)) == 0] = 255
+    ink = np.clip((32.0 - dist) / 18.0, 0.0, 1.0)
+    synthetic = cv2.cvtColor((255 * (1.0 - ink)).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+    return [natural, synthetic]
+
+
+_OCR_PUNCT_RE = re.compile(r"[\s…．.。、・,:;!?！？♡♥❤～〜ー\-]+")
+
+
+def _vote_lettering_ocr(candidates: list[str]) -> str:
+    """Pick an OCR reading for lettering from several views of it.
+
+    manga-ocr is unstable on stylised SFX and each view fails on different
+    units, but two views rarely agree on a wrong reading.  ``candidates`` is
+    ordered natural view, synthetic view, original crop.
+    """
+    norms = [_OCR_PUNCT_RE.sub("", c) for c in candidates]
+    for i in range(len(candidates)):
+        for j in range(i + 1, len(candidates)):
+            if norms[i] and norms[i] == norms[j]:
+                return candidates[i]
+    for cand, norm in zip(candidates, norms):
+        if 2 <= len(norm) <= 6 and all(_is_kana_char(ch) for ch in norm):
+            return cand
+    return candidates[-1]
