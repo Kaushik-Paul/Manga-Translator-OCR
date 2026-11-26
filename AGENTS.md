@@ -10,7 +10,7 @@ Manga Translator OCR is an end-to-end pipeline that translates Japanese manga/do
 5. **Rendering** — PIL renders translated English text into the cleaned bubble using comic fonts
 
 ## Entry Points
-- **Gradio Web UI** — `main/app.py` — interactive single-page translation with GCP Cloud Storage integration
+- **Gradio Web UI** — `main/app.py` — interactive single-page translation with GCP Cloud Storage integration. The whole UI sits behind a lock screen (see "Lock Screen" below)
 - **CLI** — `main/cli.py` — batch translation of files or directories
 
 ## Deployment Targets
@@ -46,12 +46,16 @@ manga-translator-ocr/
 │   ├── scripts/                 # Deployment and utility scripts
 │   │   ├── modal_ocr_service.py     # Modal GPU/CPU OCR service definition
 │   │   ├── modal_detector_service.py # Modal detector service definition
+│   │   ├── deploy_space.py          # Deploy the app to a HF Space (respects .gitignore)
 │   │   └── upload_assets.py         # Upload weights/fonts to HF Space
 │   └── ui/                      # Gradio UI components
 │       ├── gradio_app.py        # Full Gradio Blocks app, event handlers, global state
 │       ├── pipeline_runner.py   # Generator-based pipeline wrapper for UI progress reporting
 │       └── styles.py            # Custom CSS
 ├── manga_testing/               # Test images (gitignored)
+├── AGENTS.md                    # Agent instructions (this file, the single source of truth)
+├── CLAUDE.md                    # Only imports AGENTS.md; do not add content there
+├── gradio_sdk.txt               # HF Space README metadata for both Spaces (gitignored, local only)
 ├── pyproject.toml               # Project metadata and dependencies
 ├── .env                         # Local secrets (gitignored in production)
 └── .python-version              # Python 3.12
@@ -75,6 +79,12 @@ Use factory functions to get the right backend based on config:
 
 ### Gradio Global State
 `GLOBAL_STATE` dict in `gradio_app.py` is the shared mutable state across Gradio event handlers. The translation pipeline runs in a background `threading.Thread`; the UI polls via a `gr.Timer`. Do not block Gradio event handlers with long-running work.
+
+### Lock Screen
+The web UI opens on a lock screen and stays hidden until `GRADIO_ACTION_PASSWORD` is entered. After that no action asks for the password again.
+- Unlock state is a per-session `gr.State` (`unlocked`), which lives on the server. Every handler that reads or changes data must be wired as `fn=_require_unlocked(handler)` with `unlocked` as its **first** input. Hiding the UI is not protection, because Gradio endpoints can be called directly.
+- Handlers that also fire from programmatic value changes (`.change`, timer syncs) should skip locked sessions quietly instead of raising (see `select_images_for_session`, `sync_for_session`).
+- The browser remembers a device by storing `{"token": HMAC(password)}` in localStorage via `gr.BrowserState`, never the plaintext password. BrowserState does not save falsy values, so clearing it means writing `{"token": ""}`.
 
 ### Parallelism
 - Multiple pages: `ThreadPoolExecutor` with batch processing (configurable via `MODAL_MAX_PARALLEL_PAGES` / `LOCAL_MAX_PARALLEL_PAGES`)
@@ -147,17 +157,35 @@ uv run python -m main.cli --input page01.jpg
 # Translate a directory
 uv run python -m main.cli --input ./manga_chapter/ --output ./output/ -v
 
-# Deploy Modal services (GPU OCR + detector)
-uv run modal setup
-uv run modal deploy main/scripts/modal_ocr_service.py
-uv run modal deploy main/scripts/modal_detector_service.py
+# Deploy Modal services (GPU OCR + detector). Use the MODAL_TOKEN_* from .env:
+# the local `modal` CLI profile may point to a different workspace.
+(set -a; . ./.env; set +a; uv run modal deploy main/scripts/modal_ocr_service.py)
+(set -a; . ./.env; set +a; uv run modal deploy main/scripts/modal_detector_service.py)
 
-# Deploy to Hugging Face Spaces
-uv run gradio deploy
+# Deploy to Hugging Face Spaces: follow "Deploying to Hugging Face Spaces" below.
+# Do not use `uv run gradio deploy`; it ignores .gitignore.
 
 # Upload weights/fonts to HF Space (after deploy)
 uv run python main/scripts/upload_assets.py
 ```
+
+## Deploying to Hugging Face Spaces
+The app is deployed to **two** Spaces, and both must be updated on every release:
+
+| Space | Metadata `title` in `gradio_sdk.txt` |
+|---|---|
+| `kaushikpaul/Manga-Translator-OCR` | `Manga-Translator-OCR` |
+| `kaushikpaul/Manga-Translator-OCR_Copy` | `Manga-Translator-OCR_Copy` |
+
+A Space reads its config from YAML front matter at the top of `README.md`. The GitHub `README.md` must **never** contain that front matter. Each Space's block is kept in the local, gitignored `gradio_sdk.txt`, as two `---` … `---` blocks in the order of the table above.
+
+Deploy only from an up-to-date, clean `master` (`git checkout master && git pull && git status`). Then, for **each** Space in turn:
+
+1. Prepend that Space's metadata block from `gradio_sdk.txt` to `README.md`, followed by a blank line.
+2. Deploy: `uv run python -m main.scripts.deploy_space --repo-id kaushikpaul/<Space name>`. Add `--dry-run` first to list the files it would upload. The script uploads only git-visible files minus its ignore list. `.env`, weights and fonts are never uploaded.
+3. Remove the metadata again with `git checkout -- README.md`, and confirm `git status` is clean.
+
+Never commit `README.md` while it has metadata in it. After both deploys, wait until each Space reports `RUNNING`, for example with `HfApi().get_space_runtime("kaushikpaul/<Space name>").stage`. App secrets (`API_KEY`, `GRADIO_ACTION_PASSWORD`, GCP and Modal tokens, ...) are set in each Space's settings on Hugging Face, not uploaded.
 
 ## Linting
 - Ruff is configured (`.ruff_cache/` present). Run with: `uv run ruff check .`
