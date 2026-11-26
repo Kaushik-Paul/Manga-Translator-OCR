@@ -11,11 +11,13 @@ Provides a web interface to:
 from __future__ import annotations
 
 import hmac
+import html
 import logging
 import threading
 from pathlib import Path
 
 import gradio as gr
+from gradio.data_classes import FileData
 
 from ..config import settings
 from ..gcp_storage import (
@@ -39,6 +41,24 @@ GLOBAL_STATE = {
     "failed_text": "",
     "download_url": "",
 }
+
+
+class OriginalNameFile(gr.File):
+    """`gr.File` that also hands back the filename the user picked.
+
+    Gradio strips characters such as `[`, `]` and `&` from the temp file it
+    stores. The browser still sends the untouched name as `orig_name`, so it is
+    attached to the returned path as `.orig_name`. `is_template` keeps the
+    frontend rendering this as the regular File component.
+    """
+
+    is_template = True
+
+    def _process_single_file(self, f: FileData):
+        processed = super()._process_single_file(f)
+        if isinstance(processed, str):
+            processed.orig_name = f.orig_name  # type: ignore[attr-defined]
+        return processed
 
 
 
@@ -181,7 +201,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     '<div class="auth-modal-message">Select a .zip file. '
                     'It will be uploaded to raw-manga/&lt;zip-name&gt;/.</div>'
                 )
-                upload_zip_file = gr.File(
+                upload_zip_file = OriginalNameFile(
                     label="ZIP file",
                     file_types=[".zip"],
                     type="filepath",
@@ -352,7 +372,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     return (
                         gr.update(
                             visible=True,
-                            value=f'<span class="result-error">❌ Folder "<b>{folder_name}</b>" not found in raw-manga/.</span>',
+                            value=f'<span class="result-error">❌ Folder "<b>{html.escape(folder_name)}</b>" not found in raw-manga/.</span>',
                         ),
                         gr.update(visible=False),
                         gr.update(choices=[], value=[]),
@@ -363,7 +383,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     return (
                         gr.update(
                             visible=True,
-                            value=f'<span class="result-error">⚠️ Folder "<b>{folder_name}</b>" has no images.</span>',
+                            value=f'<span class="result-error">⚠️ Folder "<b>{html.escape(folder_name)}</b>" has no images.</span>',
                         ),
                         gr.update(visible=False),
                         gr.update(choices=[], value=[]),
@@ -379,7 +399,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                 return (
                     gr.update(
                         visible=True,
-                        value=f'<span class="result-success">✅ Found {len(images)} image(s) in "<b>{folder_name}</b>"</span>',
+                        value=f'<span class="result-success">✅ Found {len(images)} image(s) in "<b>{html.escape(folder_name)}</b>"</span>',
                     ),
                     gr.update(visible=True),
                     gr.update(choices=choices, value=GLOBAL_STATE["selected_images"]),
@@ -618,6 +638,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                 folder_name, uploaded_count = upload_raw_manga_zip(
                     zip_path=Path(zip_file_path),
                     local_dir=settings.output_dir,
+                    original_filename=getattr(zip_file_path, "orig_name", None),
                 )
                 folder_status_update, image_section_update, image_selector_update = load_folder(
                     folder_name
@@ -630,7 +651,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                         visible=True,
                         value=(
                             '<span class="result-success">✅ Uploaded '
-                            f'{uploaded_count} file(s) to raw-manga/<b>{folder_name}</b>/.</span>'
+                            f'{uploaded_count} file(s) to raw-manga/<b>{html.escape(folder_name)}</b>/.</span>'
                         ),
                     ),
                     gr.update(visible=False, value=""),
@@ -701,7 +722,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                             visible=True,
                             value=(
                                 '<span class="result-error">⚠️ Folder '
-                                f'"<b>{normalized}</b>" was not found in raw-manga/ '
+                                f'"<b>{html.escape(normalized)}</b>" was not found in raw-manga/ '
                                 "or translated-manga/.</span>"
                             ),
                         ),
@@ -734,8 +755,8 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                         visible=True,
                         value=(
                             '<span class="result-success">✅ Deleted '
-                            f'{raw_deleted} file(s) from raw-manga/<b>{normalized}</b>/ and '
-                            f'{translated_deleted} file(s) from translated-manga/<b>{normalized}</b>/.</span>'
+                            f'{raw_deleted} file(s) from raw-manga/<b>{html.escape(normalized)}</b>/ and '
+                            f'{translated_deleted} file(s) from translated-manga/<b>{html.escape(normalized)}</b>/.</span>'
                         ),
                     ),
                     gr.update(visible=False, value=""),
