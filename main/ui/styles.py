@@ -199,6 +199,12 @@ CUSTOM_CSS = """
     padding-right: 20px !important;
 }
 
+/* Gradio pads .main as well; one gutter (on .gradio-container) is enough. */
+.gradio-container > .main {
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+}
+
 /* Let the input focus ring show instead of being clipped by its block. */
 .gradio-container .form,
 .gradio-container .form > .block {
@@ -239,6 +245,10 @@ CUSTOM_CSS = """
     -webkit-mask-image: linear-gradient(to left, #000, transparent);
     mask-image: linear-gradient(to left, #000, transparent);
     pointer-events: none;
+}
+
+.mt-hero > * {
+    min-width: 0;
 }
 
 .mt-brand {
@@ -439,6 +449,10 @@ CUSTOM_CSS = """
     align-items: stretch !important;
 }
 
+.mt-folder-row > button {
+    white-space: nowrap !important;
+}
+
 .mt-folder-row input,
 .mt-folder-row textarea {
     height: 100%;
@@ -551,6 +565,7 @@ button:disabled {
 
 /* ── Progress log ───────────────────────────────────── */
 .progress-box textarea {
+    max-height: min(560px, 62vh);
     font-family: var(--font-mono) !important;
     font-size: 0.8rem !important;
     line-height: 1.7 !important;
@@ -770,5 +785,233 @@ button:disabled {
     padding: 0 !important;
     border: none !important;
     background: transparent !important;
+}
+
+/* ── Run status badge ───────────────────────────────── */
+.mt-toolbar-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem 0.6rem;
+}
+
+.mt-badge {
+    --mt-badge-color: var(--body-text-color-subdued);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.2rem 0.6rem;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--mt-badge-color) 30%, transparent);
+    background: color-mix(in srgb, var(--mt-badge-color) 10%, transparent);
+    color: var(--mt-badge-color);
+    font-size: 0.74rem;
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.mt-badge-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: currentColor;
+}
+
+.mt-badge-running {
+    --mt-badge-color: var(--mt-indigo);
+}
+
+.mt-badge-running .mt-badge-dot {
+    animation: mt-pulse 1.2s ease-in-out infinite;
+}
+
+.mt-badge-done {
+    --mt-badge-color: var(--mt-success);
+}
+
+.mt-badge-finished {
+    --mt-badge-color: var(--mt-accent);
+}
+
+@keyframes mt-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 60%, transparent); }
+    50% { box-shadow: 0 0 0 5px transparent; }
+}
+
+/* ── Accessibility ──────────────────────────────────── */
+button:focus-visible,
+.image-selector label:focus-within {
+    outline: 2px solid var(--mt-accent) !important;
+    outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+    }
+}
+
+/* ── Tablet (≤ 900px) ──────────────────────────────── */
+@media (max-width: 900px) {
+    .mt-columns {
+        flex-direction: column !important;
+        align-items: stretch !important;
+    }
+
+    .mt-columns > .column {
+        width: 100% !important;
+        min-width: 0 !important;
+    }
+
+    .mt-pipeline {
+        width: 100%;
+    }
+}
+
+/* ── Phone (≤ 640px) ────────────────────────────────── */
+@media (max-width: 640px) {
+    .gradio-container {
+        padding-left: 12px !important;
+        padding-right: 12px !important;
+    }
+
+    .mt-hero {
+        margin-top: 0.25rem;
+        padding: 1rem;
+        border-radius: 16px;
+        gap: 0.85rem;
+    }
+
+    .mt-hero::after {
+        width: 70%;
+    }
+
+    .mt-brand {
+        align-items: flex-start;
+        gap: 0.75rem;
+    }
+
+    .mt-logo {
+        width: 42px;
+        height: 42px;
+        border-radius: 12px;
+        font-size: 1.3rem;
+    }
+
+    .mt-brand p {
+        font-size: 0.85rem;
+    }
+
+    /* Stages scroll sideways instead of wrapping onto several lines. */
+    .mt-pipeline {
+        flex: 1 1 100%;
+        flex-wrap: nowrap;
+        min-width: 0;
+        max-width: 100%;
+        /* Keep the row's full width from widening the page. */
+        contain: inline-size;
+        overflow-x: auto;
+        scrollbar-width: none;
+    }
+
+    .mt-pipeline::-webkit-scrollbar {
+        display: none;
+    }
+
+    .mt-main,
+    .mt-columns,
+    .mt-stack {
+        gap: 0.75rem !important;
+    }
+
+    .mt-toolbar {
+        padding: 0;
+    }
+
+    .mt-toolbar-head,
+    .mt-toolbar-actions {
+        flex: 1 1 100% !important;
+    }
+
+    /* Toolbar actions become an even 2 × 2 grid. */
+    .mt-toolbar-actions {
+        display: grid !important;
+        grid-template-columns: 1fr 1fr;
+        gap: 0.5rem !important;
+    }
+
+    .mt-toolbar-actions button {
+        width: 100% !important;
+        min-height: 44px;
+    }
+
+    .mt-card {
+        padding: 1rem !important;
+        border-radius: 16px !important;
+        gap: 0.8rem !important;
+    }
+
+    .mt-folder-row {
+        flex-wrap: nowrap !important;
+    }
+
+    .mt-folder-row > button {
+        min-width: 88px !important;
+    }
+
+    .image-selector .wrap {
+        grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+        max-height: 300px;
+    }
+
+    .image-selector label {
+        min-height: 44px;
+    }
+
+    .progress-box textarea {
+        max-height: 50vh;
+        font-size: 0.74rem !important;
+        padding: 12px !important;
+    }
+
+    .translate-btn,
+    .download-btn {
+        min-height: 52px;
+    }
+
+    .auth-modal-overlay {
+        align-items: flex-end !important;
+        padding: 0 !important;
+    }
+
+    /* Popups slide up as bottom sheets on phones. */
+    .auth-modal-card {
+        width: 100% !important;
+        max-height: 92dvh;
+        border-radius: 20px 20px 0 0 !important;
+        padding: 1.2rem 1rem calc(1rem + env(safe-area-inset-bottom)) 1rem !important;
+        animation-name: mt-sheet;
+    }
+
+    .mt-modal-actions button {
+        flex: 1 1 0 !important;
+        min-height: 46px;
+    }
+
+    .lock-screen {
+        margin-top: 1rem !important;
+    }
+
+    .lock-card {
+        padding: 1.25rem !important;
+        border-radius: 18px !important;
+    }
+}
+
+@keyframes mt-sheet {
+    from { transform: translateY(24px); opacity: 0; }
+    to { transform: none; opacity: 1; }
 }
 """

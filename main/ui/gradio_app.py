@@ -179,6 +179,39 @@ def _card_header(step: str, title: str, subtitle: str) -> str:
     )
 
 
+# Run status shown next to the workspace title: (css modifier, label).
+_RUN_STATUSES = {
+    "idle": ("idle", "Ready"),
+    "running": ("running", "Translating…"),
+    "done": ("done", "Download ready"),
+    "finished": ("finished", "Finished"),
+}
+
+
+def _run_status() -> str:
+    """Pick the run status key from the shared global state."""
+    if GLOBAL_STATE.get("is_running"):
+        return "running"
+    if GLOBAL_STATE.get("download_url"):
+        return "done"
+    if GLOBAL_STATE.get("log_text"):
+        return "finished"
+    return "idle"
+
+
+def _workspace_header(status: str = "idle") -> str:
+    """HTML for the toolbar's title, description and run status badge."""
+    modifier, label = _RUN_STATUSES[status]
+    return (
+        '<div class="mt-toolbar-title">'
+        '<div class="mt-toolbar-row"><h2>Workspace</h2>'
+        f'<span class="mt-badge mt-badge-{modifier}" role="status">'
+        f'<span class="mt-badge-dot"></span>{label}</span></div>'
+        "<p>Load a raw-manga folder, pick pages, translate.</p>"
+        "</div>"
+    )
+
+
 def _modal_header(icon: str, title: str, message: str, danger: bool = False) -> str:
     """HTML for a popup's icon, title and explanation."""
     tone = " mt-modal-icon-danger" if danger else ""
@@ -248,13 +281,8 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Base, str]:
         with gr.Column(visible=False, elem_classes=["mt-main"]) as main_view:
             # ── Toolbar ────────────────────────────────────
             with gr.Row(elem_classes=["mt-toolbar"], equal_height=True):
-                gr.HTML(
-                    """
-                    <div class="mt-toolbar-title">
-                        <h2>Workspace</h2>
-                        <p>Load a raw-manga folder, pick pages, translate.</p>
-                    </div>
-                    """,
+                workspace_header = gr.HTML(
+                    _workspace_header(),
                     elem_classes=["mt-bare", "mt-toolbar-head"],
                 )
                 with gr.Row(elem_classes=["mt-toolbar-actions"]):
@@ -510,7 +538,8 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Base, str]:
                 gr.update(interactive=not is_running), # upload_zip_btn
                 gr.update(interactive=not is_running), # delete_folder_btn
                 gr.update(interactive=not is_running), # clear_btn
-                gr.update(active=is_running) # timer active while running
+                gr.update(active=is_running), # timer active while running
+                _workspace_header(_run_status()), # workspace_header
             )
 
         def load_folder(folder_name: str):
@@ -956,6 +985,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Base, str]:
             delete_folder_btn,
             clear_btn,
             timer,
+            workspace_header,
         ]
         upload_modal_outputs = [
             upload_modal,
