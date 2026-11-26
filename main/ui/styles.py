@@ -590,6 +590,11 @@ button:disabled {
     animation: mt-fade 0.18s ease both;
 }
 
+/* A closed popup's Column stays in the DOM with Gradio's `hide` class. */
+.auth-modal-overlay.hide {
+    display: none !important;
+}
+
 .auth-modal-card {
     flex: 0 1 auto !important;
     width: min(500px, 100%) !important;
