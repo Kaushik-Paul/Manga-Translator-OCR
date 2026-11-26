@@ -134,6 +134,12 @@ CUSTOM_CSS = """
     font-weight: 600 !important;
 }
 
+.lock-btn {
+    border-radius: 10px !important;
+    font-weight: 600 !important;
+    white-space: nowrap !important;
+}
+
 /* ── Progress ───────────────────────────────────────── */
 .progress-box textarea {
     font-family: 'JetBrains Mono', 'Fira Code', monospace !important;
@@ -158,7 +164,7 @@ CUSTOM_CSS = """
     text-decoration: underline;
 }
 
-/* ── Password modal ────────────────────────────────── */
+/* ── Upload / delete modals ────────────────────────── */
 .auth-modal-overlay {
     position: fixed !important;
     inset: 0 !important;
@@ -188,6 +194,18 @@ CUSTOM_CSS = """
 .auth-modal-message {
     margin-bottom: 0.7rem;
     opacity: 0.85;
+}
+
+/* ── Lock screen ───────────────────────────────────── */
+.lock-checking {
+    text-align: center;
+    opacity: 0.7;
+    padding: 2rem 0;
+}
+
+.lock-screen {
+    max-width: 480px !important;
+    margin: 1.5rem auto 0 auto !important;
 }
 
 /* ── Checkbox group (image selector) ────────────────── */
