@@ -147,9 +147,39 @@ def upload_translated_images(
         upload_translated_image(folder_name, local_path.name, local_path)
 
 
-def upload_raw_manga_zip(zip_path: Path, local_dir: Path) -> tuple[str, int]:
+def zip_folder_name(filename: str) -> str:
     """
-    Upload ZIP contents to raw-manga/<zip-stem>/ in GCS.
+    Turn a ZIP filename into its raw-manga/ folder name.
+
+    The name is kept exactly as the user wrote it (brackets, spaces, unicode
+    and so on are all valid in GCS object names). Only characters that would
+    change the folder layout or make the name unusable are rejected.
+    """
+    name = Path(filename.strip()).name
+    if name.lower().endswith(".zip"):
+        name = name[: -len(".zip")]
+    name = name.strip()
+
+    if not name or name in {".", ".."}:
+        raise ValueError("ZIP filename must not be empty.")
+    if "/" in name or "\\" in name:
+        raise ValueError("ZIP filename must not contain '/' or '\\'.")
+    if any(ord(char) < 32 or ord(char) == 127 for char in name):
+        raise ValueError("ZIP filename must not contain control characters.")
+    return name
+
+
+def upload_raw_manga_zip(
+    zip_path: Path,
+    local_dir: Path,
+    original_filename: str | None = None,
+) -> tuple[str, int]:
+    """
+    Upload ZIP contents to raw-manga/<zip-name>/ in GCS.
+
+    `original_filename` is the name the user uploaded. Gradio strips characters
+    such as `[` and `]` from the stored temp file, so the folder name comes from
+    the original name when it is known, and from `zip_path` otherwise.
 
     The ZIP is copied into local_dir for extraction, then both the copied ZIP and
     extracted files are always cleaned up from local storage.
@@ -164,18 +194,18 @@ def upload_raw_manga_zip(zip_path: Path, local_dir: Path) -> tuple[str, int]:
     if not zipfile.is_zipfile(zip_path):
         raise ValueError("Uploaded file is not a valid ZIP archive.")
 
-    folder_name = zip_path.stem.strip()
-    if not folder_name:
-        raise ValueError("ZIP filename must not be empty.")
+    folder_name = zip_folder_name(original_filename or zip_path.name)
     if folder_exists(folder_name):
         raise ValueError(
             f'Folder "{folder_name}" already exists in raw-manga/. '
             "Delete it first, then upload again."
         )
 
-    upload_root = local_dir / "raw-upload-temp" / f"{folder_name}-{uuid.uuid4().hex[:8]}"
+    # The local temp path never uses the folder name, so any character the
+    # user's filename holds is safe here.
+    upload_root = local_dir / "raw-upload-temp" / uuid.uuid4().hex
     extracted_dir = upload_root / "extracted"
-    copied_zip_path = upload_root / zip_path.name
+    copied_zip_path = upload_root / "upload.zip"
 
     bucket = get_bucket()
     uploaded_count = 0
