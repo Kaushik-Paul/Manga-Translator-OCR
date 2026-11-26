@@ -324,28 +324,171 @@ CUSTOM_CSS = """
     opacity: 0.85;
 }
 
-/* ── Sections ───────────────────────────────────────── */
-.section-card {
+/* ── Toolbar ────────────────────────────────────────── */
+.mt-main {
+    gap: 1rem !important;
+}
+
+.mt-toolbar {
+    align-items: center !important;
+    flex-wrap: wrap !important;
+    gap: 0.75rem 1rem !important;
+    padding: 0.25rem 0.25rem 0 0.25rem;
+}
+
+.mt-toolbar-head {
+    flex: 1 1 260px !important;
+    min-width: 0 !important;
+}
+
+.mt-toolbar-title h2 {
+    margin: 0 !important;
+    font-size: 1.15rem !important;
+    font-weight: 800 !important;
+    letter-spacing: -0.015em;
+}
+
+.mt-toolbar-title p {
+    margin: 0.1rem 0 0 0 !important;
+    font-size: 0.88rem;
+    color: var(--body-text-color-subdued);
+}
+
+.mt-toolbar-actions {
+    flex: 0 1 auto !important;
+    width: auto !important;
+    flex-wrap: wrap !important;
+    justify-content: flex-end !important;
+    gap: 0.5rem !important;
+}
+
+.mt-toolbar-actions button {
+    flex: 0 0 auto !important;
+    white-space: nowrap !important;
+}
+
+/* ── Cards ──────────────────────────────────────────── */
+.mt-columns {
+    align-items: flex-start !important;
+    gap: 1rem !important;
+}
+
+.mt-stack {
+    gap: 1rem !important;
+}
+
+.mt-card {
+    gap: 0.9rem !important;
+    padding: 1.25rem !important;
     border: 1px solid var(--border-color-primary) !important;
-    border-radius: 16px !important;
+    border-radius: 18px !important;
     background: var(--background-fill-primary) !important;
     box-shadow: var(--mt-card-shadow) !important;
-    padding: 1.25rem !important;
-    margin-bottom: 0.75rem !important;
+    animation: mt-rise 0.28s ease both;
 }
 
-.section-title {
-    font-size: 1.05rem;
-    font-weight: 700;
-    margin-bottom: 0.75rem;
+/* Blocks inside a card sit flat on it instead of drawing their own box. */
+.mt-card .block:not(.image-selector .block),
+.mt-card .form {
+    border: none !important;
+    background: transparent !important;
+    box-shadow: none !important;
+}
+
+.mt-card > .block,
+.mt-card .form > .block {
+    padding: 0 !important;
+}
+
+.mt-card-head {
     display: flex;
-    align-items: center;
-    gap: 0.5rem;
+    align-items: flex-start;
+    gap: 0.75rem;
 }
 
-.top-actions-row {
-    justify-content: flex-end !important;
-    margin-bottom: 0.75rem !important;
+.mt-step {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    border-radius: 10px;
+    background: var(--color-accent-soft);
+    border: 1px solid var(--border-color-primary);
+    color: var(--mt-accent);
+    font-size: 0.85rem;
+    font-weight: 800;
+}
+
+.mt-card-head h3 {
+    margin: 0 !important;
+    font-size: 1.02rem !important;
+    font-weight: 700 !important;
+    letter-spacing: -0.01em;
+    line-height: 1.3 !important;
+}
+
+.mt-card-head p {
+    margin: 0.15rem 0 0 0 !important;
+    font-size: 0.85rem;
+    color: var(--body-text-color-subdued);
+}
+
+.mt-folder-row {
+    gap: 0.6rem !important;
+    align-items: stretch !important;
+}
+
+.mt-folder-row input,
+.mt-folder-row textarea {
+    height: 100%;
+    border: 1px solid var(--input-border-color) !important;
+    border-radius: var(--input-radius) !important;
+    background: var(--input-background-fill) !important;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.mt-folder-row input:focus,
+.mt-folder-row textarea:focus {
+    border-color: var(--input-border-color-focus) !important;
+    box-shadow: var(--input-shadow-focus) !important;
+}
+
+@keyframes mt-rise {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: none; }
+}
+
+/* ── Status messages ────────────────────────────────── */
+.mt-status .html-container {
+    padding: 0 !important;
+}
+
+.mt-status .prose > span {
+    display: block;
+    padding: 0.6rem 0.8rem;
+    border-radius: 10px;
+    font-size: 0.9rem;
+}
+
+.result-success {
+    color: var(--mt-success) !important;
+    font-weight: 600;
+}
+
+.result-error {
+    color: var(--mt-danger) !important;
+    font-weight: 600;
+}
+
+.mt-status .prose > span.result-success {
+    background: color-mix(in srgb, var(--mt-success) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--mt-success) 25%, transparent);
+}
+
+.mt-status .prose > span.result-error {
+    background: color-mix(in srgb, var(--mt-danger) 9%, transparent);
+    border: 1px solid color-mix(in srgb, var(--mt-danger) 25%, transparent);
 }
 
 /* ── Buttons ────────────────────────────────────────── */
@@ -377,26 +520,58 @@ button:disabled {
     box-shadow: 0 8px 22px -8px rgba(5, 150, 105, 0.6) !important;
 }
 
-.lock-btn {
-    white-space: nowrap !important;
+/* ── Image chips ────────────────────────────────────── */
+.image-selector .wrap {
+    display: grid !important;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 0.5rem !important;
+    max-height: 340px;
+    overflow-y: auto;
+    padding: 2px 4px 2px 2px;
 }
 
-/* ── Progress ───────────────────────────────────────── */
+.image-selector label {
+    min-width: 0;
+    margin: 0 !important;
+    border-radius: 10px !important;
+    transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+}
+
+.image-selector label span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.86rem;
+}
+
+.image-selector label:first-child {
+    grid-column: 1 / -1;
+    font-weight: 700;
+}
+
+/* ── Progress log ───────────────────────────────────── */
 .progress-box textarea {
     font-family: var(--font-mono) !important;
-    font-size: 0.82rem !important;
-    line-height: 1.65 !important;
+    font-size: 0.8rem !important;
+    line-height: 1.7 !important;
+    padding: 14px 16px !important;
+    border-radius: 12px !important;
+    border: 1px solid #1f2433 !important;
+    background: #0b0e17 !important;
+    color: #d4d9ea !important;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03) !important;
 }
 
-/* ── Results ────────────────────────────────────────── */
-.result-success {
-    color: var(--mt-success);
-    font-weight: 600;
+.failed-box textarea {
+    font-family: var(--font-mono) !important;
+    font-size: 0.8rem !important;
+    border-color: color-mix(in srgb, var(--mt-danger) 35%, transparent) !important;
+    background: color-mix(in srgb, var(--mt-danger) 6%, var(--background-fill-primary)) !important;
 }
 
-.result-error {
-    color: var(--mt-danger);
-    font-weight: 600;
+.failed-box label > span,
+.failed-box [data-testid="block-info"] {
+    color: var(--mt-danger) !important;
 }
 
 /* ── Upload / delete modals ────────────────────────── */
@@ -404,6 +579,7 @@ button:disabled {
     position: fixed !important;
     inset: 0 !important;
     z-index: 9999 !important;
+    margin: 0 !important;
     background: rgba(10, 12, 18, 0.55) !important;
     -webkit-backdrop-filter: blur(6px);
     backdrop-filter: blur(6px);
@@ -411,26 +587,104 @@ button:disabled {
     align-items: center !important;
     justify-content: center !important;
     padding: 1rem !important;
+    animation: mt-fade 0.18s ease both;
+}
+
+/* A closed popup's Column stays in the DOM with Gradio's `hide` class. */
+.auth-modal-overlay.hide {
+    display: none !important;
 }
 
 .auth-modal-card {
-    width: min(480px, 100%) !important;
+    flex: 0 1 auto !important;
+    width: min(500px, 100%) !important;
+    max-height: calc(100dvh - 2rem);
+    overflow-y: auto;
+    gap: 1rem !important;
     border: 1px solid var(--border-color-primary) !important;
-    border-radius: 18px !important;
+    border-radius: 20px !important;
     background: var(--background-fill-primary) !important;
-    padding: 1.25rem !important;
-    box-shadow: 0 24px 64px -16px rgba(0, 0, 0, 0.45) !important;
+    padding: 1.4rem !important;
+    box-shadow: 0 30px 80px -20px rgba(0, 0, 0, 0.5) !important;
+    animation: mt-pop 0.22s cubic-bezier(0.2, 0.9, 0.3, 1.2) both;
+}
+
+.auth-modal-card .form {
+    border: none !important;
+    background: transparent !important;
+    box-shadow: none !important;
+}
+
+.auth-modal-card > .block,
+.auth-modal-card .form > .block {
+    padding: 0 !important;
+    border: none !important;
+    background: transparent !important;
+}
+
+.auth-modal-card > .block.mt-dropzone {
+    padding: 0.5rem !important;
+    border: 1.5px dashed color-mix(in srgb, var(--body-text-color-subdued) 45%, transparent) !important;
+    border-radius: 14px !important;
+    background: var(--background-fill-secondary) !important;
+    transition: border-color 0.15s ease;
+}
+
+.auth-modal-card > .block.mt-dropzone:hover {
+    border-color: var(--mt-accent) !important;
+}
+
+.mt-modal-head {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.85rem;
+}
+
+.mt-modal-icon {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 44px;
+    height: 44px;
+    border-radius: 14px;
+    background: var(--color-accent-soft);
+    border: 1px solid var(--border-color-primary);
+    font-size: 1.3rem;
+}
+
+.mt-modal-icon-danger {
+    background: color-mix(in srgb, var(--mt-danger) 12%, transparent);
 }
 
 .auth-modal-title {
     font-size: 1.1rem;
-    font-weight: 700;
-    margin-bottom: 0.4rem;
+    font-weight: 800;
+    letter-spacing: -0.01em;
+    margin-bottom: 0.2rem;
 }
 
 .auth-modal-message {
-    margin-bottom: 0.7rem;
+    font-size: 0.9rem;
     color: var(--body-text-color-subdued);
+}
+
+.mt-modal-actions {
+    justify-content: flex-end !important;
+    gap: 0.5rem !important;
+}
+
+.mt-modal-actions button {
+    flex: 0 1 140px !important;
+}
+
+@keyframes mt-fade {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+@keyframes mt-pop {
+    from { opacity: 0; transform: translateY(10px) scale(0.97); }
+    to { opacity: 1; transform: none; }
 }
 
 /* ── Lock screen ───────────────────────────────────── */
@@ -516,10 +770,5 @@ button:disabled {
     padding: 0 !important;
     border: none !important;
     background: transparent !important;
-}
-
-/* ── Checkbox group (image selector) ────────────────── */
-.image-selector label {
-    transition: background 0.15s ease, border-color 0.15s ease;
 }
 """
