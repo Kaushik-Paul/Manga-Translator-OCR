@@ -30,7 +30,7 @@ from ..gcp_storage import (
     upload_raw_manga_zip,
 )
 from .pipeline_runner import TranslationResult, run_translation_pipeline
-from .styles import CUSTOM_CSS
+from .styles import CUSTOM_CSS, build_theme
 
 logger = logging.getLogger(__name__)
 
@@ -149,14 +149,30 @@ def _require_unlocked(fn):
     return guarded
 
 
-def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
+_HEADER_HTML = """
+<header class="mt-hero">
+    <div class="mt-brand">
+        <div class="mt-logo" aria-hidden="true">訳</div>
+        <div>
+            <h1>Manga Translator <span>OCR</span></h1>
+            <p>Japanese manga pages to clean English lettering, straight from Cloud Storage.</p>
+        </div>
+    </div>
+    <ol class="mt-pipeline" aria-label="Pipeline stages">
+        <li>Detect</li>
+        <li>OCR</li>
+        <li>Translate</li>
+        <li>Inpaint</li>
+        <li>Render</li>
+    </ol>
+</header>
+"""
+
+
+def create_app() -> tuple[gr.Blocks, gr.themes.Base, str]:
     """Build and return the Gradio Blocks application, theme, and CSS."""
 
-    theme = gr.themes.Soft(
-        primary_hue="orange",
-        secondary_hue="purple",
-        neutral_hue="gray",
-    )
+    theme = build_theme()
 
     with gr.Blocks(
         title="Manga Translator OCR",
@@ -173,25 +189,25 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
         )
 
         # ── Header ─────────────────────────────────────
-        gr.HTML(
-            """
-            <div class="app-header">
-                <h1>🎌 Manga Translator OCR</h1>
-                <p>Translate manga pages from Japanese to English via GCP Cloud Storage</p>
-            </div>
-            """
-        )
+        gr.HTML(_HEADER_HTML, elem_classes=["mt-bare"])
 
         # ── Lock screen ────────────────────────────────
         # Both views start hidden; app.load shows one of them once the
         # remembered device token (if any) has been checked.
-        checking_access = gr.HTML('<div class="lock-checking">🔒 Checking access…</div>')
+        checking_access = gr.HTML(
+            '<div class="lock-checking"><span class="mt-spinner"></span>Checking access…</div>'
+        )
         with gr.Column(visible=False, elem_classes=["lock-screen"]) as lock_screen:
-            with gr.Group(elem_classes=["section-card", "lock-card"]):
-                gr.HTML('<div class="section-title">🔒 Enter Password</div>')
+            with gr.Column(elem_classes=["lock-card"]):
                 gr.HTML(
-                    '<div class="auth-modal-message">Unlock once and this device '
-                    "is remembered.</div>"
+                    """
+                    <div class="lock-head">
+                        <div class="lock-badge" aria-hidden="true">🔒</div>
+                        <h2>Unlock the workspace</h2>
+                        <p>Enter the access password. This device is remembered after you unlock.</p>
+                    </div>
+                    """,
+                    elem_classes=["mt-bare"],
                 )
                 unlock_password = gr.Textbox(
                     label="Password",
@@ -201,9 +217,9 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                 )
                 unlock_error = gr.HTML(visible=False)
                 unlock_btn = gr.Button(
-                    "🔓 Unlock",
+                    "Unlock",
                     variant="primary",
-                    elem_classes=["primary-btn"],
+                    size="lg",
                 )
 
         # ── Main view (only visible once unlocked) ─────
