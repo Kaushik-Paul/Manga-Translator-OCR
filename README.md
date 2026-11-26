@@ -97,8 +97,7 @@ LOCAL_MAX_PARALLEL_PAGES="2"
 # Optional (only when USE_MODAL=true): max parallel pages per batch
 MODAL_MAX_PARALLEL_PAGES="2"
 
-# Optional but recommended for Gradio abuse protection:
-# required to run "Translate Selected" and to open the download link
+# Required for the Gradio web UI: the password on its lock screen
 GRADIO_ACTION_PASSWORD="change-this-password"
 ```
 
@@ -169,6 +168,8 @@ uv run python main/app.py
 ```
 
 *The UI will be accessible locally at `http://0.0.0.0:7860`.*
+
+The app opens on a lock screen. Enter `GRADIO_ACTION_PASSWORD` once and the whole app unlocks for that session, with no more prompts for each action. The browser also remembers the device: localStorage keeps a token derived from the password (never the password itself), so later visits skip the lock screen. **🔒 Log out** forgets the device. Changing `GRADIO_ACTION_PASSWORD` logs out every remembered device.
 
 ### ⚡ Command Line Interface (CLI)
 

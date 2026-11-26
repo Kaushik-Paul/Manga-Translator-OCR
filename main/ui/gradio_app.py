@@ -10,10 +10,13 @@ Provides a web interface to:
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import html
+import inspect
 import logging
 import threading
+import time
 from pathlib import Path
 
 import gradio as gr
@@ -66,6 +69,86 @@ def _keep_original_filename(component: gr.File) -> gr.File:
     return component
 
 
+# ── Access control ─────────────────────────────────────
+# The whole UI sits behind one password (GRADIO_ACTION_PASSWORD). Unlocking
+# marks the session as unlocked server-side and stores a device token in the
+# browser's localStorage, so the same device skips the lock screen next time.
+#
+# The token is an HMAC of the password, never the password itself. It changes
+# when the password changes, which logs every remembered device out.
+# BrowserState encrypts in the browser, so its secret is public. It is fixed
+# only so stored tokens stay readable across app restarts.
+# The stored value is {"token": ...}. BrowserState skips saving falsy values,
+# so logging out has to write {"token": ""} rather than "".
+_DEVICE_TOKEN_STORAGE_KEY = "manga-translator-ocr-device-token"
+_DEVICE_TOKEN_STORAGE_SECRET = "manga-translator-ocr-browser-state-v1"
+_DEVICE_TOKEN_CONTEXT = b"manga-translator-ocr/device-token/v1"
+_FAILED_UNLOCK_DELAY_SECONDS = 1.0
+_MISSING_PASSWORD_MESSAGE = (
+    "⚠️ GRADIO_ACTION_PASSWORD is not configured in .env. Set it and restart the app."
+)
+
+
+def _configured_password() -> str:
+    return settings.gradio_action_password.strip()
+
+
+def _device_token(password: str) -> str:
+    return hmac.new(
+        password.encode("utf-8"), _DEVICE_TOKEN_CONTEXT, hashlib.sha256
+    ).hexdigest()
+
+
+def _check_password(password: str) -> tuple[bool, str]:
+    configured_password = _configured_password()
+    if not configured_password:
+        return False, _MISSING_PASSWORD_MESSAGE
+    if not password:
+        return False, "⚠️ Password is required."
+    if not hmac.compare_digest(password.encode("utf-8"), configured_password.encode("utf-8")):
+        return False, "❌ Incorrect password."
+    return True, ""
+
+
+def _stored_device(token: str = "") -> dict[str, str]:
+    return {"token": token}
+
+
+def _device_token_is_valid(stored: object) -> bool:
+    token = stored.get("token") if isinstance(stored, dict) else None
+    configured_password = _configured_password()
+    if not configured_password or not isinstance(token, str) or not token:
+        return False
+    return hmac.compare_digest(token, _device_token(configured_password))
+
+
+def _ensure_unlocked(is_unlocked: object) -> None:
+    if is_unlocked is not True:
+        raise gr.Error("🔒 This session is locked. Reload the page and enter the password.")
+
+
+def _require_unlocked(fn):
+    """Wrap an event handler so it only runs for an unlocked session.
+
+    The wrapped handler takes the session's `unlocked` State as its first
+    input, followed by the handler's own inputs. Hiding the UI is not enough on
+    its own, because Gradio event endpoints can be called directly.
+    """
+    if inspect.isgeneratorfunction(fn):
+
+        def guarded_generator(is_unlocked, *args):
+            _ensure_unlocked(is_unlocked)
+            yield from fn(*args)
+
+        return guarded_generator
+
+    def guarded(is_unlocked, *args):
+        _ensure_unlocked(is_unlocked)
+        return fn(*args)
+
+    return guarded
+
+
 def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
     """Build and return the Gradio Blocks application, theme, and CSS."""
 
@@ -81,7 +164,13 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
 
         # Hidden state component to trigger auto-updates
         timer = gr.Timer(value=1.0, active=False)
-        auth_action = gr.State("")
+        # Per-session flag, set only after the password or device token checks out.
+        unlocked = gr.State(False)
+        remembered_token = gr.BrowserState(
+            _stored_device(),
+            storage_key=_DEVICE_TOKEN_STORAGE_KEY,
+            secret=_DEVICE_TOKEN_STORAGE_SECRET,
+        )
 
         # ── Header ─────────────────────────────────────
         gr.HTML(
@@ -93,177 +182,171 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             """
         )
 
-        with gr.Row(elem_classes=["top-actions-row"]):
-            upload_zip_btn = gr.Button(
-                "📤 Upload ZIP to raw-manga",
-                variant="secondary",
-                elem_classes=["upload-zip-btn"],
-            )
-            delete_folder_btn = gr.Button(
-                "🗑️ Delete Folder",
-                variant="stop",
-                elem_classes=["delete-folder-btn"],
-            )
-            clear_btn = gr.Button(
-                "🧹 Clear",
-                variant="secondary",
-                elem_classes=["clear-btn"],
-                interactive=True,
-            )
-
-        # ── Section 1: Folder Input ────────────────────
-        with gr.Group(elem_classes=["section-card"]):
-            gr.HTML('<div class="section-title">📁 Manga Folder</div>')
-            with gr.Row():
-                folder_input = gr.Textbox(
-                    label="Folder name",
-                    placeholder="Enter manga folder name (in raw-manga bucket)...",
-                    scale=4,
-                    interactive=True,
+        # ── Lock screen ────────────────────────────────
+        # Both views start hidden; app.load shows one of them once the
+        # remembered device token (if any) has been checked.
+        checking_access = gr.HTML('<div class="lock-checking">🔒 Checking access…</div>')
+        with gr.Column(visible=False, elem_classes=["lock-screen"]) as lock_screen:
+            with gr.Group(elem_classes=["section-card", "lock-card"]):
+                gr.HTML('<div class="section-title">🔒 Enter Password</div>')
+                gr.HTML(
+                    '<div class="auth-modal-message">Unlock once and this device '
+                    "is remembered.</div>"
                 )
-                load_btn = gr.Button(
-                    "🔍 Load",
-                    variant="primary",
-                    elem_classes=["primary-btn"],
-                    scale=1,
-                    interactive=True,
-                )
-            folder_status = gr.HTML(visible=False)
-
-        # ── Section 2: Image Selector ──────────────────
-        with gr.Group(elem_classes=["section-card"], visible=False) as image_section:
-            gr.HTML('<div class="section-title">🖼️ Select Images</div>')
-            image_selector = gr.CheckboxGroup(
-                label="Images to translate",
-                choices=[],
-                value=[],
-                elem_classes=["image-selector"],
-                interactive=True,
-            )
-            with gr.Row():
-                translate_btn = gr.Button(
-                    "🚀 Translate Selected",
-                    variant="primary",
-                    elem_classes=["translate-btn"],
-                    scale=2,
-                    interactive=True,
-                )
-
-        # ── Section 3: Progress & Results ──────────────
-        with gr.Group(elem_classes=["section-card"], visible=False) as results_section:
-            gr.HTML('<div class="section-title">📊 Progress & Results</div>')
-            progress_log = gr.Textbox(
-                label="Pipeline Log",
-                lines=12,
-                max_lines=30,
-                interactive=False,
-                elem_classes=["progress-box"],
-            )
-            with gr.Row():
-                failed_images_box = gr.Textbox(
-                    label="❌ Failed Images",
-                    lines=3,
-                    interactive=False,
-                    visible=False,
-                )
-            download_btn = gr.Button(
-                "📥 Download Translated Manga (CBZ) — Expires in 24 hours",
-                variant="primary",
-                elem_classes=["download-btn"],
-                interactive=True,
-                visible=False,
-            )
-
-        # Hidden trigger value. JS listener opens this URL in a new tab.
-        download_launch_url = gr.Textbox(value="", visible=False, interactive=False)
-
-        # Password popup shown before costly/protected actions.
-        with gr.Group(visible=False, elem_classes=["auth-modal-overlay"]) as auth_modal:
-            with gr.Group(elem_classes=["auth-modal-card"]):
-                gr.HTML('<div class="auth-modal-title">🔒 Password Required</div>')
-                auth_prompt = gr.HTML()
-                auth_password = gr.Textbox(
+                unlock_password = gr.Textbox(
                     label="Password",
                     type="password",
                     placeholder="Enter password",
                     interactive=True,
                 )
-                auth_error = gr.HTML(visible=False)
-                with gr.Row():
-                    auth_submit_btn = gr.Button(
-                        "Continue",
-                        variant="primary",
-                        elem_classes=["primary-btn"],
-                    )
-                    auth_cancel_btn = gr.Button("Cancel")
+                unlock_error = gr.HTML(visible=False)
+                unlock_btn = gr.Button(
+                    "🔓 Unlock",
+                    variant="primary",
+                    elem_classes=["primary-btn"],
+                )
 
-        # ZIP upload popup shown after password authorization.
-        with gr.Group(visible=False, elem_classes=["auth-modal-overlay"]) as upload_modal:
-            with gr.Group(elem_classes=["auth-modal-card"]):
-                gr.HTML('<div class="auth-modal-title">📦 Upload Manga ZIP</div>')
-                gr.HTML(
-                    '<div class="auth-modal-message">Select a .zip file. '
-                    'It will be uploaded to raw-manga/&lt;zip-name&gt;/.</div>'
+        # ── Main view (only visible once unlocked) ─────
+        with gr.Column(visible=False) as main_view:
+            with gr.Row(elem_classes=["top-actions-row"]):
+                upload_zip_btn = gr.Button(
+                    "📤 Upload ZIP to raw-manga",
+                    variant="secondary",
+                    elem_classes=["upload-zip-btn"],
                 )
-                upload_zip_file = _keep_original_filename(
-                    gr.File(
-                        label="ZIP file",
-                        file_types=[".zip"],
-                        type="filepath",
-                    )
+                delete_folder_btn = gr.Button(
+                    "🗑️ Delete Folder",
+                    variant="stop",
+                    elem_classes=["delete-folder-btn"],
                 )
-                upload_status = gr.HTML(visible=False)
-                upload_error = gr.HTML(visible=False)
-                with gr.Row():
-                    upload_confirm_btn = gr.Button(
-                        "Confirm",
-                        variant="primary",
-                        elem_classes=["primary-btn"],
-                    )
-                    upload_close_btn = gr.Button("Close")
-
-        # Folder deletion popup shown after password authorization.
-        with gr.Group(visible=False, elem_classes=["auth-modal-overlay"]) as delete_modal:
-            with gr.Group(elem_classes=["auth-modal-card"]):
-                gr.HTML('<div class="auth-modal-title">🗑️ Delete Manga Folder</div>')
-                gr.HTML(
-                    '<div class="auth-modal-message">Delete folder from both '
-                    "raw-manga/ and translated-manga/.</div>"
-                )
-                delete_folder_name = gr.Textbox(
-                    label="Folder name",
-                    placeholder="Enter folder name to delete",
+                clear_btn = gr.Button(
+                    "🧹 Clear",
+                    variant="secondary",
+                    elem_classes=["clear-btn"],
                     interactive=True,
                 )
-                delete_status = gr.HTML(visible=False)
-                delete_error = gr.HTML(visible=False)
+                lock_btn = gr.Button(
+                    "🔒 Log out",
+                    variant="secondary",
+                    elem_classes=["lock-btn"],
+                    scale=0,
+                    min_width=120,
+                )
+
+            # ── Section 1: Folder Input ────────────────────
+            with gr.Group(elem_classes=["section-card"]):
+                gr.HTML('<div class="section-title">📁 Manga Folder</div>')
                 with gr.Row():
-                    delete_confirm_btn = gr.Button(
-                        "Confirm",
-                        variant="stop",
-                        elem_classes=["delete-folder-btn"],
+                    folder_input = gr.Textbox(
+                        label="Folder name",
+                        placeholder="Enter manga folder name (in raw-manga bucket)...",
+                        scale=4,
+                        interactive=True,
                     )
-                    delete_close_btn = gr.Button("Close")
+                    load_btn = gr.Button(
+                        "🔍 Load",
+                        variant="primary",
+                        elem_classes=["primary-btn"],
+                        scale=1,
+                        interactive=True,
+                    )
+                folder_status = gr.HTML(visible=False)
 
-        def _action_prompt(action: str) -> str:
-            if action == "download":
-                text = "Enter password to open the download link."
-            elif action == "upload_zip":
-                text = "Enter password to upload a ZIP file."
-            elif action == "delete_folder":
-                text = "Enter password to delete a manga folder."
-            else:
-                text = "Enter password to start translation."
-            return f'<div class="auth-modal-message">{text}</div>'
+            # ── Section 2: Image Selector ──────────────────
+            with gr.Group(elem_classes=["section-card"], visible=False) as image_section:
+                gr.HTML('<div class="section-title">🖼️ Select Images</div>')
+                image_selector = gr.CheckboxGroup(
+                    label="Images to translate",
+                    choices=[],
+                    value=[],
+                    elem_classes=["image-selector"],
+                    interactive=True,
+                )
+                with gr.Row():
+                    translate_btn = gr.Button(
+                        "🚀 Translate Selected",
+                        variant="primary",
+                        elem_classes=["translate-btn"],
+                        scale=2,
+                        interactive=True,
+                    )
 
-        def _close_auth_modal():
-            return (
-                "",
-                gr.update(visible=False),
-                gr.update(value=""),
-                gr.update(value=""),
-                gr.update(visible=False, value=""),
-            )
+            # ── Section 3: Progress & Results ──────────────
+            with gr.Group(elem_classes=["section-card"], visible=False) as results_section:
+                gr.HTML('<div class="section-title">📊 Progress & Results</div>')
+                progress_log = gr.Textbox(
+                    label="Pipeline Log",
+                    lines=12,
+                    max_lines=30,
+                    interactive=False,
+                    elem_classes=["progress-box"],
+                )
+                with gr.Row():
+                    failed_images_box = gr.Textbox(
+                        label="❌ Failed Images",
+                        lines=3,
+                        interactive=False,
+                        visible=False,
+                    )
+                download_btn = gr.Button(
+                    "📥 Download Translated Manga (CBZ) — Expires in 24 hours",
+                    variant="primary",
+                    elem_classes=["download-btn"],
+                    interactive=True,
+                    visible=False,
+                )
+
+            # Hidden trigger value. JS listener opens this URL in a new tab.
+            download_launch_url = gr.Textbox(value="", visible=False, interactive=False)
+
+            # ZIP upload popup.
+            with gr.Group(visible=False, elem_classes=["auth-modal-overlay"]) as upload_modal:
+                with gr.Group(elem_classes=["auth-modal-card"]):
+                    gr.HTML('<div class="auth-modal-title">📦 Upload Manga ZIP</div>')
+                    gr.HTML(
+                        '<div class="auth-modal-message">Select a .zip file. '
+                        'It will be uploaded to raw-manga/&lt;zip-name&gt;/.</div>'
+                    )
+                    upload_zip_file = _keep_original_filename(
+                        gr.File(
+                            label="ZIP file",
+                            file_types=[".zip"],
+                            type="filepath",
+                        )
+                    )
+                    upload_status = gr.HTML(visible=False)
+                    upload_error = gr.HTML(visible=False)
+                    with gr.Row():
+                        upload_confirm_btn = gr.Button(
+                            "Confirm",
+                            variant="primary",
+                            elem_classes=["primary-btn"],
+                        )
+                        upload_close_btn = gr.Button("Close")
+
+            # Folder deletion popup.
+            with gr.Group(visible=False, elem_classes=["auth-modal-overlay"]) as delete_modal:
+                with gr.Group(elem_classes=["auth-modal-card"]):
+                    gr.HTML('<div class="auth-modal-title">🗑️ Delete Manga Folder</div>')
+                    gr.HTML(
+                        '<div class="auth-modal-message">Delete folder from both '
+                        "raw-manga/ and translated-manga/.</div>"
+                    )
+                    delete_folder_name = gr.Textbox(
+                        label="Folder name",
+                        placeholder="Enter folder name to delete",
+                        interactive=True,
+                    )
+                    delete_status = gr.HTML(visible=False)
+                    delete_error = gr.HTML(visible=False)
+                    with gr.Row():
+                        delete_confirm_btn = gr.Button(
+                            "Confirm",
+                            variant="stop",
+                            elem_classes=["delete-folder-btn"],
+                        )
+                        delete_close_btn = gr.Button("Close")
+
 
         def _close_upload_modal():
             return (
@@ -297,32 +380,6 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                 gr.update(visible=False, value=""),
                 gr.update(visible=False, value=""),
             )
-
-        def _open_auth_modal(action: str):
-            if action == "download" and not GLOBAL_STATE.get("download_url"):
-                return _close_auth_modal()
-            return (
-                action,
-                gr.update(visible=True),
-                gr.update(value=_action_prompt(action)),
-                gr.update(value=""),
-                gr.update(visible=False, value=""),
-            )
-
-        def _validate_action_password(password: str) -> tuple[bool, str]:
-            configured_password = settings.gradio_action_password.strip()
-
-            if not configured_password:
-                return (
-                    False,
-                    "⚠️ GRADIO_ACTION_PASSWORD is not configured in .env. "
-                    "Set it and restart the app.",
-                )
-            if not password:
-                return False, "⚠️ Password is required."
-            if not hmac.compare_digest(password, configured_password):
-                return False, "❌ Incorrect password."
-            return True, ""
 
         def _operation_controls(is_busy: bool):
             return (
@@ -465,6 +522,9 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             folder_name = GLOBAL_STATE["folder_name"]
             selected_images = [s for s in GLOBAL_STATE["selected_images"] if s != "All"]
 
+            if GLOBAL_STATE.get("is_running"):
+                return sync_state_from_global()
+
             if not selected_images:
                 GLOBAL_STATE["log_text"] = "⚠️ No images selected."
                 return sync_state_from_global()
@@ -523,91 +583,6 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             thread = threading.Thread(target=_background_task, daemon=True)
             thread.start()
             return sync_state_from_global()
-
-        def authorize_action(password: str, action: str):
-            action = (action or "").strip()
-            is_valid, err_message = _validate_action_password(password)
-
-            if not action:
-                is_valid = False
-                err_message = "⚠️ No action selected. Please try again."
-
-            if not is_valid:
-                return (
-                    action,
-                    gr.update(visible=True),
-                    gr.update(value=_action_prompt(action or "translate")),
-                    gr.update(value=""),
-                    gr.update(
-                        visible=True,
-                        value=f'<span class="result-error">{err_message}</span>',
-                    ),
-                    *sync_state_from_global(),
-                    "",
-                    *_close_upload_modal(),
-                    *_close_delete_modal(),
-                )
-
-            if action == "translate":
-                sync_updates = run_pipeline()
-                return (
-                    *_close_auth_modal(),
-                    *sync_updates,
-                    "",
-                    *_close_upload_modal(),
-                    *_close_delete_modal(),
-                )
-
-            if action == "download":
-                download_url = GLOBAL_STATE.get("download_url", "")
-                if not download_url:
-                    return (
-                        action,
-                        gr.update(visible=True),
-                        gr.update(value=_action_prompt(action)),
-                        gr.update(value=""),
-                        gr.update(
-                            visible=True,
-                            value='<span class="result-error">❌ Download link is not ready yet.</span>',
-                        ),
-                        *sync_state_from_global(),
-                        "",
-                        *_close_upload_modal(),
-                        *_close_delete_modal(),
-                    )
-                return (
-                    *_close_auth_modal(),
-                    *sync_state_from_global(),
-                    download_url,
-                    *_close_upload_modal(),
-                    *_close_delete_modal(),
-                )
-
-            if action == "upload_zip":
-                return (
-                    *_close_auth_modal(),
-                    *sync_state_from_global(),
-                    "",
-                    *_open_upload_modal(),
-                    *_close_delete_modal(),
-                )
-
-            if action == "delete_folder":
-                return (
-                    *_close_auth_modal(),
-                    *sync_state_from_global(),
-                    "",
-                    *_close_upload_modal(),
-                    *_open_delete_modal(),
-                )
-
-            return (
-                *_close_auth_modal(),
-                *sync_state_from_global(),
-                "",
-                *_close_upload_modal(),
-                *_close_delete_modal(),
-            )
 
         def confirm_zip_upload(zip_file_path: str | None):
             # Disable upload/delete/clear actions while upload is in progress.
@@ -789,6 +764,12 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     *_operation_controls(False),
                 )
 
+        def get_download_url() -> str:
+            download_url = GLOBAL_STATE.get("download_url", "")
+            if not download_url:
+                raise gr.Error("Download link is not ready yet.")
+            return download_url
+
         def clear_all_ui():
             GLOBAL_STATE["folder_name"] = ""
             GLOBAL_STATE["loaded_images"] = []
@@ -800,53 +781,74 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
 
             return (
                 gr.update(visible=False, value=""),  # folder_status
-                "",  # auth_action
-                gr.update(visible=False),  # auth_modal
-                gr.update(value=""),  # auth_prompt
-                gr.update(value=""),  # auth_password
-                gr.update(visible=False, value=""),  # auth_error
-                gr.update(visible=False),  # upload_modal
-                gr.update(value=None),  # upload_zip_file
-                gr.update(visible=False, value=""),  # upload_status
-                gr.update(visible=False, value=""),  # upload_error
-                gr.update(visible=False),  # delete_modal
-                gr.update(value=""),  # delete_folder_name
-                gr.update(visible=False, value=""),  # delete_status
-                gr.update(visible=False, value=""),  # delete_error
+                *_close_upload_modal(),
+                *_close_delete_modal(),
                 "",  # download_launch_url
                 *sync_state_from_global(),
             )
 
+        # ── Lock screen handlers ───────────────────────
+
+        def _access_views(is_unlocked: bool, error: str = ""):
+            return (
+                gr.update(visible=False),  # checking_access
+                gr.update(visible=not is_unlocked),  # lock_screen
+                gr.update(visible=is_unlocked),  # main_view
+                gr.update(
+                    visible=bool(error),
+                    value=f'<span class="result-error">{error}</span>' if error else "",
+                ),  # unlock_error
+            )
+
+        def restore_access(stored: dict):
+            """On page load, unlock straight away if this device is remembered."""
+            if _device_token_is_valid(stored):
+                return (True, *_access_views(True))
+            error = "" if _configured_password() else _MISSING_PASSWORD_MESSAGE
+            return (False, *_access_views(False, error))
+
+        def unlock(password: str):
+            is_valid, error = _check_password(password)
+            if not is_valid:
+                if password and _configured_password():
+                    # Slow down password guessing.
+                    time.sleep(_FAILED_UNLOCK_DELAY_SECONDS)
+                return (
+                    False,
+                    _stored_device(),
+                    *_access_views(False, error),
+                    gr.update(value=""),
+                )
+            token = _device_token(_configured_password())
+            return (True, _stored_device(token), *_access_views(True), gr.update(value=""))
+
+        def lock():
+            """Lock this session and forget the device."""
+            return (
+                False,
+                _stored_device(),
+                *_access_views(False),
+                gr.update(value=""),
+                *_close_upload_modal(),
+                *_close_delete_modal(),
+            )
+
+        def sync_for_session(is_unlocked: bool):
+            """Sync the UI from global state, but only for unlocked sessions."""
+            if is_unlocked is not True:
+                return tuple(gr.update() for _ in sync_outputs)
+            return sync_state_from_global()
+
+        def select_images_for_session(is_unlocked: bool, selected: list[str]):
+            # Value changes made by syncs also fire `.change`, so a locked
+            # session is skipped quietly here instead of raising.
+            if is_unlocked is not True:
+                return gr.update()
+            return on_image_selection_change(selected)
+
         # ── Wire Events ────────────────────────────────
 
-        load_btn.click(
-            fn=load_folder,
-            inputs=[folder_input],
-            outputs=[
-                folder_status,
-                image_section,
-                image_selector,
-            ],
-        )
-
-        # Also trigger load on Enter key
-        folder_input.submit(
-            fn=load_folder,
-            inputs=[folder_input],
-            outputs=[
-                folder_status,
-                image_section,
-                image_selector,
-            ],
-        )
-
-        image_selector.change(
-            fn=on_image_selection_change,
-            inputs=[image_selector],
-            outputs=[image_selector],
-        )
-        
-        # When app loads or timer tickets, sync the UI bounds to the backend global state.
+        # When the app loads or the timer ticks, sync the UI to the global state.
         sync_outputs = [
             folder_input,
             load_btn,
@@ -862,13 +864,6 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             clear_btn,
             timer,
         ]
-        auth_outputs = [
-            auth_action,
-            auth_modal,
-            auth_prompt,
-            auth_password,
-            auth_error,
-        ]
         upload_modal_outputs = [
             upload_modal,
             upload_zip_file,
@@ -881,79 +876,104 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
             delete_status,
             delete_error,
         ]
+        access_view_outputs = [
+            checking_access,
+            lock_screen,
+            main_view,
+            unlock_error,
+        ]
         clear_outputs = [
             folder_status,
-            auth_action,
-            *auth_outputs[1:],
             *upload_modal_outputs,
             *delete_modal_outputs,
             download_launch_url,
             *sync_outputs,
         ]
-        
+        folder_load_outputs = [
+            folder_status,
+            image_section,
+            image_selector,
+        ]
+
         app.load(
-            fn=sync_state_from_global,
-            inputs=None,
-            outputs=sync_outputs
+            fn=restore_access,
+            inputs=[remembered_token],
+            outputs=[unlocked, *access_view_outputs],
+            queue=False,
+        ).then(
+            fn=sync_for_session,
+            inputs=[unlocked],
+            outputs=sync_outputs,
         )
         timer.tick(
-            fn=sync_state_from_global,
-            inputs=None,
-            outputs=sync_outputs
+            fn=sync_for_session,
+            inputs=[unlocked],
+            outputs=sync_outputs,
         )
 
-        translate_btn.click(
-            fn=lambda: _open_auth_modal("translate"),
+        unlock_outputs = [
+            unlocked,
+            remembered_token,
+            *access_view_outputs,
+            unlock_password,
+        ]
+        for unlock_trigger in (unlock_btn.click, unlock_password.submit):
+            unlock_trigger(
+                fn=unlock,
+                inputs=[unlock_password],
+                outputs=unlock_outputs,
+            ).then(
+                fn=sync_for_session,
+                inputs=[unlocked],
+                outputs=sync_outputs,
+            )
+
+        lock_btn.click(
+            fn=lock,
             inputs=[],
-            outputs=auth_outputs,
+            outputs=[*unlock_outputs, *upload_modal_outputs, *delete_modal_outputs],
             queue=False,
         )
 
+        # Also trigger load on Enter key
+        for load_trigger in (load_btn.click, folder_input.submit):
+            load_trigger(
+                fn=_require_unlocked(load_folder),
+                inputs=[unlocked, folder_input],
+                outputs=folder_load_outputs,
+            )
+
+        image_selector.change(
+            fn=select_images_for_session,
+            inputs=[unlocked, image_selector],
+            outputs=[image_selector],
+        )
+
+        translate_btn.click(
+            fn=_require_unlocked(run_pipeline),
+            inputs=[unlocked],
+            outputs=sync_outputs,
+        )
+
         upload_zip_btn.click(
-            fn=lambda: _open_auth_modal("upload_zip"),
-            inputs=[],
-            outputs=auth_outputs,
+            fn=_require_unlocked(_open_upload_modal),
+            inputs=[unlocked],
+            outputs=upload_modal_outputs,
             queue=False,
         )
 
         delete_folder_btn.click(
-            fn=lambda: _open_auth_modal("delete_folder"),
-            inputs=[],
-            outputs=auth_outputs,
+            fn=_require_unlocked(_open_delete_modal),
+            inputs=[unlocked],
+            outputs=delete_modal_outputs,
             queue=False,
         )
 
         download_btn.click(
-            fn=lambda: _open_auth_modal("download"),
-            inputs=[],
-            outputs=auth_outputs,
+            fn=_require_unlocked(get_download_url),
+            inputs=[unlocked],
+            outputs=[download_launch_url],
             queue=False,
-        )
-
-        auth_cancel_btn.click(
-            fn=_close_auth_modal,
-            inputs=[],
-            outputs=auth_outputs,
-            queue=False,
-        )
-
-        auth_submit_outputs = [
-            *auth_outputs,
-            *sync_outputs,
-            download_launch_url,
-            *upload_modal_outputs,
-            *delete_modal_outputs,
-        ]
-
-        auth_submit_btn.click(
-            fn=authorize_action,
-            inputs=[auth_password, auth_action],
-            outputs=auth_submit_outputs,
-        )
-        auth_password.submit(
-            fn=authorize_action,
-            inputs=[auth_password, auth_action],
-            outputs=auth_submit_outputs,
         )
 
         upload_close_btn.click(
@@ -964,8 +984,8 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
         )
 
         upload_confirm_btn.click(
-            fn=confirm_zip_upload,
-            inputs=[upload_zip_file],
+            fn=_require_unlocked(confirm_zip_upload),
+            inputs=[unlocked, upload_zip_file],
             outputs=[
                 *upload_modal_outputs,
                 folder_input,
@@ -988,8 +1008,8 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
         )
 
         delete_confirm_btn.click(
-            fn=confirm_delete_folder,
-            inputs=[delete_folder_name],
+            fn=_require_unlocked(confirm_delete_folder),
+            inputs=[unlocked, delete_folder_name],
             outputs=[
                 *delete_modal_outputs,
                 folder_input,
@@ -1005,8 +1025,8 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
         )
 
         clear_btn.click(
-            fn=clear_all_ui,
-            inputs=[],
+            fn=_require_unlocked(clear_all_ui),
+            inputs=[unlocked],
             outputs=clear_outputs,
             queue=False,
         )
