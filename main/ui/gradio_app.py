@@ -43,23 +43,27 @@ GLOBAL_STATE = {
 }
 
 
-class OriginalNameFile(gr.File):
-    """`gr.File` that also hands back the filename the user picked.
+def _keep_original_filename(component: gr.File) -> gr.File:
+    """Make a single-file `gr.File` hand back the filename the user picked.
 
     Gradio strips characters such as `[`, `]` and `&` from the temp file it
-    stores. The browser still sends the untouched name as `orig_name`, so it is
-    attached to the returned path as `.orig_name`. `is_template` keeps the
-    frontend rendering this as the regular File component.
+    stores, but the browser still sends the untouched name as `orig_name`.
+    It is attached to the returned path as `.orig_name`.
+
+    This wraps the instance's `preprocess` instead of subclassing `gr.File`,
+    because every Component subclass makes Gradio write a `.pyi` stub of the
+    whole defining module at import time.
     """
+    preprocess = component.preprocess
 
-    is_template = True
-
-    def _process_single_file(self, f: FileData):
-        processed = super()._process_single_file(f)
-        if isinstance(processed, str):
-            processed.orig_name = f.orig_name  # type: ignore[attr-defined]
+    def preprocess_with_original_name(payload):
+        processed = preprocess(payload)
+        if isinstance(payload, FileData) and isinstance(processed, str):
+            processed.orig_name = payload.orig_name  # type: ignore[attr-defined]
         return processed
 
+    component.preprocess = preprocess_with_original_name  # type: ignore[method-assign]
+    return component
 
 
 def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
@@ -201,10 +205,12 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Soft, str]:
                     '<div class="auth-modal-message">Select a .zip file. '
                     'It will be uploaded to raw-manga/&lt;zip-name&gt;/.</div>'
                 )
-                upload_zip_file = OriginalNameFile(
-                    label="ZIP file",
-                    file_types=[".zip"],
-                    type="filepath",
+                upload_zip_file = _keep_original_filename(
+                    gr.File(
+                        label="ZIP file",
+                        file_types=[".zip"],
+                        type="filepath",
+                    )
                 )
                 upload_status = gr.HTML(visible=False)
                 upload_error = gr.HTML(visible=False)
