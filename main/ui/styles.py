@@ -787,6 +787,157 @@ button:disabled {
     background: transparent !important;
 }
 
+/* ── Tabs (segmented control) ───────────────────────── */
+.mt-tabs {
+    gap: 0.9rem !important;
+}
+
+.mt-tabs > .tab-wrapper {
+    height: auto !important;
+    padding: 0 !important;
+    border: none !important;
+}
+
+.mt-tabs .tab-container {
+    display: inline-flex !important;
+    width: auto !important;
+    height: auto !important;
+    gap: 4px;
+    padding: 4px;
+    border: 1px solid var(--border-color-primary);
+    border-radius: 14px;
+    background: var(--background-fill-secondary);
+}
+
+.mt-tabs [role="tab"] {
+    height: auto !important;
+    margin: 0 !important;
+    padding: 0.45rem 1.1rem !important;
+    border: none !important;
+    border-radius: 10px !important;
+    color: var(--body-text-color-subdued) !important;
+    font-size: 0.92rem !important;
+    font-weight: 600 !important;
+    transition: background 0.15s ease, color 0.15s ease;
+}
+
+.mt-tabs [role="tab"]:hover {
+    color: var(--body-text-color) !important;
+}
+
+.mt-tabs [role="tab"].selected {
+    background: var(--background-fill-primary) !important;
+    color: var(--body-text-color) !important;
+    box-shadow: 0 1px 2px rgba(16, 24, 40, 0.08), 0 2px 8px -2px rgba(16, 24, 40, 0.12);
+}
+
+.mt-tabs [role="tab"].selected::after {
+    display: none !important;
+}
+
+.mt-tabs .tabitem {
+    padding: 0 !important;
+    border: none !important;
+    background: transparent !important;
+}
+
+/* ── Library ────────────────────────────────────────── */
+.mt-library-bar,
+.mt-preview-bar {
+    align-items: flex-start !important;
+    flex-wrap: wrap !important;
+    gap: 0.75rem !important;
+}
+
+.mt-library-head,
+.mt-preview-headblock {
+    flex: 1 1 260px !important;
+    min-width: 0 !important;
+}
+
+.mt-library-bar > button,
+.mt-preview-bar > button {
+    flex: 0 0 auto !important;
+    white-space: nowrap !important;
+}
+
+.mt-library-count {
+    margin: 0 !important;
+    font-size: 0.88rem;
+    color: var(--body-text-color-subdued);
+}
+
+.mt-library-count b {
+    color: var(--body-text-color);
+}
+
+/* The table reads as a list: sans text, roomy rows, a hover cue. */
+.mt-library-table table,
+.mt-library-table td span,
+.mt-library-table th span {
+    font-family: var(--font) !important;
+    font-size: 0.88rem !important;
+}
+
+.mt-library-table th span {
+    font-weight: 700 !important;
+    color: var(--body-text-color-subdued) !important;
+}
+
+.mt-library-table tbody tr {
+    cursor: pointer;
+}
+
+.mt-library-table tbody tr:hover td {
+    background: var(--color-accent-soft) !important;
+}
+
+.mt-preview-head h3 {
+    margin: 0 0 0.45rem 0 !important;
+    font-size: 1.1rem !important;
+    font-weight: 800 !important;
+    letter-spacing: -0.01em;
+    line-height: 1.3 !important;
+    overflow-wrap: anywhere;
+}
+
+.mt-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem;
+}
+
+.mt-meta > span:not(.mt-badge) {
+    padding: 0.2rem 0.6rem;
+    border: 1px solid var(--border-color-primary);
+    border-radius: 999px;
+    background: var(--background-fill-secondary);
+    font-size: 0.76rem;
+    font-weight: 600;
+    color: var(--body-text-color-subdued);
+    white-space: nowrap;
+}
+
+.mt-preview-gallery {
+    border: none !important;
+    background: transparent !important;
+}
+
+.mt-preview-gallery .grid-wrap {
+    padding: 2px !important;
+}
+
+.mt-preview-gallery .grid-container {
+    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)) !important;
+    gap: 0.6rem !important;
+}
+
+.mt-preview-gallery .thumbnail-item {
+    border-radius: 10px !important;
+    background: var(--background-fill-secondary) !important;
+}
+
 /* ── Run status badge ───────────────────────────────── */
 .mt-toolbar-row {
     display: flex;
@@ -998,6 +1149,37 @@ button:focus-visible,
     .mt-modal-actions button {
         flex: 1 1 0 !important;
         min-height: 46px;
+    }
+
+    .mt-tabs .tab-container {
+        display: flex !important;
+        width: 100% !important;
+    }
+
+    .mt-tabs [role="tab"] {
+        flex: 1 1 0;
+        min-height: 40px;
+    }
+
+    /* Size and Translated are in the preview; phones keep the key columns. */
+    .mt-library-table th:nth-child(3),
+    .mt-library-table td:nth-child(3),
+    .mt-library-table th:nth-child(4),
+    .mt-library-table td:nth-child(4) {
+        display: none !important;
+    }
+
+    .mt-preview-bar > button {
+        flex: 1 1 100% !important;
+        min-height: 48px;
+    }
+
+    .mt-preview-gallery .grid-container {
+        grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)) !important;
+    }
+
+    .mt-preview-gallery {
+        height: 60vh !important;
     }
 
     .lock-screen {
