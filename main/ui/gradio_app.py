@@ -17,16 +17,23 @@ import inspect
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import gradio as gr
+import pandas as pd
 from gradio.data_classes import FileData
 
 from ..config import settings
 from ..gcp_storage import (
+    TranslatedArchive,
+    archive_download_url,
     delete_manga_folder,
     folder_exists,
     list_images_in_folder,
+    list_translated_archives,
+    mark_archive_downloaded,
+    translated_page_urls,
     upload_raw_manga_zip,
 )
 from .pipeline_runner import TranslationResult, run_translation_pipeline
@@ -43,6 +50,8 @@ GLOBAL_STATE = {
     "log_text": "",
     "failed_text": "",
     "download_url": "",
+    # Folder the current download_url belongs to.
+    "download_folder": "",
 }
 
 
@@ -140,12 +149,28 @@ def _require_unlocked(fn):
             _ensure_unlocked(is_unlocked)
             yield from fn(*args)
 
-        return guarded_generator
+        return _copy_signature(guarded_generator, fn)
 
     def guarded(is_unlocked, *args):
         _ensure_unlocked(is_unlocked)
         return fn(*args)
 
+    return _copy_signature(guarded, fn)
+
+
+def _copy_signature(guarded, fn):
+    """Give `guarded` the signature of `fn` with `is_unlocked` in front.
+
+    Gradio reads a handler's signature and type hints to inject special
+    arguments such as `gr.SelectData`. Without this, a guarded handler would
+    never receive them.
+    """
+    signature = inspect.signature(fn)
+    unlocked_param = inspect.Parameter("is_unlocked", inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    guarded.__signature__ = signature.replace(
+        parameters=[unlocked_param, *signature.parameters.values()]
+    )
+    guarded.__annotations__ = dict(getattr(fn, "__annotations__", {}))
     return guarded
 
 
@@ -212,6 +237,86 @@ def _workspace_header(status: str = "idle") -> str:
     )
 
 
+# ── Translated library ─────────────────────────────────
+_LIBRARY_COLUMNS = ("Chapter", "Pages", "Size", "Translated", "Downloaded")
+
+
+def _human_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def _relative_time(moment: datetime | None) -> str:
+    """Describe a timestamp as "5 min ago", "3 days ago" or a date."""
+    if moment is None:
+        return "—"
+    seconds = (datetime.now(timezone.utc) - moment).total_seconds()
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} min ago"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)} h ago"
+    if seconds < 30 * 86400:
+        days = int(seconds // 86400)
+        return f"{days} day{'s' if days != 1 else ''} ago"
+    return moment.strftime("%d %b %Y")
+
+
+def _library_frame(archives: list[TranslatedArchive]) -> pd.DataFrame:
+    rows = [
+        [
+            archive.folder_name,
+            archive.page_count,
+            _human_size(archive.archive_size),
+            _relative_time(archive.translated_at),
+            f"✅ {_relative_time(archive.downloaded_at)}" if archive.downloaded_at else "Not yet",
+        ]
+        for archive in archives
+    ]
+    return pd.DataFrame(rows, columns=list(_LIBRARY_COLUMNS))
+
+
+def _library_summary(archives: list[TranslatedArchive] | None) -> str:
+    if archives is None:
+        return '<p class="mt-library-count">Open this tab to load the library.</p>'
+    total = sum(archive.archive_size for archive in archives)
+    pending = sum(1 for archive in archives if archive.downloaded_at is None)
+    count = f"{len(archives)} archive{'s' if len(archives) != 1 else ''}"
+    return (
+        '<p class="mt-library-count">'
+        f"<b>{count}</b> · {_human_size(total)} · "
+        f"<b>{pending}</b> not downloaded yet</p>"
+    )
+
+
+def _preview_header(archive: TranslatedArchive) -> str:
+    """HTML for the preview card: name, facts and the downloaded badge."""
+    if archive.downloaded_at:
+        badge = (
+            '<span class="mt-badge mt-badge-done"><span class="mt-badge-dot"></span>'
+            f"Downloaded {_relative_time(archive.downloaded_at)}</span>"
+        )
+    else:
+        badge = (
+            '<span class="mt-badge mt-badge-finished"><span class="mt-badge-dot"></span>'
+            "Not downloaded yet</span>"
+        )
+    return (
+        '<div class="mt-preview-head">'
+        f"<h3>{html.escape(archive.folder_name)}</h3>"
+        '<div class="mt-meta">'
+        f"<span>{archive.page_count} pages</span>"
+        f"<span>{_human_size(archive.archive_size)}</span>"
+        f"<span>Translated {_relative_time(archive.translated_at)}</span>"
+        f"{badge}</div></div>"
+    )
+
+
 def _modal_header(icon: str, title: str, message: str, danger: bool = False) -> str:
     """HTML for a popup's icon, title and explanation."""
     tone = " mt-modal-icon-danger" if danger else ""
@@ -237,6 +342,9 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Base, str]:
         timer = gr.Timer(value=1.0, active=False)
         # Per-session flag, set only after the password or device token checks out.
         unlocked = gr.State(False)
+        # Library rows for this session, and the folder picked for preview.
+        library_archives = gr.State([])
+        library_selected = gr.State("")
         remembered_token = gr.BrowserState(
             _stored_device(),
             storage_key=_DEVICE_TOKEN_STORAGE_KEY,
@@ -317,102 +425,168 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Base, str]:
                         elem_classes=["lock-btn"],
                     )
 
-            with gr.Row(elem_classes=["mt-columns"]):
-                with gr.Column(scale=5, min_width=320, elem_classes=["mt-stack"]):
-                    # ── Step 1: Folder ─────────────────────────────
-                    with gr.Column(elem_classes=["mt-card"]):
-                        gr.HTML(
-                            _card_header(
-                                "1",
-                                "Choose a folder",
-                                "Name of a folder in the raw-manga bucket.",
-                            ),
-                            elem_classes=["mt-bare"],
-                        )
-                        with gr.Row(elem_classes=["mt-folder-row"], equal_height=True):
-                            folder_input = gr.Textbox(
-                                label="Folder name",
+            with gr.Tabs(elem_classes=["mt-tabs"]):
+                with gr.Tab("✨ Translate", id="translate", elem_classes=["mt-tab"]):
+                    with gr.Row(elem_classes=["mt-columns"]):
+                        with gr.Column(scale=5, min_width=320, elem_classes=["mt-stack"]):
+                            # ── Step 1: Folder ─────────────────────────────
+                            with gr.Column(elem_classes=["mt-card"]):
+                                gr.HTML(
+                                    _card_header(
+                                        "1",
+                                        "Choose a folder",
+                                        "Name of a folder in the raw-manga bucket.",
+                                    ),
+                                    elem_classes=["mt-bare"],
+                                )
+                                with gr.Row(elem_classes=["mt-folder-row"], equal_height=True):
+                                    folder_input = gr.Textbox(
+                                        label="Folder name",
+                                        show_label=False,
+                                        placeholder="e.g. my-manga-chapter-01",
+                                        scale=4,
+                                        min_width=180,
+                                        interactive=True,
+                                        container=False,
+                                    )
+                                    load_btn = gr.Button(
+                                        "🔍 Load",
+                                        variant="primary",
+                                        scale=0,
+                                        min_width=110,
+                                        interactive=True,
+                                    )
+                                folder_status = gr.HTML(visible=False, elem_classes=["mt-status"])
+
+                            # ── Step 2: Pages ──────────────────────────────
+                            with gr.Column(elem_classes=["mt-card"], visible=False) as image_section:
+                                gr.HTML(
+                                    _card_header(
+                                        "2",
+                                        "Pick pages",
+                                        "Every page is selected. Untick the ones to skip.",
+                                    ),
+                                    elem_classes=["mt-bare"],
+                                )
+                                image_selector = gr.CheckboxGroup(
+                                    label="Images to translate",
+                                    show_label=False,
+                                    choices=[],
+                                    value=[],
+                                    elem_classes=["image-selector"],
+                                    interactive=True,
+                                )
+                                translate_btn = gr.Button(
+                                    "🚀 Translate selected pages",
+                                    variant="primary",
+                                    size="lg",
+                                    elem_classes=["translate-btn"],
+                                    interactive=True,
+                                )
+
+                        # ── Step 3: Progress & results ─────────────────
+                        with gr.Column(
+                            scale=6,
+                            min_width=320,
+                            visible=False,
+                            elem_classes=["mt-card", "mt-results"],
+                        ) as results_section:
+                            gr.HTML(
+                                _card_header(
+                                    "3",
+                                    "Progress & results",
+                                    "Live pipeline log. The download link appears when it finishes.",
+                                ),
+                                elem_classes=["mt-bare"],
+                            )
+                            progress_log = gr.Textbox(
+                                label="Pipeline log",
                                 show_label=False,
-                                placeholder="e.g. my-manga-chapter-01",
-                                scale=4,
-                                min_width=180,
-                                interactive=True,
-                                container=False,
+                                lines=14,
+                                max_lines=30,
+                                interactive=False,
+                                autoscroll=True,
+                                elem_classes=["progress-box"],
                             )
-                            load_btn = gr.Button(
-                                "🔍 Load",
+                            failed_images_box = gr.Textbox(
+                                label="Failed images",
+                                lines=3,
+                                interactive=False,
+                                visible=False,
+                                elem_classes=["failed-box"],
+                            )
+                            download_btn = gr.Button(
+                                "📥 Download translated manga (CBZ) · link valid 24 h",
                                 variant="primary",
-                                scale=0,
-                                min_width=110,
+                                size="lg",
+                                elem_classes=["download-btn"],
                                 interactive=True,
+                                visible=False,
                             )
-                        folder_status = gr.HTML(visible=False, elem_classes=["mt-status"])
 
-                    # ── Step 2: Pages ──────────────────────────────
-                    with gr.Column(elem_classes=["mt-card"], visible=False) as image_section:
-                        gr.HTML(
-                            _card_header(
-                                "2",
-                                "Pick pages",
-                                "Every page is selected. Untick the ones to skip.",
-                            ),
-                            elem_classes=["mt-bare"],
-                        )
-                        image_selector = gr.CheckboxGroup(
-                            label="Images to translate",
-                            show_label=False,
-                            choices=[],
-                            value=[],
-                            elem_classes=["image-selector"],
-                            interactive=True,
-                        )
-                        translate_btn = gr.Button(
-                            "🚀 Translate selected pages",
-                            variant="primary",
-                            size="lg",
-                            elem_classes=["translate-btn"],
-                            interactive=True,
-                        )
+                with gr.Tab("📚 Library", id="library", elem_classes=["mt-tab"]) as library_tab:
+                    with gr.Column(elem_classes=["mt-stack"]):
+                        with gr.Column(elem_classes=["mt-card", "mt-library"]):
+                            with gr.Row(elem_classes=["mt-library-bar"], equal_height=True):
+                                gr.HTML(
+                                    _card_header(
+                                        "📚",
+                                        "Translated library",
+                                        "Every converted CBZ in translated-manga/. "
+                                        "Click a row to preview it.",
+                                    ),
+                                    elem_classes=["mt-bare", "mt-library-head"],
+                                )
+                                library_refresh_btn = gr.Button(
+                                    "🔄 Refresh",
+                                    variant="secondary",
+                                    size="sm",
+                                    scale=0,
+                                    min_width=0,
+                                )
+                            library_summary = gr.HTML(
+                                _library_summary(None),
+                                elem_classes=["mt-bare"],
+                            )
+                            library_table = gr.Dataframe(
+                                value=_library_frame([]),
+                                headers=list(_LIBRARY_COLUMNS),
+                                datatype=["str", "number", "str", "str", "str"],
+                                interactive=False,
+                                show_label=False,
+                                show_search="search",
+                                wrap=True,
+                                max_height=440,
+                                column_widths=["44%", "10%", "13%", "16%", "17%"],
+                                elem_classes=["mt-library-table"],
+                            )
+                            library_status = gr.HTML(visible=False, elem_classes=["mt-status"])
 
-                # ── Step 3: Progress & results ─────────────────
-                with gr.Column(
-                    scale=6,
-                    min_width=320,
-                    visible=False,
-                    elem_classes=["mt-card", "mt-results"],
-                ) as results_section:
-                    gr.HTML(
-                        _card_header(
-                            "3",
-                            "Progress & results",
-                            "Live pipeline log. The download link appears when it finishes.",
-                        ),
-                        elem_classes=["mt-bare"],
-                    )
-                    progress_log = gr.Textbox(
-                        label="Pipeline log",
-                        show_label=False,
-                        lines=14,
-                        max_lines=30,
-                        interactive=False,
-                        autoscroll=True,
-                        elem_classes=["progress-box"],
-                    )
-                    failed_images_box = gr.Textbox(
-                        label="Failed images",
-                        lines=3,
-                        interactive=False,
-                        visible=False,
-                        elem_classes=["failed-box"],
-                    )
-                    download_btn = gr.Button(
-                        "📥 Download translated manga (CBZ) · link valid 24 h",
-                        variant="primary",
-                        size="lg",
-                        elem_classes=["download-btn"],
-                        interactive=True,
-                        visible=False,
-                    )
+                        with gr.Column(
+                            visible=False,
+                            elem_classes=["mt-card", "mt-preview"],
+                        ) as preview_section:
+                            with gr.Row(elem_classes=["mt-preview-bar"], equal_height=True):
+                                preview_header = gr.HTML(
+                                    elem_classes=["mt-bare", "mt-preview-headblock"],
+                                )
+                                preview_download_btn = gr.Button(
+                                    "📥 Download CBZ",
+                                    variant="primary",
+                                    scale=0,
+                                    min_width=190,
+                                    elem_classes=["download-btn"],
+                                )
+                            preview_gallery = gr.Gallery(
+                                label="Pages",
+                                show_label=False,
+                                columns=6,
+                                height=620,
+                                object_fit="contain",
+                                allow_preview=True,
+                                interactive=False,
+                                elem_classes=["mt-preview-gallery"],
+                            )
 
             # Hidden trigger value. JS listener opens this URL in a new tab.
             download_launch_url = gr.Textbox(value="", visible=False, interactive=False)
@@ -656,6 +830,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Base, str]:
             GLOBAL_STATE["log_text"] = f"🚀 Starting translation for {len(selected_images)} image(s) from '{folder_name}'...\n"
             GLOBAL_STATE["failed_text"] = ""
             GLOBAL_STATE["download_url"] = ""
+            GLOBAL_STATE["download_folder"] = ""
 
             def _background_task():
                 log_lines = [GLOBAL_STATE["log_text"]]
@@ -693,6 +868,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Base, str]:
                     # Download link
                     if final_result.download_url:
                         GLOBAL_STATE["download_url"] = final_result.download_url
+                        GLOBAL_STATE["download_folder"] = folder_name
                 except Exception as e:
                     logger.error("Background task error: %s", e)
                     log_lines.append(f"\n❌ Pipeline crashed: {e}")
@@ -890,7 +1066,94 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Base, str]:
             download_url = GLOBAL_STATE.get("download_url", "")
             if not download_url:
                 raise gr.Error("Download link is not ready yet.")
+            download_folder = GLOBAL_STATE.get("download_folder", "")
+            if download_folder:
+                # Marked in the background so the link opens straight away.
+                threading.Thread(
+                    target=mark_archive_downloaded, args=(download_folder,), daemon=True
+                ).start()
             return download_url
+
+        # ── Library handlers ───────────────────────────
+
+        def _library_error(message: str):
+            return gr.update(
+                visible=True,
+                value=f'<span class="result-error">{html.escape(message)}</span>',
+            )
+
+        def load_library():
+            """List the converted CBZs in the bucket."""
+            try:
+                archives = list_translated_archives()
+            except Exception as e:
+                logger.error("Error listing translated archives: %s", e)
+                return (
+                    gr.update(),
+                    gr.update(),
+                    _library_error(f"❌ Could not load the library: {e}"),
+                    gr.update(),
+                )
+            if archives:
+                status = gr.update(visible=False, value="")
+            else:
+                status = gr.update(
+                    visible=True,
+                    value=(
+                        '<span class="result-error">No converted CBZ in translated-manga/ '
+                        "yet. Translate a folder and it shows up here.</span>"
+                    ),
+                )
+            return _library_frame(archives), _library_summary(archives), status, archives
+
+        def select_archive(archives: list, evt: gr.SelectData):
+            """Show the preview of the clicked row's archive."""
+            row = evt.row_value or []
+            folder_name = str(row[0]) if row else ""
+            archive = next((a for a in archives or [] if a.folder_name == folder_name), None)
+            if archive is None:
+                return (
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    _library_error("⚠️ That archive is gone. Refresh the library."),
+                )
+            try:
+                pages = translated_page_urls(folder_name)
+            except Exception as e:
+                logger.error("Error loading preview for %s: %s", folder_name, e)
+                return (
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    _library_error(f"❌ Could not load the preview: {e}"),
+                )
+            return (
+                folder_name,
+                gr.update(visible=True),
+                _preview_header(archive),
+                [(url, name) for name, url in pages],
+                gr.update(visible=False, value=""),
+            )
+
+        def download_archive(folder_name: str):
+            """Open the selected CBZ and refresh the library's downloaded marks."""
+            if not folder_name:
+                raise gr.Error("Select an archive first.")
+            try:
+                url = archive_download_url(folder_name)
+            except Exception as e:
+                logger.error("Error creating download link for %s: %s", folder_name, e)
+                raise gr.Error(f"Could not create the download link: {e}") from e
+
+            frame, summary, status, archives = load_library()
+            archive = next(
+                (a for a in archives if a.folder_name == folder_name), None
+            ) if isinstance(archives, list) else None
+            header = _preview_header(archive) if archive else gr.update()
+            return url, frame, summary, status, archives, header
 
         def clear_all_ui():
             GLOBAL_STATE["folder_name"] = ""
@@ -900,6 +1163,7 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Base, str]:
             GLOBAL_STATE["log_text"] = ""
             GLOBAL_STATE["failed_text"] = ""
             GLOBAL_STATE["download_url"] = ""
+            GLOBAL_STATE["download_folder"] = ""
 
             return (
                 gr.update(visible=False, value=""),  # folder_status
@@ -1090,6 +1354,38 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Base, str]:
             inputs=[unlocked],
             outputs=delete_modal_outputs,
             queue=False,
+        )
+
+        library_outputs = [library_table, library_summary, library_status, library_archives]
+        for library_trigger in (library_tab.select, library_refresh_btn.click):
+            library_trigger(
+                fn=_require_unlocked(load_library),
+                inputs=[unlocked],
+                outputs=library_outputs,
+            )
+
+        library_table.select(
+            fn=_require_unlocked(select_archive),
+            inputs=[unlocked, library_archives],
+            outputs=[
+                library_selected,
+                preview_section,
+                preview_header,
+                preview_gallery,
+                library_status,
+            ],
+        ).then(
+            fn=None,
+            js="""
+                () => document.querySelector(".mt-preview")
+                    ?.scrollIntoView({ behavior: "smooth", block: "start" })
+            """,
+        )
+
+        preview_download_btn.click(
+            fn=_require_unlocked(download_archive),
+            inputs=[unlocked, library_selected],
+            outputs=[download_launch_url, *library_outputs, preview_header],
         )
 
         download_btn.click(

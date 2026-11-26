@@ -10,7 +10,7 @@ Manga Translator OCR is an end-to-end pipeline that translates Japanese manga/do
 5. **Rendering** — PIL renders translated English text into the cleaned bubble using comic fonts
 
 ## Entry Points
-- **Gradio Web UI** — `main/app.py` — interactive single-page translation with GCP Cloud Storage integration. The whole UI sits behind a lock screen (see "Lock Screen" below)
+- **Gradio Web UI** — `main/app.py` — interactive single-page translation with GCP Cloud Storage integration. The whole UI sits behind a lock screen (see "Lock Screen" below). A "Library" tab lists every converted CBZ in the bucket with a page preview (see "Translated Library" below)
 - **CLI** — `main/cli.py` — batch translation of files or directories
 
 ## Deployment Targets
@@ -38,7 +38,7 @@ manga-translator-ocr/
 │   ├── translator.py            # LLM prompting, batch translation, repair pass
 │   ├── model_client.py          # OpenAI-compatible chat-completions client
 │   ├── renderer.py              # Inpainting (cv2), text rendering (PIL), font/bubble logic
-│   ├── gcp_storage.py           # GCS download/upload, presigned URLs, ZIP handling
+│   ├── gcp_storage.py           # GCS download/upload, presigned URLs, ZIP handling, library listing
 │   ├── fonts/                   # Bundled comic fonts (animeace2.otf, CCWildWordsRoman.ttf, CJK fonts)
 │   ├── weights/                 # Model weights (gitignored, must be populated manually)
 │   │   ├── comic-text-detector/ # comic-text-detector.onnx
@@ -85,6 +85,12 @@ The web UI opens on a lock screen and stays hidden until `GRADIO_ACTION_PASSWORD
 - Unlock state is a per-session `gr.State` (`unlocked`), which lives on the server. Every handler that reads or changes data must be wired as `fn=_require_unlocked(handler)` with `unlocked` as its **first** input. Hiding the UI is not protection, because Gradio endpoints can be called directly.
 - Handlers that also fire from programmatic value changes (`.change`, timer syncs) should skip locked sessions quietly instead of raising (see `select_images_for_session`, `sync_for_session`).
 - The browser remembers a device by storing `{"token": HMAC(password)}` in localStorage via `gr.BrowserState`, never the plaintext password. BrowserState does not save falsy values, so clearing it means writing `{"token": ""}`.
+- `_require_unlocked` copies the handler's signature and annotations (with `is_unlocked` in front), so special arguments such as `evt: gr.SelectData` still reach a guarded handler. Keep handler annotations resolvable from `gradio_app`'s module globals.
+
+### Translated Library
+- Every run writes `translated-manga/<folder>/Chapter.cbz`. `list_translated_archives()` lists the folders that have one, using a single listing of the prefix.
+- The preview loads pages through short-lived signed URLs (`translated_page_urls`), so the browser fetches them straight from the bucket instead of through the app.
+- "Downloaded" is a `downloaded-at` custom metadata key on the CBZ. The app sets it whenever it hands out the CBZ's link, from the Library tab or from the post-run download button. A new run replaces the CBZ, which clears the mark. Patching metadata moves the object's `updated` time, so the translated time shown is `time_created`.
 
 ### Parallelism
 - Multiple pages: `ThreadPoolExecutor` with batch processing (configurable via `MODAL_MAX_PARALLEL_PAGES` / `LOCAL_MAX_PARALLEL_PAGES`)

@@ -12,10 +12,12 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import uuid
 import zipfile
-from datetime import timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from google.cloud import storage
@@ -27,6 +29,23 @@ _DEFAULT_BUCKET_NAME = "manga-ocr-translation"
 _RAW_PREFIX = "raw-manga"
 _TRANSLATED_PREFIX = "translated-manga"
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+# Each translated folder gets one CBZ (CBZ is the popular manga archive format).
+_ARCHIVE_NAME = "Chapter.cbz"
+# Custom object metadata key set on the CBZ when the app hands out its link.
+_DOWNLOADED_AT_KEY = "downloaded-at"
+
+
+@dataclass
+class TranslatedArchive:
+    """A translated folder in translated-manga/ that has a CBZ."""
+
+    folder_name: str
+    page_count: int
+    archive_size: int
+    # When the CBZ was written. This is the object's creation time: marking a
+    # download patches metadata, which moves `updated` but not this.
+    translated_at: datetime | None
+    downloaded_at: datetime | None
 
 
 def _get_credentials() -> service_account.Credentials:
@@ -317,8 +336,7 @@ def generate_download_url(folder_name: str, ttl_hours: int = 24) -> str:
 
     zip_buffer.seek(0)
 
-    # Upload zip as Chapter.cbz (CBZ is the popular manga archive format)
-    zip_blob_path = f"{_TRANSLATED_PREFIX}/{folder_name}/Chapter.cbz"
+    zip_blob_path = f"{_TRANSLATED_PREFIX}/{folder_name}/{_ARCHIVE_NAME}"
     zip_blob = bucket.blob(zip_blob_path)
     zip_blob.upload_from_file(zip_buffer, content_type="application/zip")
     logger.info("Uploaded cbz: %s", zip_blob_path)
@@ -330,6 +348,127 @@ def generate_download_url(folder_name: str, ttl_hours: int = 24) -> str:
         method="GET",
     )
 
+    return url
+
+
+def _natural_key(name: str) -> list[int | str]:
+    """Sort key so that page 2 comes before page 10."""
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", name)]
+
+
+def _parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def list_translated_archives() -> list[TranslatedArchive]:
+    """
+    List every folder in translated-manga/ that has a CBZ, newest first.
+
+    One listing of the prefix gives the page count, CBZ size, update time and
+    the "downloaded" mark for every folder.
+    """
+    client = get_gcs_client()
+    bucket = client.bucket(_get_bucket_name())
+    prefix = f"{_TRANSLATED_PREFIX}/"
+
+    page_counts: dict[str, int] = {}
+    archives: dict[str, storage.Blob] = {}
+    for blob in client.list_blobs(bucket, prefix=prefix):
+        folder_name, _, filename = blob.name[len(prefix) :].partition("/")
+        # Only files directly inside a folder count.
+        if not folder_name or not filename or "/" in filename:
+            continue
+        if filename == _ARCHIVE_NAME:
+            archives[folder_name] = blob
+        elif Path(filename).suffix.lower() in _IMAGE_EXTENSIONS:
+            page_counts[folder_name] = page_counts.get(folder_name, 0) + 1
+
+    result = [
+        TranslatedArchive(
+            folder_name=folder_name,
+            page_count=page_counts.get(folder_name, 0),
+            archive_size=blob.size or 0,
+            translated_at=blob.time_created,
+            downloaded_at=_parse_timestamp((blob.metadata or {}).get(_DOWNLOADED_AT_KEY)),
+        )
+        for folder_name, blob in archives.items()
+    ]
+    oldest = datetime.min.replace(tzinfo=timezone.utc)
+    result.sort(key=lambda archive: archive.translated_at or oldest, reverse=True)
+    return result
+
+
+def translated_page_urls(folder_name: str, ttl_minutes: int = 60) -> list[tuple[str, str]]:
+    """
+    Return (filename, signed URL) for every translated page of a folder.
+
+    Pages are in reading order. The URLs let the browser load the pages
+    straight from the bucket for the preview.
+    """
+    client = get_gcs_client()
+    bucket = client.bucket(_get_bucket_name())
+    prefix = f"{_TRANSLATED_PREFIX}/{folder_name}/"
+
+    pages: list[storage.Blob] = []
+    for blob in client.list_blobs(bucket, prefix=prefix):
+        filename = blob.name[len(prefix) :]
+        if filename and "/" not in filename and Path(filename).suffix.lower() in _IMAGE_EXTENSIONS:
+            pages.append(blob)
+    pages.sort(key=lambda blob: _natural_key(blob.name[len(prefix) :]))
+
+    expiration = timedelta(minutes=ttl_minutes)
+    return [
+        (
+            blob.name[len(prefix) :],
+            blob.generate_signed_url(version="v4", expiration=expiration, method="GET"),
+        )
+        for blob in pages
+    ]
+
+
+def mark_archive_downloaded(folder_name: str) -> None:
+    """
+    Record on the folder's CBZ that its download link was handed out.
+
+    This is best effort: a failure is logged and never blocks the download.
+    A new translation run replaces the CBZ, which clears the mark.
+    """
+    try:
+        bucket = get_bucket()
+        blob = bucket.get_blob(f"{_TRANSLATED_PREFIX}/{folder_name}/{_ARCHIVE_NAME}")
+        if blob is None:
+            return
+        blob.metadata = {
+            **(blob.metadata or {}),
+            _DOWNLOADED_AT_KEY: datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        blob.patch()
+    except Exception as e:
+        logger.warning("Could not mark %s as downloaded: %s", folder_name, e)
+
+
+def archive_download_url(folder_name: str, ttl_hours: int = 24) -> str:
+    """
+    Return a signed URL for a folder's existing CBZ and mark it downloaded.
+
+    Unlike generate_download_url this does not rebuild the archive.
+    """
+    bucket = get_bucket()
+    blob = bucket.get_blob(f"{_TRANSLATED_PREFIX}/{folder_name}/{_ARCHIVE_NAME}")
+    if blob is None:
+        raise ValueError(f'No CBZ found for "{folder_name}" in translated-manga/.')
+    url = blob.generate_signed_url(
+        version="v4",
+        expiration=timedelta(hours=ttl_hours),
+        method="GET",
+    )
+    mark_archive_downloaded(folder_name)
     return url
 
 
