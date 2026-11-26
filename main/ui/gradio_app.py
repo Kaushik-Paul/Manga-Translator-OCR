@@ -169,6 +169,28 @@ _HEADER_HTML = """
 """
 
 
+def _card_header(step: str, title: str, subtitle: str) -> str:
+    """HTML for a numbered step card's heading."""
+    return (
+        '<div class="mt-card-head">'
+        f'<span class="mt-step" aria-hidden="true">{step}</span>'
+        f"<div><h3>{title}</h3><p>{subtitle}</p></div>"
+        "</div>"
+    )
+
+
+def _modal_header(icon: str, title: str, message: str, danger: bool = False) -> str:
+    """HTML for a popup's icon, title and explanation."""
+    tone = " mt-modal-icon-danger" if danger else ""
+    return (
+        '<div class="mt-modal-head">'
+        f'<span class="mt-modal-icon{tone}" aria-hidden="true">{icon}</span>'
+        f'<div><div class="auth-modal-title">{title}</div>'
+        f'<div class="auth-modal-message">{message}</div></div>'
+        "</div>"
+    )
+
+
 def create_app() -> tuple[gr.Blocks, gr.themes.Base, str]:
     """Build and return the Gradio Blocks application, theme, and CSS."""
 
@@ -223,145 +245,200 @@ def create_app() -> tuple[gr.Blocks, gr.themes.Base, str]:
                 )
 
         # ── Main view (only visible once unlocked) ─────
-        with gr.Column(visible=False) as main_view:
-            with gr.Row(elem_classes=["top-actions-row"]):
-                upload_zip_btn = gr.Button(
-                    "📤 Upload ZIP to raw-manga",
-                    variant="secondary",
-                    elem_classes=["upload-zip-btn"],
+        with gr.Column(visible=False, elem_classes=["mt-main"]) as main_view:
+            # ── Toolbar ────────────────────────────────────
+            with gr.Row(elem_classes=["mt-toolbar"], equal_height=True):
+                gr.HTML(
+                    """
+                    <div class="mt-toolbar-title">
+                        <h2>Workspace</h2>
+                        <p>Load a raw-manga folder, pick pages, translate.</p>
+                    </div>
+                    """,
+                    elem_classes=["mt-bare", "mt-toolbar-head"],
                 )
-                delete_folder_btn = gr.Button(
-                    "🗑️ Delete Folder",
-                    variant="stop",
-                    elem_classes=["delete-folder-btn"],
-                )
-                clear_btn = gr.Button(
-                    "🧹 Clear",
-                    variant="secondary",
-                    elem_classes=["clear-btn"],
-                    interactive=True,
-                )
-                lock_btn = gr.Button(
-                    "🔒 Log out",
-                    variant="secondary",
-                    elem_classes=["lock-btn"],
-                    scale=0,
-                    min_width=120,
-                )
-
-            # ── Section 1: Folder Input ────────────────────
-            with gr.Group(elem_classes=["section-card"]):
-                gr.HTML('<div class="section-title">📁 Manga Folder</div>')
-                with gr.Row():
-                    folder_input = gr.Textbox(
-                        label="Folder name",
-                        placeholder="Enter manga folder name (in raw-manga bucket)...",
-                        scale=4,
+                with gr.Row(elem_classes=["mt-toolbar-actions"]):
+                    upload_zip_btn = gr.Button(
+                        "📤 Upload ZIP",
+                        variant="secondary",
+                        size="md",
+                        scale=0,
+                        min_width=0,
+                    )
+                    delete_folder_btn = gr.Button(
+                        "🗑️ Delete folder",
+                        variant="stop",
+                        size="md",
+                        scale=0,
+                        min_width=0,
+                    )
+                    clear_btn = gr.Button(
+                        "🧹 Clear",
+                        variant="secondary",
+                        size="md",
+                        scale=0,
+                        min_width=0,
                         interactive=True,
                     )
-                    load_btn = gr.Button(
-                        "🔍 Load",
-                        variant="primary",
-                        elem_classes=["primary-btn"],
-                        scale=1,
-                        interactive=True,
-                    )
-                folder_status = gr.HTML(visible=False)
-
-            # ── Section 2: Image Selector ──────────────────
-            with gr.Group(elem_classes=["section-card"], visible=False) as image_section:
-                gr.HTML('<div class="section-title">🖼️ Select Images</div>')
-                image_selector = gr.CheckboxGroup(
-                    label="Images to translate",
-                    choices=[],
-                    value=[],
-                    elem_classes=["image-selector"],
-                    interactive=True,
-                )
-                with gr.Row():
-                    translate_btn = gr.Button(
-                        "🚀 Translate Selected",
-                        variant="primary",
-                        elem_classes=["translate-btn"],
-                        scale=2,
-                        interactive=True,
+                    lock_btn = gr.Button(
+                        "🔒 Log out",
+                        variant="secondary",
+                        size="md",
+                        scale=0,
+                        min_width=0,
+                        elem_classes=["lock-btn"],
                     )
 
-            # ── Section 3: Progress & Results ──────────────
-            with gr.Group(elem_classes=["section-card"], visible=False) as results_section:
-                gr.HTML('<div class="section-title">📊 Progress & Results</div>')
-                progress_log = gr.Textbox(
-                    label="Pipeline Log",
-                    lines=12,
-                    max_lines=30,
-                    interactive=False,
-                    elem_classes=["progress-box"],
-                )
-                with gr.Row():
+            with gr.Row(elem_classes=["mt-columns"]):
+                with gr.Column(scale=5, min_width=320, elem_classes=["mt-stack"]):
+                    # ── Step 1: Folder ─────────────────────────────
+                    with gr.Column(elem_classes=["mt-card"]):
+                        gr.HTML(
+                            _card_header(
+                                "1",
+                                "Choose a folder",
+                                "Name of a folder in the raw-manga bucket.",
+                            ),
+                            elem_classes=["mt-bare"],
+                        )
+                        with gr.Row(elem_classes=["mt-folder-row"], equal_height=True):
+                            folder_input = gr.Textbox(
+                                label="Folder name",
+                                show_label=False,
+                                placeholder="e.g. my-manga-chapter-01",
+                                scale=4,
+                                min_width=180,
+                                interactive=True,
+                                container=False,
+                            )
+                            load_btn = gr.Button(
+                                "🔍 Load",
+                                variant="primary",
+                                scale=0,
+                                min_width=110,
+                                interactive=True,
+                            )
+                        folder_status = gr.HTML(visible=False, elem_classes=["mt-status"])
+
+                    # ── Step 2: Pages ──────────────────────────────
+                    with gr.Column(elem_classes=["mt-card"], visible=False) as image_section:
+                        gr.HTML(
+                            _card_header(
+                                "2",
+                                "Pick pages",
+                                "Every page is selected. Untick the ones to skip.",
+                            ),
+                            elem_classes=["mt-bare"],
+                        )
+                        image_selector = gr.CheckboxGroup(
+                            label="Images to translate",
+                            show_label=False,
+                            choices=[],
+                            value=[],
+                            elem_classes=["image-selector"],
+                            interactive=True,
+                        )
+                        translate_btn = gr.Button(
+                            "🚀 Translate selected pages",
+                            variant="primary",
+                            size="lg",
+                            elem_classes=["translate-btn"],
+                            interactive=True,
+                        )
+
+                # ── Step 3: Progress & results ─────────────────
+                with gr.Column(
+                    scale=6,
+                    min_width=320,
+                    visible=False,
+                    elem_classes=["mt-card", "mt-results"],
+                ) as results_section:
+                    gr.HTML(
+                        _card_header(
+                            "3",
+                            "Progress & results",
+                            "Live pipeline log. The download link appears when it finishes.",
+                        ),
+                        elem_classes=["mt-bare"],
+                    )
+                    progress_log = gr.Textbox(
+                        label="Pipeline log",
+                        show_label=False,
+                        lines=14,
+                        max_lines=30,
+                        interactive=False,
+                        autoscroll=True,
+                        elem_classes=["progress-box"],
+                    )
                     failed_images_box = gr.Textbox(
-                        label="❌ Failed Images",
+                        label="Failed images",
                         lines=3,
                         interactive=False,
                         visible=False,
+                        elem_classes=["failed-box"],
                     )
-                download_btn = gr.Button(
-                    "📥 Download Translated Manga (CBZ) — Expires in 24 hours",
-                    variant="primary",
-                    elem_classes=["download-btn"],
-                    interactive=True,
-                    visible=False,
-                )
+                    download_btn = gr.Button(
+                        "📥 Download translated manga (CBZ) · link valid 24 h",
+                        variant="primary",
+                        size="lg",
+                        elem_classes=["download-btn"],
+                        interactive=True,
+                        visible=False,
+                    )
 
             # Hidden trigger value. JS listener opens this URL in a new tab.
             download_launch_url = gr.Textbox(value="", visible=False, interactive=False)
 
             # ZIP upload popup.
-            with gr.Group(visible=False, elem_classes=["auth-modal-overlay"]) as upload_modal:
-                with gr.Group(elem_classes=["auth-modal-card"]):
-                    gr.HTML('<div class="auth-modal-title">📦 Upload Manga ZIP</div>')
+            with gr.Column(visible=False, elem_classes=["auth-modal-overlay"]) as upload_modal:
+                with gr.Column(elem_classes=["auth-modal-card"]):
                     gr.HTML(
-                        '<div class="auth-modal-message">Select a .zip file. '
-                        'It will be uploaded to raw-manga/&lt;zip-name&gt;/.</div>'
+                        _modal_header(
+                            "📦",
+                            "Upload a manga ZIP",
+                            "The pages are uploaded to raw-manga/&lt;zip-name&gt;/ and "
+                            "loaded straight away.",
+                        ),
+                        elem_classes=["mt-bare"],
                     )
                     upload_zip_file = _keep_original_filename(
                         gr.File(
                             label="ZIP file",
                             file_types=[".zip"],
                             type="filepath",
+                            height=180,
+                            elem_classes=["mt-dropzone"],
                         )
                     )
-                    upload_status = gr.HTML(visible=False)
-                    upload_error = gr.HTML(visible=False)
-                    with gr.Row():
-                        upload_confirm_btn = gr.Button(
-                            "Confirm",
-                            variant="primary",
-                            elem_classes=["primary-btn"],
-                        )
-                        upload_close_btn = gr.Button("Close")
+                    upload_status = gr.HTML(visible=False, elem_classes=["mt-status"])
+                    upload_error = gr.HTML(visible=False, elem_classes=["mt-status"])
+                    with gr.Row(elem_classes=["mt-modal-actions"]):
+                        upload_close_btn = gr.Button("Close", variant="secondary")
+                        upload_confirm_btn = gr.Button("Upload", variant="primary")
 
             # Folder deletion popup.
-            with gr.Group(visible=False, elem_classes=["auth-modal-overlay"]) as delete_modal:
-                with gr.Group(elem_classes=["auth-modal-card"]):
-                    gr.HTML('<div class="auth-modal-title">🗑️ Delete Manga Folder</div>')
+            with gr.Column(visible=False, elem_classes=["auth-modal-overlay"]) as delete_modal:
+                with gr.Column(elem_classes=["auth-modal-card"]):
                     gr.HTML(
-                        '<div class="auth-modal-message">Delete folder from both '
-                        "raw-manga/ and translated-manga/.</div>"
+                        _modal_header(
+                            "🗑️",
+                            "Delete a manga folder",
+                            "Removes the folder from both raw-manga/ and "
+                            "translated-manga/. This cannot be undone.",
+                            danger=True,
+                        ),
+                        elem_classes=["mt-bare"],
                     )
                     delete_folder_name = gr.Textbox(
                         label="Folder name",
                         placeholder="Enter folder name to delete",
                         interactive=True,
                     )
-                    delete_status = gr.HTML(visible=False)
-                    delete_error = gr.HTML(visible=False)
-                    with gr.Row():
-                        delete_confirm_btn = gr.Button(
-                            "Confirm",
-                            variant="stop",
-                            elem_classes=["delete-folder-btn"],
-                        )
-                        delete_close_btn = gr.Button("Close")
+                    delete_status = gr.HTML(visible=False, elem_classes=["mt-status"])
+                    delete_error = gr.HTML(visible=False, elem_classes=["mt-status"])
+                    with gr.Row(elem_classes=["mt-modal-actions"]):
+                        delete_close_btn = gr.Button("Close", variant="secondary")
+                        delete_confirm_btn = gr.Button("Delete", variant="stop")
 
 
         def _close_upload_modal():
